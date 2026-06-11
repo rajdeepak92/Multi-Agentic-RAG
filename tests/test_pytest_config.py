@@ -14,6 +14,7 @@ def test_pytest_config_limits_discovery_to_tests() -> None:
         ".venv",
         ".multi_agentic_rag",
         ".cache",
+        "generated",
         "**pycache**",
         "AppData",
         "site-packages",

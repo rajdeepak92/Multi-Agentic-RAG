@@ -11,6 +11,8 @@ Install or verify these first:
 - uv
 - PowerShell
 - Neo4j Desktop, if you want graph indexing and graph-aware workflows
+- Weaviate, optional, if you want the primary vector adapter instead of Chroma fallback
+- Tesseract OCR, optional, only if scanned PDFs must be processed
 - OpenAI API key, recommended for LLM-backed features
 - Hugging Face token, recommended for model downloads
 
@@ -44,19 +46,15 @@ dependencies from `pyproject.toml` and `uv.lock`.
 
 The `.env` file is intentionally ignored by git, so create it after cloning.
 
-If the repo has a template:
-
 ```powershell
 copy .env.example .env
 ```
 
-If no template exists, create `.env` manually:
+Then edit `.env`:
 
 ```powershell
 notepad .env
 ```
-
-Use this as the starting configuration:
 
 ```env
 OPENAI_API_KEY=<your_openai_api_key>
@@ -67,17 +65,32 @@ HF_HUB_CACHE=.cache/huggingface/hub
 
 MULTI_AGENTIC_RAG_HOME=.multi_agentic_rag
 MULTI_AGENTIC_RAG_PROFILE=local
+OBJECT_STORE_PATH=.multi_agentic_rag/objects
 
 NEO4J_URI=bolt://127.0.0.1:7687
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=<your_neo4j_password>
 
+VECTOR_STORE_PROVIDER=auto
+WEAVIATE_URL=
+WEAVIATE_API_KEY=
+WEAVIATE_COLLECTION=MultiAgenticRagChunk
+WEAVIATE_HYBRID_ALPHA=0.65
 CHROMA_PATH=.multi_agentic_rag/chroma
 SQLITE_DB_PATH=.multi_agentic_rag/registry.db
+KEYWORD_INDEX_ENABLED=true
 
+EMBEDDING_PROVIDER=hash
 DEFAULT_EMBEDDING_MODEL=BAAI/bge-m3
 DEFAULT_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+LLM_PROVIDER=none
 DEFAULT_LLM_MODEL=gpt-5.5
+AZURE_OPENAI_ENDPOINT=
+AZURE_OPENAI_API_KEY=
+AZURE_OPENAI_DEPLOYMENT=
+
+ENABLE_PDF_OCR=false
+TESSERACT_CMD=
 
 API_HOST=127.0.0.1
 API_PORT=8000
@@ -135,7 +148,10 @@ Expected important checks:
 - Python passes
 - `.env` is found
 - SQLite registry passes
+- SQLite FTS5 keyword index passes
+- Local object store passes
 - ChromaDB passes
+- Weaviate passes if configured, otherwise warns that Chroma fallback is used
 - Neo4j passes or warns if Neo4j is not running
 - FastAPI app imports
 
@@ -175,9 +191,10 @@ uv run multi-agentic-rag ingest-real-brd
 ```
 
 This copies managed document versions into `.multi_agentic_rag/documents`,
-writes metadata to SQLite, writes vectors to ChromaDB, writes graph data to
-Neo4j when available, marks V1 as superseded, marks V2 as active, and creates
-deterministic delta records where changes are found.
+writes parsed JSONL artifacts into `.multi_agentic_rag/objects`, writes metadata
+and FTS5 keyword entries to SQLite, writes vectors to Weaviate or ChromaDB,
+writes graph data to Neo4j when available, marks V1 as superseded, marks V2 as
+active, and creates deterministic delta records where changes are found.
 
 ### Option B: Use The Demo Workflow
 
@@ -271,6 +288,7 @@ uv run multi-rag --help
 ## 12. Local Files To Know
 
 - `.env`: local secrets and runtime configuration, ignored by git
+- `.env.example`: non-secret configuration template
 - `.multi_agentic_rag/`: app-managed runtime state, ignored by git
 - `.cache/`: local Hugging Face/model cache, ignored by git
 - `neo4j/`: local Neo4j helper data, ignored by git
@@ -279,4 +297,3 @@ uv run multi-rag --help
 - `ARCHITECTURE.mermaid`: architecture diagram source
 
 Do not manually edit `.multi_agentic_rag/` unless debugging local state.
-

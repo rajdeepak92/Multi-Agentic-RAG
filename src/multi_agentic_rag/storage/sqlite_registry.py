@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -10,10 +11,13 @@ from typing import Any
 from multi_agentic_rag.models import (
     ChunkRecord,
     CoverageRecord,
+    CoverageRunRecord,
     DeltaRecord,
     DocumentRecord,
     DocumentStatus,
     FactRecord,
+    GeneratedTestFileRecord,
+    TestRunResultRecord,
 )
 from multi_agentic_rag.utils.paths import resolve_path
 
@@ -128,14 +132,90 @@ class SQLiteRegistry:
                     automation_feasibility TEXT NOT NULL,
                     priority TEXT NOT NULL,
                     coverage_status TEXT NOT NULL,
-                    evidence_json TEXT NOT NULL
+                    evidence_json TEXT NOT NULL,
+                    document_id TEXT,
+                    version TEXT,
+                    chunk_id TEXT,
+                    scenario_index INTEGER,
+                    source_hash TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_coverage_requirement
                     ON coverage(requirement_id);
+
+                CREATE TABLE IF NOT EXISTS coverage_runs (
+                    run_id TEXT PRIMARY KEY,
+                    system_name TEXT NOT NULL,
+                    version TEXT,
+                    scope_hash TEXT NOT NULL,
+                    scenario_count INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    generated_count INTEGER NOT NULL,
+                    coverage_ids_json TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_coverage_runs_scope
+                    ON coverage_runs(system_name, version, scope_hash, scenario_count);
+
+                CREATE TABLE IF NOT EXISTS generated_test_files (
+                    test_file_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    system_name TEXT NOT NULL,
+                    version TEXT,
+                    scope_hash TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    tracking_file_path TEXT,
+                    harness_file_paths_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL,
+                    coverage_ids_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_generated_test_files_scope
+                    ON generated_test_files(system_name, version, scope_hash);
+
+                CREATE TABLE IF NOT EXISTS test_run_results (
+                    result_id TEXT PRIMARY KEY,
+                    test_file_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    system_name TEXT NOT NULL,
+                    version TEXT,
+                    file_path TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    exit_code INTEGER,
+                    passed INTEGER NOT NULL,
+                    failed INTEGER NOT NULL,
+                    skipped INTEGER NOT NULL,
+                    dependency_blockers_json TEXT NOT NULL,
+                    output TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_test_run_results_file
+                    ON test_run_results(test_file_id, created_at);
                 """
             )
+            self._create_keyword_index(connection)
             self._ensure_column(connection, "deltas", "fact_key", "TEXT")
+            for column_name, column_type in (
+                ("document_id", "TEXT"),
+                ("version", "TEXT"),
+                ("chunk_id", "TEXT"),
+                ("scenario_index", "INTEGER"),
+                ("source_hash", "TEXT"),
+            ):
+                self._ensure_column(connection, "coverage", column_name, column_type)
+            self._ensure_column(connection, "generated_test_files", "tracking_file_path", "TEXT")
+            self._ensure_column(
+                connection,
+                "generated_test_files",
+                "harness_file_paths_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
 
     def upsert_document(self, document: DocumentRecord) -> None:
         payload = document.model_dump(mode="json")
@@ -237,6 +317,13 @@ class SQLiteRegistry:
                 "UPDATE facts SET status = ? WHERE document_id = ?",
                 (status.value, document_id),
             )
+            try:
+                connection.execute(
+                    "UPDATE chunk_fts SET status = ? WHERE document_id = ?",
+                    (status.value, document_id),
+                )
+            except sqlite3.OperationalError:
+                pass
 
     def upsert_chunks(self, chunks: list[ChunkRecord]) -> None:
         if not chunks:
@@ -267,6 +354,7 @@ class SQLiteRegistry:
                 """,
                 rows,
             )
+            self._upsert_chunk_keywords(connection, rows)
 
     def list_chunks(
         self,
@@ -297,6 +385,58 @@ class SQLiteRegistry:
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [ChunkRecord(**dict(row)) for row in rows]
+
+    def search_chunks(
+        self,
+        query_text: str,
+        *,
+        system_name: str | None = None,
+        version: str | None = None,
+        status: DocumentStatus | None = None,
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Search chunks with SQLite FTS5 BM25 ranking."""
+
+        fts_query = self._to_fts_query(query_text)
+        if not fts_query:
+            return []
+        filters: list[str] = ["chunk_fts MATCH ?"]
+        params: list[Any] = [fts_query]
+        if system_name:
+            filters.append("system_name = ?")
+            params.append(system_name)
+        if version:
+            filters.append("version = ?")
+            params.append(version)
+        if status:
+            filters.append("status = ?")
+            params.append(status.value)
+        params.append(top_k)
+        sql = f"""
+            SELECT
+                chunk_id,
+                document_id,
+                system_name,
+                version,
+                status,
+                source_name,
+                page,
+                section_title,
+                chunk_index,
+                content_hash,
+                text,
+                bm25(chunk_fts) AS score
+            FROM chunk_fts
+            WHERE {" AND ".join(filters)}
+            ORDER BY score ASC
+            LIMIT ?
+        """
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [dict(row) for row in rows]
 
     def upsert_facts(self, facts: list[FactRecord]) -> None:
         if not facts:
@@ -444,11 +584,13 @@ class SQLiteRegistry:
                 """
                 INSERT INTO coverage (
                     coverage_id, requirement_id, use_case, test_scenario,
-                    automation_feasibility, priority, coverage_status, evidence_json
+                    automation_feasibility, priority, coverage_status, evidence_json,
+                    document_id, version, chunk_id, scenario_index, source_hash
                 )
                 VALUES (
                     :coverage_id, :requirement_id, :use_case, :test_scenario,
-                    :automation_feasibility, :priority, :coverage_status, :evidence_json
+                    :automation_feasibility, :priority, :coverage_status, :evidence_json,
+                    :document_id, :version, :chunk_id, :scenario_index, :source_hash
                 )
                 ON CONFLICT(coverage_id) DO UPDATE SET
                     requirement_id=excluded.requirement_id,
@@ -457,7 +599,12 @@ class SQLiteRegistry:
                     automation_feasibility=excluded.automation_feasibility,
                     priority=excluded.priority,
                     coverage_status=excluded.coverage_status,
-                    evidence_json=excluded.evidence_json
+                    evidence_json=excluded.evidence_json,
+                    document_id=excluded.document_id,
+                    version=excluded.version,
+                    chunk_id=excluded.chunk_id,
+                    scenario_index=excluded.scenario_index,
+                    source_hash=excluded.source_hash
                 """,
                 rows,
             )
@@ -472,6 +619,187 @@ class SQLiteRegistry:
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [self._coverage_from_row(row) for row in rows]
+
+    def list_coverage_by_ids(self, coverage_ids: list[str]) -> list[CoverageRecord]:
+        if not coverage_ids:
+            return []
+        placeholders = ", ".join("?" for _ in coverage_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM coverage WHERE coverage_id IN ({placeholders})",
+                coverage_ids,
+            ).fetchall()
+        by_id = {row["coverage_id"]: self._coverage_from_row(row) for row in rows}
+        return [by_id[coverage_id] for coverage_id in coverage_ids if coverage_id in by_id]
+
+    def upsert_coverage_run(self, record: CoverageRunRecord) -> None:
+        payload = record.model_dump(mode="json")
+        payload["coverage_ids_json"] = json.dumps(payload.pop("coverage_ids"), sort_keys=True)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO coverage_runs (
+                    run_id, system_name, version, scope_hash, scenario_count, status,
+                    generated_count, coverage_ids_json, message, created_at, updated_at
+                )
+                VALUES (
+                    :run_id, :system_name, :version, :scope_hash, :scenario_count, :status,
+                    :generated_count, :coverage_ids_json, :message, :created_at, :updated_at
+                )
+                ON CONFLICT(run_id) DO UPDATE SET
+                    system_name=excluded.system_name,
+                    version=excluded.version,
+                    scope_hash=excluded.scope_hash,
+                    scenario_count=excluded.scenario_count,
+                    status=excluded.status,
+                    generated_count=excluded.generated_count,
+                    coverage_ids_json=excluded.coverage_ids_json,
+                    message=excluded.message,
+                    updated_at=excluded.updated_at
+                """,
+                payload,
+            )
+
+    def find_coverage_run(
+        self,
+        *,
+        system_name: str,
+        version: str | None,
+        scope_hash: str,
+        scenario_count: int,
+        status: str | None = None,
+    ) -> CoverageRunRecord | None:
+        query = """
+            SELECT * FROM coverage_runs
+            WHERE system_name = ? AND scope_hash = ? AND scenario_count = ?
+        """
+        params: list[Any] = [system_name, scope_hash, scenario_count]
+        if version is None:
+            query += " AND version IS NULL"
+        else:
+            query += " AND version = ?"
+            params.append(version)
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY updated_at DESC LIMIT 1"
+        with self._connect() as connection:
+            row = connection.execute(query, params).fetchone()
+        return self._coverage_run_from_row(row) if row else None
+
+    def upsert_generated_test_file(self, record: GeneratedTestFileRecord) -> None:
+        payload = record.model_dump(mode="json")
+        payload["coverage_ids_json"] = json.dumps(payload.pop("coverage_ids"), sort_keys=True)
+        payload["harness_file_paths_json"] = json.dumps(
+            payload.pop("harness_file_paths"),
+            sort_keys=True,
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO generated_test_files (
+                    test_file_id, run_id, system_name, version, scope_hash, file_path,
+                    tracking_file_path, harness_file_paths_json, status, coverage_ids_json,
+                    created_at, updated_at
+                )
+                VALUES (
+                    :test_file_id, :run_id, :system_name, :version, :scope_hash, :file_path,
+                    :tracking_file_path, :harness_file_paths_json, :status,
+                    :coverage_ids_json, :created_at, :updated_at
+                )
+                ON CONFLICT(test_file_id) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    system_name=excluded.system_name,
+                    version=excluded.version,
+                    scope_hash=excluded.scope_hash,
+                    file_path=excluded.file_path,
+                    tracking_file_path=excluded.tracking_file_path,
+                    harness_file_paths_json=excluded.harness_file_paths_json,
+                    status=excluded.status,
+                    coverage_ids_json=excluded.coverage_ids_json,
+                    updated_at=excluded.updated_at
+                """,
+                payload,
+            )
+
+    def find_generated_test_file(
+        self,
+        *,
+        system_name: str,
+        version: str | None,
+        scope_hash: str,
+    ) -> GeneratedTestFileRecord | None:
+        query = """
+            SELECT * FROM generated_test_files
+            WHERE system_name = ? AND scope_hash = ?
+        """
+        params: list[Any] = [system_name, scope_hash]
+        if version is None:
+            query += " AND version IS NULL"
+        else:
+            query += " AND version = ?"
+            params.append(version)
+        query += " ORDER BY updated_at DESC LIMIT 1"
+        with self._connect() as connection:
+            row = connection.execute(query, params).fetchone()
+        return self._generated_test_file_from_row(row) if row else None
+
+    def get_generated_test_file(self, test_file_id: str) -> GeneratedTestFileRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM generated_test_files WHERE test_file_id = ?",
+                (test_file_id,),
+            ).fetchone()
+        return self._generated_test_file_from_row(row) if row else None
+
+    def insert_test_run_result(self, record: TestRunResultRecord) -> None:
+        payload = record.model_dump(mode="json")
+        payload["dependency_blockers_json"] = json.dumps(
+            payload.pop("dependency_blockers"),
+            sort_keys=True,
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO test_run_results (
+                    result_id, test_file_id, run_id, system_name, version, file_path,
+                    status, exit_code, passed, failed, skipped,
+                    dependency_blockers_json, output, created_at
+                )
+                VALUES (
+                    :result_id, :test_file_id, :run_id, :system_name, :version, :file_path,
+                    :status, :exit_code, :passed, :failed, :skipped,
+                    :dependency_blockers_json, :output, :created_at
+                )
+                ON CONFLICT(result_id) DO UPDATE SET
+                    status=excluded.status,
+                    exit_code=excluded.exit_code,
+                    passed=excluded.passed,
+                    failed=excluded.failed,
+                    skipped=excluded.skipped,
+                    dependency_blockers_json=excluded.dependency_blockers_json,
+                    output=excluded.output
+                """,
+                payload,
+            )
+
+    def get_latest_test_result(
+        self,
+        *,
+        system_name: str,
+        version: str | None = None,
+    ) -> TestRunResultRecord | None:
+        query = "SELECT * FROM test_run_results WHERE system_name = ?"
+        params: list[Any] = [system_name]
+        if version is None:
+            query += " AND version IS NULL"
+        else:
+            query += " AND version = ?"
+            params.append(version)
+        query += " ORDER BY created_at DESC LIMIT 1"
+        with self._connect() as connection:
+            row = connection.execute(query, params).fetchone()
+        return self._test_run_result_from_row(row) if row else None
 
     @staticmethod
     def _ensure_column(
@@ -488,6 +816,81 @@ class SQLiteRegistry:
             connection.execute(
                 f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
             )
+
+    @staticmethod
+    def _create_keyword_index(connection: sqlite3.Connection) -> None:
+        try:
+            connection.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
+                    chunk_id UNINDEXED,
+                    document_id UNINDEXED,
+                    system_name UNINDEXED,
+                    version UNINDEXED,
+                    status UNINDEXED,
+                    source_name UNINDEXED,
+                    page UNINDEXED,
+                    section_title UNINDEXED,
+                    chunk_index UNINDEXED,
+                    content_hash UNINDEXED,
+                    text,
+                    tokenize='unicode61'
+                )
+                """
+            )
+        except sqlite3.OperationalError:
+            return
+
+    @staticmethod
+    def _upsert_chunk_keywords(connection: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
+        try:
+            connection.executemany(
+                "DELETE FROM chunk_fts WHERE chunk_id = ?",
+                [(row["chunk_id"],) for row in rows],
+            )
+            connection.executemany(
+                """
+                INSERT INTO chunk_fts (
+                    chunk_id,
+                    document_id,
+                    system_name,
+                    version,
+                    status,
+                    source_name,
+                    page,
+                    section_title,
+                    chunk_index,
+                    content_hash,
+                    text
+                )
+                VALUES (
+                    :chunk_id,
+                    :document_id,
+                    :system_name,
+                    :version,
+                    :status,
+                    :source_name,
+                    :page,
+                    :section_title,
+                    :chunk_index,
+                    :content_hash,
+                    :text
+                )
+                """,
+                rows,
+            )
+        except sqlite3.OperationalError:
+            return
+
+    @staticmethod
+    def _to_fts_query(query_text: str) -> str:
+        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*", query_text)
+        quoted = []
+        for token in tokens[:16]:
+            clean = token.replace('"', '""')
+            if len(clean) >= 2:
+                quoted.append(f'"{clean}"')
+        return " OR ".join(quoted)
 
     @staticmethod
     def _document_from_row(row: sqlite3.Row) -> DocumentRecord:
@@ -510,3 +913,26 @@ class SQLiteRegistry:
         payload = dict(row)
         payload["evidence"] = json.loads(payload.pop("evidence_json") or "[]")
         return CoverageRecord(**payload)
+
+    @staticmethod
+    def _coverage_run_from_row(row: sqlite3.Row) -> CoverageRunRecord:
+        payload = dict(row)
+        payload["coverage_ids"] = json.loads(payload.pop("coverage_ids_json") or "[]")
+        return CoverageRunRecord(**payload)
+
+    @staticmethod
+    def _generated_test_file_from_row(row: sqlite3.Row) -> GeneratedTestFileRecord:
+        payload = dict(row)
+        payload["coverage_ids"] = json.loads(payload.pop("coverage_ids_json") or "[]")
+        payload["harness_file_paths"] = json.loads(
+            payload.pop("harness_file_paths_json", "[]") or "[]"
+        )
+        return GeneratedTestFileRecord(**payload)
+
+    @staticmethod
+    def _test_run_result_from_row(row: sqlite3.Row) -> TestRunResultRecord:
+        payload = dict(row)
+        payload["dependency_blockers"] = json.loads(
+            payload.pop("dependency_blockers_json") or "[]"
+        )
+        return TestRunResultRecord(**payload)

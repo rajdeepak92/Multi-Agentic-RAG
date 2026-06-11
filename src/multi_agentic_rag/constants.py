@@ -9,12 +9,14 @@ RUNTIME_DIR_NAME = ".multi_agentic_rag"
 DOCUMENTS_DIR_NAME = "documents"
 CHROMA_DIR_NAME = "chroma"
 EXPORTS_DIR_NAME = "exports"
+OBJECTS_DIR_NAME = "objects"
 REGISTRY_DB_NAME = "registry.db"
 
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_CHUNK_OVERLAP = 150
 
 GRAPH_COLLECTION_NAME = "multi_agentic_rag_chunks"
+WEAVIATE_COLLECTION_NAME = "MultiAgenticRagChunk"
 
 SCIENTIFIC_RULES = (
     "No evidence -> no answer.",

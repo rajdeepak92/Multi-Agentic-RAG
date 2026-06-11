@@ -14,7 +14,7 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 class IngestDocumentRequest(BaseModel):
     """Local document ingest request."""
 
-    path: str = Field(description="Local path to a PDF document.")
+    path: str = Field(description="Local path to a PDF or DOCX document.")
     system_name: str = Field(alias="system")
     version: str
 

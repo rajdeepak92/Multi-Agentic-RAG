@@ -98,6 +98,8 @@ class IngestionSummary:
     neo4j_write_status: str
     chroma_write_status: str
     sqlite_write_status: str
+    vector_provider: str = "chroma"
+    keyword_index_status: str = "PASS"
     warnings: list[str] = field(default_factory=list)
 
 
@@ -277,9 +279,11 @@ def ingest_version_pair(
         if result_v1.neo4j_available and result_v2.neo4j_available
         else "WARN",
         chroma_write_status="WARN"
-        if any("Chroma indexing skipped" in warning for warning in warnings)
+        if any("Vector indexing skipped" in warning for warning in warnings)
         else "PASS",
         sqlite_write_status="PASS",
+        vector_provider=result_v2.vector_store,
+        keyword_index_status="PASS" if result_v2.keyword_indexed else "WARN",
         warnings=warnings,
     )
 

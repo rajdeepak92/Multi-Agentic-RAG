@@ -6,7 +6,12 @@ import shutil
 from pathlib import Path
 
 from multi_agentic_rag.config import Settings
-from multi_agentic_rag.constants import CHROMA_DIR_NAME, DOCUMENTS_DIR_NAME, EXPORTS_DIR_NAME
+from multi_agentic_rag.constants import (
+    CHROMA_DIR_NAME,
+    DOCUMENTS_DIR_NAME,
+    EXPORTS_DIR_NAME,
+    OBJECTS_DIR_NAME,
+)
 
 
 def resolve_path(path: str | Path) -> Path:
@@ -22,7 +27,8 @@ def ensure_runtime_dirs(settings: Settings) -> dict[str, Path]:
     documents = home / DOCUMENTS_DIR_NAME
     chroma = resolve_path(settings.chroma_path)
     exports = home / EXPORTS_DIR_NAME
-    for path in (home, documents, chroma, exports):
+    objects = resolve_path(settings.object_store_path)
+    for path in (home, documents, chroma, exports, objects):
         path.mkdir(parents=True, exist_ok=True)
     settings.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
     return {
@@ -30,6 +36,7 @@ def ensure_runtime_dirs(settings: Settings) -> dict[str, Path]:
         "documents": documents,
         "chroma": chroma,
         "exports": exports,
+        OBJECTS_DIR_NAME: objects,
         "registry": resolve_path(settings.sqlite_db_path),
     }
 

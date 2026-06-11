@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from multi_agentic_rag.models import DocumentStatus
-from multi_agentic_rag.storage.chroma_store import ChromaVectorStore
+from multi_agentic_rag.storage.vector_store import VectorStore
 
 
 class VectorRetriever:
     """Thin retriever wrapper with status/version filters."""
 
-    def __init__(self, vector_store: ChromaVectorStore) -> None:
+    def __init__(self, vector_store: VectorStore) -> None:
         self.vector_store = vector_store
 
     def retrieve_current(self, query: str, *, system_name: str, top_k: int = 5):

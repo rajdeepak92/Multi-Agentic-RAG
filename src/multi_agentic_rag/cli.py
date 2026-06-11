@@ -11,13 +11,16 @@ from rich.console import Console
 from rich.table import Table
 
 from multi_agentic_rag.config import get_settings
-from multi_agentic_rag.coverage import generate_requirement_coverage
+from multi_agentic_rag.coverage import DEFAULT_SCENARIO_COUNT, plan_requirement_coverage
 from multi_agentic_rag.exceptions import IngestionError
 from multi_agentic_rag.ingestion import ingest_document
-from multi_agentic_rag.models import DocumentStatus
+from multi_agentic_rag.models import DocumentStatus, TaskResult, TestExecutionResult
 from multi_agentic_rag.retrieval import answer_query
 from multi_agentic_rag.storage.neo4j_store import Neo4jGraphStore
 from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.vector_factory import select_vector_store
+from multi_agentic_rag.tasks import handle_task
+from multi_agentic_rag.testing import generate_testcases, get_last_test_result, run_testcases
 from multi_agentic_rag.utils.diagnostics import DiagnosticCheck, run_diagnostics
 from multi_agentic_rag.utils.paths import ensure_runtime_dirs
 from multi_agentic_rag.workflows import (
@@ -51,10 +54,16 @@ def init() -> None:
     console.print(f"Home: {paths['home']}")
     console.print(f"Documents: {paths['documents']}")
     console.print(f"Chroma: {paths['chroma']}")
+    console.print(f"Objects: {paths['objects']}")
     console.print(f"Exports: {paths['exports']}")
     console.print(f"SQLite registry: {paths['registry']}")
+    try:
+        selection = select_vector_store(settings)
+        console.print(f"Vector provider: {selection.provider} ({selection.reason})")
+    except Exception as exc:
+        console.print(f"[yellow]WARN[/yellow] Vector provider not ready: {exc}")
     console.print("\nNext steps:")
-    console.print("1. Copy .env.example to .env and update local settings.")
+    console.print("1. Create or edit .env with local settings.")
     console.print("2. Start Neo4j manually from Neo4j Desktop if graph indexing is needed.")
     console.print("3. Run: multi-agentic-rag doctor")
 
@@ -156,11 +165,11 @@ def api(
 
 @app.command("ingest")
 def ingest(
-    path: Annotated[Path, typer.Argument(help="Path to PDF document.")],
+    path: Annotated[Path, typer.Argument(help="Path to PDF or DOCX document.")],
     system: Annotated[str, typer.Option("--system", help="System name.")],
     version: Annotated[str, typer.Option("--version", help="Document version.")],
 ) -> None:
-    """Ingest a versioned PDF document."""
+    """Ingest a versioned PDF or DOCX document."""
 
     result = ingest_document(path, system_name=system, version=version)
     console.print(f"[green]Ingested[/green] {result.document.source_name}")
@@ -169,9 +178,61 @@ def ingest(
     console.print(f"Chunks indexed: {result.chunks_indexed}")
     console.print(f"Facts extracted: {result.facts_extracted}")
     console.print(f"Deltas created: {result.deltas_created}")
+    console.print(f"Vector store: {result.vector_store}")
+    console.print(f"Keyword indexed: {result.keyword_indexed}")
+    if result.object_store_path:
+        console.print(f"Parsed artifact: {result.object_store_path}")
     console.print(f"Neo4j available: {result.neo4j_available}")
     for warning in result.warnings:
         console.print(f"[yellow]WARN[/yellow] {warning}")
+
+
+@app.command("ingest-doc")
+def ingest_doc(
+    path: Annotated[Path, typer.Argument(help="Path to PDF or DOCX document.")],
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str, typer.Option("--version", help="Document version.")],
+) -> None:
+    """Alias for ingesting a versioned PDF or DOCX document."""
+
+    ingest(path=path, system=system, version=version)
+
+
+@app.command("ingest-folder")
+def ingest_folder(
+    folder: Annotated[Path, typer.Argument(help="Folder containing PDF/DOCX documents.")],
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str, typer.Option("--version", help="Document version.")],
+) -> None:
+    """Ingest every supported document in a folder for the same system/version."""
+
+    if not folder.exists() or not folder.is_dir():
+        console.print(f"[red]Folder does not exist:[/red] {folder}")
+        raise typer.Exit(code=1)
+    supported = sorted(
+        path
+        for path in folder.iterdir()
+        if path.is_file() and path.suffix.lower() in {".pdf", ".docx"}
+    )
+    if not supported:
+        console.print("[yellow]No supported .pdf or .docx files found.[/yellow]")
+        raise typer.Exit(code=1)
+    table = Table(title="Folder Ingestion")
+    table.add_column("File")
+    table.add_column("Status")
+    table.add_column("Chunks")
+    table.add_column("Facts")
+    for path in supported:
+        result = ingest_document(path, system_name=system, version=version)
+        table.add_row(
+            path.name,
+            result.document.status.value,
+            str(result.chunks_indexed),
+            str(result.facts_extracted),
+        )
+        for warning in result.warnings:
+            console.print(f"[yellow]WARN[/yellow] {path.name}: {warning}")
+    console.print(table)
 
 
 @app.command("query")
@@ -236,34 +297,132 @@ def delta(
 @app.command("coverage")
 def coverage(
     system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
+    count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
 ) -> None:
-    """Generate baseline coverage records from active requirement evidence."""
+    """Generate or reuse tracked coverage records."""
 
-    registry = SQLiteRegistry(get_settings().sqlite_db_path)
-    registry.initialize()
-    requirement_facts = [
-        fact
-        for fact in registry.list_facts(system_name=system, status=DocumentStatus.ACTIVE)
-        if fact.fact_type == "requirement"
-    ]
-    if not requirement_facts:
-        console.print("[yellow]No active requirement evidence found. No coverage claim made.[/yellow]")
+    result = plan_requirement_coverage(
+        system_name=system,
+        version=version,
+        scenario_count=count,
+    )
+    if not result.supported:
+        console.print(f"[yellow]{result.message}[/yellow]")
         return
-    records = generate_requirement_coverage(requirement_facts)
-    registry.upsert_coverage(records)
     table = Table(title="Coverage Records")
     table.add_column("Requirement")
+    table.add_column("Index")
     table.add_column("Scenario")
     table.add_column("Status")
     table.add_column("Priority")
-    for record in records:
+    for record in result.records:
         table.add_row(
             record.requirement_id,
+            str(record.scenario_index or ""),
             record.test_scenario,
             record.coverage_status,
             record.priority,
         )
     console.print(table)
+    console.print(f"{result.action}: {result.message}")
+
+
+@app.command("coverage-plan")
+def coverage_plan(
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
+    count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
+    force: Annotated[bool, typer.Option("--force", help="Regenerate even if covered.")] = False,
+) -> None:
+    """Generate or reuse tracked coverage scenarios."""
+
+    result = plan_requirement_coverage(
+        system_name=system,
+        version=version,
+        scenario_count=count,
+        force=force,
+    )
+    console.print(f"{result.action}: {result.message}")
+    if result.run:
+        console.print(f"Run ID: {result.run.run_id}")
+        console.print(f"Scope hash: {result.run.scope_hash}")
+        console.print(f"Generated count: {result.run.generated_count}")
+    if not result.supported:
+        raise typer.Exit(code=1)
+
+
+@app.command("generate-tests")
+def generate_tests(
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
+    count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
+    force: Annotated[bool, typer.Option("--force", help="Rewrite generated file.")] = False,
+) -> None:
+    """Generate or reuse a pytest testcase file from coverage evidence."""
+
+    result = generate_testcases(
+        system_name=system,
+        version=version,
+        scenario_count=count,
+        force=force,
+    )
+    console.print(f"{result.action}: {result.message}")
+    if result.test_file:
+        console.print(f"Test file: {result.test_file.file_path}")
+    if not result.supported:
+        raise typer.Exit(code=1)
+
+
+@app.command("run-testcases")
+def run_testcases_command(
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
+    count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
+) -> None:
+    """Run the generated pytest testcase file and store results."""
+
+    result = run_testcases(
+        system_name=system,
+        version=version,
+        scenario_count=count,
+    )
+    _print_test_execution(result)
+    if not result.supported:
+        raise typer.Exit(code=1)
+
+
+@app.command("last-results")
+def last_results(
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
+) -> None:
+    """Show the last stored testcase execution result without rerunning."""
+
+    result = get_last_test_result(system_name=system, version=version)
+    _print_test_execution(result)
+    if not result.supported:
+        raise typer.Exit(code=1)
+
+
+@app.command("task")
+def task(
+    user_request: Annotated[str, typer.Argument(help="Natural-language MARAG task.")],
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
+    count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
+) -> None:
+    """Route a natural-language request to query, coverage, writer, or runner agents."""
+
+    result = handle_task(
+        user_request,
+        system_name=system,
+        version=version,
+        scenario_count=count,
+    )
+    _print_task_result(result)
+    if not result.supported:
+        raise typer.Exit(code=1)
 
 
 @app.command("mcp-info")
@@ -329,7 +488,9 @@ def _print_ingestion_summary(summary: IngestionSummary) -> None:
     table.add_row("number_of_extracted_facts", str(summary.number_of_extracted_facts))
     table.add_row("number_of_delta_records", str(summary.number_of_delta_records))
     table.add_row("Neo4j write status", summary.neo4j_write_status)
-    table.add_row("Chroma write status", summary.chroma_write_status)
+    table.add_row("Vector provider", summary.vector_provider)
+    table.add_row("Vector write status", summary.chroma_write_status)
+    table.add_row("Keyword index status", summary.keyword_index_status)
     table.add_row("SQLite write status", summary.sqlite_write_status)
     console.print(table)
     for warning in summary.warnings:
@@ -355,6 +516,47 @@ def _print_demo_run(result: DemoRunResult) -> None:
     console.print(f"Historical query: {result.historical_query.answer}")
     console.print(f"Delta query: {result.delta_query.answer}")
     console.print(f"Coverage draft records: {len(result.coverage_records)}")
+
+
+def _print_test_execution(result: TestExecutionResult) -> None:
+    style = "green" if result.supported else "yellow"
+    console.print(f"[{style}]{result.action}: {result.message}[/{style}]")
+    if result.test_file:
+        console.print(f"Test file: {result.test_file.file_path}")
+    if result.result:
+        table = Table(title="Test Run Result")
+        table.add_column("Field")
+        table.add_column("Value")
+        table.add_row("status", result.result.status)
+        table.add_row("exit_code", "" if result.result.exit_code is None else str(result.result.exit_code))
+        table.add_row("passed", str(result.result.passed))
+        table.add_row("failed", str(result.result.failed))
+        table.add_row("skipped", str(result.result.skipped))
+        table.add_row("created_at", result.result.created_at)
+        console.print(table)
+    for warning in result.warnings:
+        console.print(f"[yellow]WARN[/yellow] {warning}")
+
+
+def _print_task_result(result: TaskResult) -> None:
+    style = "green" if result.supported else "yellow"
+    console.print(f"[{style}]{result.intent}: {result.message}[/{style}]")
+    if result.query and result.query.evidence:
+        console.print("\nEvidence:")
+        for evidence in result.query.evidence[:10]:
+            console.print(
+                f"- {evidence.source_name} p.{evidence.page} "
+                f"({evidence.version}, {evidence.chunk_id})"
+            )
+    if result.coverage and result.coverage.run:
+        console.print(f"Coverage run: {result.coverage.run.run_id}")
+        console.print(f"Coverage records: {len(result.coverage.records)}")
+    if result.test_generation and result.test_generation.test_file:
+        console.print(f"Test file: {result.test_generation.test_file.file_path}")
+    if result.test_execution:
+        _print_test_execution(result.test_execution)
+    for warning in result.warnings:
+        console.print(f"[yellow]WARN[/yellow] {warning}")
 
 
 if __name__ == "__main__":

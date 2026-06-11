@@ -5,6 +5,12 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from multi_agentic_rag.models.chunk import ChunkRecord
+from multi_agentic_rag.models.coverage import (
+    CoverageRecord,
+    CoverageRunRecord,
+    GeneratedTestFileRecord,
+    TestRunResultRecord,
+)
 from multi_agentic_rag.models.delta import DeltaRecord
 from multi_agentic_rag.models.document import DocumentRecord
 from multi_agentic_rag.models.graph import FactRecord
@@ -30,6 +36,9 @@ class IngestResult(BaseModel):
     facts_extracted: int
     deltas_created: int
     neo4j_available: bool
+    vector_store: str = "chroma"
+    keyword_indexed: int = 0
+    object_store_path: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -46,4 +55,56 @@ class QueryResult(BaseModel):
     chunks: list[ChunkRecord] = Field(default_factory=list)
     deltas: list[DeltaRecord] = Field(default_factory=list)
     evidence: list[EvidenceRecord] = Field(default_factory=list)
+    retrieval_sources: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class CoveragePlanResult(BaseModel):
+    """Result of creating or reusing a coverage plan."""
+
+    supported: bool
+    action: str
+    message: str
+    run: CoverageRunRecord | None = None
+    records: list[CoverageRecord] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TestGenerationResult(BaseModel):
+    """Result of writing or reusing a generated testcase file."""
+
+    supported: bool
+    action: str
+    message: str
+    coverage: CoveragePlanResult | None = None
+    test_file: GeneratedTestFileRecord | None = None
+    tracking_file_path: str | None = None
+    harness_file_paths: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TestExecutionResult(BaseModel):
+    """Result of executing generated testcases."""
+
+    supported: bool
+    action: str
+    message: str
+    test_file: GeneratedTestFileRecord | None = None
+    result: TestRunResultRecord | None = None
+    tracking_file_path: str | None = None
+    attempts: int = 0
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TaskResult(BaseModel):
+    """Natural-language task router result."""
+
+    supported: bool
+    intent: str
+    message: str
+    query: QueryResult | None = None
+    coverage: CoveragePlanResult | None = None
+    test_generation: TestGenerationResult | None = None
+    test_execution: TestExecutionResult | None = None
+    last_result: TestRunResultRecord | None = None
     warnings: list[str] = Field(default_factory=list)

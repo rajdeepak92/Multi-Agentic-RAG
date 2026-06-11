@@ -86,6 +86,8 @@ class ChromaVectorStore:
     function or an enterprise vector store can replace it later.
     """
 
+    name = "chroma"
+
     def __init__(
         self,
         path: str | Path,

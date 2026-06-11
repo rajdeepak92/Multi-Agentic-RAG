@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from multi_agentic_rag.api import routes_coverage, routes_delta, routes_documents, routes_queries
+from multi_agentic_rag.api import (
+    routes_coverage,
+    routes_delta,
+    routes_documents,
+    routes_queries,
+    routes_tasks,
+    routes_tests,
+)
 from multi_agentic_rag.utils.diagnostics import run_diagnostics
 
 
@@ -29,6 +36,8 @@ def create_app() -> FastAPI:
     application.include_router(routes_queries.router)
     application.include_router(routes_delta.router)
     application.include_router(routes_coverage.router)
+    application.include_router(routes_tests.router)
+    application.include_router(routes_tasks.router)
     return application
 
 

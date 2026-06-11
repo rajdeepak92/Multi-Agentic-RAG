@@ -7,8 +7,9 @@ from multi_agentic_rag.models import ChunkRecord, DocumentStatus, EvidenceRecord
 from multi_agentic_rag.models.graph import FactRecord
 from multi_agentic_rag.retrieval.graph_retriever import GraphRetriever
 from multi_agentic_rag.retrieval.intent import QueryIntent, detect_intent
-from multi_agentic_rag.storage.chroma_store import ChromaVectorStore
+from multi_agentic_rag.retrieval.keyword_retriever import KeywordRetriever
 from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.vector_factory import select_vector_store
 
 
 def answer_query(
@@ -50,6 +51,9 @@ def answer_query(
         status=status,
     )
     warnings: list[str] = []
+    retrieval_sources: list[str] = []
+    if facts:
+        retrieval_sources.append("registry")
     vector_chunks, vector_warnings = _query_vector_chunks(
         query=query,
         registry=registry,
@@ -59,6 +63,19 @@ def answer_query(
         status=status,
     )
     warnings.extend(vector_warnings)
+    if vector_chunks:
+        retrieval_sources.append("vector")
+    keyword_chunks, keyword_warnings = _query_keyword_chunks(
+        query=query,
+        registry=registry,
+        settings=settings,
+        system_name=system_name,
+        version=version,
+        status=status,
+    )
+    warnings.extend(keyword_warnings)
+    if keyword_chunks:
+        retrieval_sources.append("keyword")
     graph_facts, graph_warning = _query_graph_facts(
         registry=registry,
         settings=settings,
@@ -67,8 +84,10 @@ def answer_query(
     )
     if graph_warning:
         warnings.append(f"Neo4j graph facts unavailable: {graph_warning}")
+    if graph_facts:
+        retrieval_sources.append("graph")
     facts = _dedupe_facts(facts + graph_facts)
-    chunks = _dedupe_chunks(_chunks_for_facts(registry, facts) + vector_chunks)
+    chunks = _dedupe_chunks(_chunks_for_facts(registry, facts) + vector_chunks + keyword_chunks)
     if not facts and not chunks:
         return _unsupported(
             query=query,
@@ -79,7 +98,9 @@ def answer_query(
         )
     selected = _select_relevant_facts(query, facts)
     if selected:
-        chunks = _dedupe_chunks(_chunks_for_facts(registry, selected) + vector_chunks)
+        chunks = _dedupe_chunks(
+            _chunks_for_facts(registry, selected) + vector_chunks + keyword_chunks
+        )
         answer = _render_fact_answer(selected, status=status)
         return QueryResult(
             query=query,
@@ -91,6 +112,7 @@ def answer_query(
             facts=selected,
             chunks=chunks,
             evidence=_evidence_records(chunks),
+            retrieval_sources=retrieval_sources,
             warnings=warnings,
         )
     return QueryResult(
@@ -102,6 +124,7 @@ def answer_query(
         answer=f"Found {len(chunks)} evidence chunk(s), but no extracted fact matched exactly.",
         chunks=chunks,
         evidence=_evidence_records(chunks),
+        retrieval_sources=retrieval_sources,
         warnings=warnings
         + ["Answer limited to retrieved evidence chunks; no unsupported fact was generated."],
     )
@@ -149,6 +172,7 @@ def _answer_delta_query(
         deltas=selected,
         chunks=chunks,
         evidence=_evidence_records(chunks),
+        retrieval_sources=["registry"],
         warnings=[],
     )
 
@@ -181,6 +205,7 @@ def _answer_coverage_query(
         facts=requirement_facts,
         chunks=chunks,
         evidence=_evidence_records(chunks),
+        retrieval_sources=["registry"],
     )
 
 
@@ -264,13 +289,47 @@ def _query_vector_chunks(
         "status": status.value,
     }
     try:
-        results = ChromaVectorStore(settings.chroma_path).query(
+        selection = select_vector_store(settings)
+        results = selection.store.query(
             query,
             filters=filters,
             top_k=5,
         )
     except Exception as exc:
-        return [], [f"Chroma chunk retrieval unavailable: {exc}"]
+        return [], [f"Vector chunk retrieval unavailable: {exc}"]
+    chunk_ids = [result["chunk_id"] for result in results]
+    if not chunk_ids:
+        return [], []
+    candidates = registry.list_chunks(
+        system_name=system_name,
+        version=version,
+        status=status,
+    )
+    by_id = {chunk.chunk_id: chunk for chunk in candidates}
+    return [by_id[chunk_id] for chunk_id in chunk_ids if chunk_id in by_id], []
+
+
+def _query_keyword_chunks(
+    *,
+    query: str,
+    registry: SQLiteRegistry,
+    settings: Settings,
+    system_name: str | None,
+    version: str | None,
+    status: DocumentStatus,
+) -> tuple[list[ChunkRecord], list[str]]:
+    if not settings.keyword_index_enabled:
+        return [], []
+    try:
+        results = KeywordRetriever(registry).retrieve(
+            query,
+            system_name=system_name,
+            version=version,
+            status=status,
+            top_k=5,
+        )
+    except Exception as exc:
+        return [], [f"Keyword retrieval unavailable: {exc}"]
     chunk_ids = [result["chunk_id"] for result in results]
     if not chunk_ids:
         return [], []

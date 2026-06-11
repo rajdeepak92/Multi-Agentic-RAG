@@ -119,20 +119,50 @@ class GraphRetriever:
             system_name=system_name,
         )
 
+    def get_related_subgraph(
+        self,
+        *,
+        system_name: str,
+        entity_text: str,
+        max_records: int = 50,
+    ) -> GraphRetrievalResult:
+        """Return a bounded active subgraph around a named entity or fact key."""
+
+        return self._run(
+            """
+            MATCH (:System {system_name: $system_name})-[:HAS_DOCUMENT]->(d:Document {status: 'active'})
+            MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
+            MATCH path = (c)-[*1..2]-(n)
+            WHERE toLower(coalesce(n.name, n.fact_key, n.requirement_id, n.value, ''))
+                CONTAINS toLower($entity_text)
+            RETURN
+                d.document_id AS document_id,
+                d.version AS version,
+                c.chunk_id AS chunk_id,
+                labels(n) AS labels,
+                properties(n) AS properties,
+                length(path) AS hops
+            ORDER BY hops ASC
+            LIMIT $max_records
+            """,
+            system_name=system_name,
+            entity_text=entity_text,
+            max_records=max_records,
+        )
+
     def retrieve(self, query: str, *, system_name: str) -> list[dict[str, Any]]:
         """Backward-compatible current-fact retrieval facade."""
 
         _ = query
         return self.get_current_facts(system_name).records
 
-    def _run(self, cypher: str, *, system_name: str) -> GraphRetrievalResult:
+    def _run(self, cypher: str, **params: Any) -> GraphRetrievalResult:
         available, message = self.graph_store.check_connection()
         if not available:
             return GraphRetrievalResult(records=[], warning=message)
         try:
-            driver = self.graph_store._get_driver()
-            with driver.session() as session:
-                result = session.run(cypher, {"system_name": system_name})
+            with self.graph_store.session() as session:
+                result = session.run(cypher, params)
                 return GraphRetrievalResult(records=[dict(record) for record in result])
         except Exception as exc:  # pragma: no cover - depends on local Neo4j
             return GraphRetrievalResult(records=[], warning=str(exc))

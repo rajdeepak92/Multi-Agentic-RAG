@@ -24,16 +24,37 @@ def test_graph_check_uses_temp_node_with_mocked_driver(tmp_path) -> None:
     assert any("DETACH DELETE" in query for query, _ in driver.session_obj.runs)
 
 
+def test_graph_store_uses_configured_database_for_sessions(tmp_path) -> None:
+    driver = FakeDriver()
+    store = Neo4jGraphStore(
+        Settings(
+            multi_agentic_rag_home=tmp_path / ".runtime",
+            sqlite_db_path=tmp_path / ".runtime" / "registry.db",
+            chroma_path=tmp_path / ".runtime" / "chroma",
+            neo4j_uri="bolt://fake:7687",
+            neo4j_database="neo4j",
+        )
+    )
+    store._driver = driver
+
+    with store.session():
+        pass
+
+    assert driver.session_kwargs == [{"database": "neo4j"}]
+
+
 class FakeDriver:
     def __init__(self) -> None:
         self.verified = False
         self.closed = False
         self.session_obj = FakeSession()
+        self.session_kwargs = []
 
     def verify_connectivity(self) -> None:
         self.verified = True
 
-    def session(self):
+    def session(self, **kwargs):
+        self.session_kwargs.append(kwargs)
         return self.session_obj
 
     def close(self) -> None:

@@ -1,49 +1,141 @@
 flowchart TD
-  A["BRD V1/V2 source PDFs"]
-  B["CLI / FastAPI ingestion"]
-  C["PyMuPDF parser"]
-  D["Chunker"]
-  E["Deterministic extractors"]
-  F["SQLite registry"]
-  G["ChromaDB local vector store"]
-  H["Neo4j Knowledge Graph"]
-  I["LangGraph workflow skeleton"]
-  J["Hybrid retriever"]
-  K["Query / Delta / Coverage outputs"]
+  User["User task, CLI, or FastAPI request"]
+  Router{"IntentRouter"}
 
-  A --> B
-  B --> C
-  C --> D
-  D --> E
-  E --> F
-  D --> G
-  E --> H
-  F --> J
-  G --> J
-  H --> J
-  I --> B
-  I --> J
-  J --> K
+  User --> Router
+  Router --> IngestWorkflow["ingest_document workflow"]
+  Router --> TestWorkflow["generate_test_automation workflow"]
+  Router --> ChatWorkflow["answer_document_question workflow"]
 
-  subgraph VersionLifecycle["Version lifecycle"]
-    L1["V1 active first"]
-    L2["V2 ingested later"]
-    L3["V1 becomes superseded"]
-    L4["V2 becomes active"]
-    L5["Old evidence preserved"]
-    L6["No hard delete"]
-    L1 --> L2 --> L3 --> L4 --> L5 --> L6
+  subgraph Ingestion["Document ingestion and evidence indexing"]
+    SourceDocs["documents/inbox/<system> PDFs and DOCX"]
+    Parser["PyMuPDF, pdfplumber, python-docx, optional OCR"]
+    Chunker["Context-preserving chunker"]
+    Extractors["Deterministic requirement, sensor, protocol, threshold extractors"]
+    Registry["SQLite registry metadata, facts, deltas, coverage, test results"]
+    Keyword["SQLite FTS5 BM25 keyword index"]
+    Objects["Filesystem object store raw copies and parsed JSONL"]
+    VectorChoice{"Vector provider"}
+    Weaviate["Weaviate when configured"]
+    Chroma["ChromaDB local fallback"]
+    Neo4j["Neo4j knowledge graph when reachable"]
+
+    SourceDocs --> Parser --> Chunker --> Extractors
+    Chunker --> Registry
+    Extractors --> Registry
+    Chunker --> Keyword
+    Chunker --> Objects
+    Chunker --> VectorChoice
+    VectorChoice --> Weaviate
+    VectorChoice --> Chroma
+    Extractors --> Neo4j
   end
 
-  F --> VersionLifecycle
-  H --> VersionLifecycle
+  IngestWorkflow --> SourceDocs
 
-  subgraph FuturePlaceholders["Future placeholders"]
-    M["MCP server placeholder only"]
-    N["PostgreSQL / Weaviate / OpenSearch / MinIO-S3"]
-    O["Production UI / auth / enterprise deployment"]
+  subgraph Retrieval["Evidence retrieval"]
+    GraphRetriever["Graph retriever"]
+    VectorRetriever["Vector retriever"]
+    KeywordRetriever["BM25 keyword retriever"]
+    RegistryRetriever["Registry and delta lookup"]
+    EvidenceMerger["Hybrid evidence merger and deduper"]
+    Answer["Evidence-gated answer"]
+
+    Neo4j --> GraphRetriever
+    Weaviate --> VectorRetriever
+    Chroma --> VectorRetriever
+    Keyword --> KeywordRetriever
+    Registry --> RegistryRetriever
+    GraphRetriever --> EvidenceMerger
+    VectorRetriever --> EvidenceMerger
+    KeywordRetriever --> EvidenceMerger
+    RegistryRetriever --> EvidenceMerger
+    EvidenceMerger --> Answer
   end
 
-  K -. later .-> M
-  F -. later .-> N
-  K -. later .-> O
+  ChatWorkflow --> EvidenceMerger
+
+  subgraph Automation["Document-grounded dummy test automation"]
+    Resolver["DocumentResolver"]
+    Collector["EvidenceCollector"]
+    Selector["ScenarioSelector"]
+    CoveragePlanner["Coverage planner"]
+    DependencyAudit["DependencyAuditAgent controlled dependency audit"]
+    Harness["HarnessAgent writes pytest.ini and conftest.py"]
+    Writer["TestCodeWriterAgent writes pytest class tests"]
+    Tracking["TrackingJsonAgent writes sidecar JSON"]
+    Generated["generated/project_1/brd_v1 artifacts"]
+    Validator["PytestValidationAgent py_compile"]
+    Executor["ExecutionAgent runs pytest in artifact folder"]
+    Debugger["FailureDebuggerAgent classify and retry up to 5"]
+    DbUpdate["DbUpdateAgent stores coverage, generated files, and runs"]
+    Result["PASS, FAIL, or BLOCKED result"]
+
+    Resolver --> Collector --> Selector --> CoveragePlanner
+    CoveragePlanner --> DependencyAudit --> Harness --> Writer --> Tracking
+    Harness --> Generated
+    Writer --> Generated
+    Tracking --> Generated
+    Generated --> Validator --> Executor --> Debugger --> Result
+    Debugger --> DbUpdate
+    Result --> DbUpdate
+  end
+
+  TestWorkflow --> Resolver
+  EvidenceMerger --> Collector
+  Registry --> CoveragePlanner
+  Registry --> DbUpdate
+
+  subgraph Ontology["Industrial ontology anchors"]
+    Requirement["Requirement"]
+    Device["Device"]
+    Sensor["Sensor and SOSA hints"]
+    Protocol["Protocol Modbus, CAN, REST, MQTT"]
+    Threshold["Threshold and unit"]
+    Interface["MQTT topic, REST endpoint, CAN ID, Modbus register"]
+    TestCase["Test case"]
+  end
+
+  Extractors --> Ontology
+  Ontology --> Neo4j
+
+  subgraph Versioning["Version lifecycle"]
+    V1["BRD v1 active"]
+    V2["BRD v2 arrives"]
+    Superseded["Older evidence marked superseded"]
+    Delta["Delta records stored"]
+    Preserve["Old evidence preserved for versioned truth"]
+
+    V1 --> V2 --> Superseded --> Delta --> Preserve
+  end
+
+  Registry --> Versioning
+  Neo4j --> Versioning
+
+  subgraph Orchestration["Orchestration direction"]
+    LangGraph["LangGraph main orchestrator"]
+    OpenAI["OpenAI model for routing, planning, debugging"]
+    HF["HuggingFace embeddings and reranking"]
+    BM25["BM25 exact keyword retrieval"]
+
+    LangGraph -. planned stateful graph .-> Router
+    OpenAI -. planned reasoning brain .-> Router
+    OpenAI -. planned reasoning brain .-> Selector
+    OpenAI -. planned reasoning brain .-> Debugger
+    HF -. optional model-backed embeddings .-> VectorRetriever
+    BM25 --> KeywordRetriever
+  end
+
+  subgraph Planned["Planned production backends"]
+    Postgres["PostgreSQL metadata"]
+    OpenSearch["OpenSearch BM25"]
+    Minio["MinIO or S3 object store"]
+    MCP["Full MCP server"]
+    UI["Production auth and UI"]
+  end
+
+  Registry -. migrate .-> Postgres
+  Keyword -. migrate .-> OpenSearch
+  Objects -. migrate .-> Minio
+  Answer -. later .-> MCP
+  Result -. later .-> UI

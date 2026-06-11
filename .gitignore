@@ -1,4 +1,4 @@
-# Python-generated files
+# Python build/test artifacts
 __pycache__/
 *.py[oc]
 build/
@@ -12,13 +12,26 @@ wheels/
 htmlcov/
 
 # Virtual environments
-.venv
+.venv/
 
-# Local runtime state
+# Local secrets and machine-specific settings
 .env
-neo4j/desktop-data/
-neo4j/dumps/*.dump
-neo4j/dumps/*.backup
-neo4j/dumps/*.tar
+
+# MARAG runtime state
 .multi_agentic_rag/
 .cache/
+generated/
+tests/generated/
+
+# Local Neo4j Desktop/runtime data
+neo4j/desktop-data/
+neo4j/runtime/
+neo4j/dumps/
+neo4j/import/
+neo4j-desktop-data/
+
+# Local logs and ad hoc database files
+*.log
+*.db
+*.sqlite
+*.sqlite3

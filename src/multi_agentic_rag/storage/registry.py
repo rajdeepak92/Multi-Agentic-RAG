@@ -8,10 +8,13 @@ from typing import Protocol
 from multi_agentic_rag.models import (
     ChunkRecord,
     CoverageRecord,
+    CoverageRunRecord,
     DeltaRecord,
     DocumentRecord,
     DocumentStatus,
     FactRecord,
+    GeneratedTestFileRecord,
+    TestRunResultRecord,
 )
 
 
@@ -83,3 +86,38 @@ class Registry(Protocol):
         *,
         requirement_id: str | None = None,
     ) -> list[CoverageRecord]: ...
+
+    def list_coverage_by_ids(self, coverage_ids: list[str]) -> list[CoverageRecord]: ...
+
+    def upsert_coverage_run(self, record: CoverageRunRecord) -> None: ...
+
+    def find_coverage_run(
+        self,
+        *,
+        system_name: str,
+        version: str | None,
+        scope_hash: str,
+        scenario_count: int,
+        status: str | None = None,
+    ) -> CoverageRunRecord | None: ...
+
+    def upsert_generated_test_file(self, record: GeneratedTestFileRecord) -> None: ...
+
+    def find_generated_test_file(
+        self,
+        *,
+        system_name: str,
+        version: str | None,
+        scope_hash: str,
+    ) -> GeneratedTestFileRecord | None: ...
+
+    def get_generated_test_file(self, test_file_id: str) -> GeneratedTestFileRecord | None: ...
+
+    def insert_test_run_result(self, record: TestRunResultRecord) -> None: ...
+
+    def get_latest_test_result(
+        self,
+        *,
+        system_name: str,
+        version: str | None = None,
+    ) -> TestRunResultRecord | None: ...
