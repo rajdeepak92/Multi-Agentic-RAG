@@ -1,0 +1,49 @@
+flowchart TD
+  A["BRD V1/V2 source PDFs"]
+  B["CLI / FastAPI ingestion"]
+  C["PyMuPDF parser"]
+  D["Chunker"]
+  E["Deterministic extractors"]
+  F["SQLite registry"]
+  G["ChromaDB local vector store"]
+  H["Neo4j Knowledge Graph"]
+  I["LangGraph workflow skeleton"]
+  J["Hybrid retriever"]
+  K["Query / Delta / Coverage outputs"]
+
+  A --> B
+  B --> C
+  C --> D
+  D --> E
+  E --> F
+  D --> G
+  E --> H
+  F --> J
+  G --> J
+  H --> J
+  I --> B
+  I --> J
+  J --> K
+
+  subgraph VersionLifecycle["Version lifecycle"]
+    L1["V1 active first"]
+    L2["V2 ingested later"]
+    L3["V1 becomes superseded"]
+    L4["V2 becomes active"]
+    L5["Old evidence preserved"]
+    L6["No hard delete"]
+    L1 --> L2 --> L3 --> L4 --> L5 --> L6
+  end
+
+  F --> VersionLifecycle
+  H --> VersionLifecycle
+
+  subgraph FuturePlaceholders["Future placeholders"]
+    M["MCP server placeholder only"]
+    N["PostgreSQL / Weaviate / OpenSearch / MinIO-S3"]
+    O["Production UI / auth / enterprise deployment"]
+  end
+
+  K -. later .-> M
+  F -. later .-> N
+  K -. later .-> O
