@@ -18,6 +18,7 @@ def test_intent_router() -> None:
     assert detect_intent("Generate coverage") == QueryIntent.COVERAGE_GENERATION
     assert detect_intent("What was the old threshold?") == QueryIntent.HISTORICAL_TRUTH
     assert detect_intent("What is the current threshold?") == QueryIntent.CURRENT_TRUTH
+    assert detect_intent("What are the covered areas of BRD V1?") == QueryIntent.CURRENT_TRUTH
 
 
 def test_compute_fact_deltas_modified_threshold() -> None:

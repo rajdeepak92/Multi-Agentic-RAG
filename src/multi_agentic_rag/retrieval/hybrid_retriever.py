@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import re
+
 from multi_agentic_rag.config import Settings, get_settings
+from multi_agentic_rag.extraction.rule_extractors import extract_facts_from_text
 from multi_agentic_rag.models import ChunkRecord, DocumentStatus, EvidenceRecord, QueryResult
 from multi_agentic_rag.models.graph import FactRecord
 from multi_agentic_rag.retrieval.graph_retriever import GraphRetriever
@@ -25,6 +28,7 @@ def answer_query(
     registry = SQLiteRegistry(settings.sqlite_db_path)
     registry.initialize()
     intent = detect_intent(query)
+    retrieval_query = _expand_query_for_retrieval(query)
 
     if intent == QueryIntent.DELTA_ANALYSIS:
         return _answer_delta_query(
@@ -40,38 +44,44 @@ def answer_query(
             settings=settings,
             intent=intent,
         )
-    status = (
-        DocumentStatus.SUPERSEDED
-        if intent == QueryIntent.HISTORICAL_TRUTH
-        else DocumentStatus.ACTIVE
+    status = _status_filter(intent=intent, version=version)
+    document_scope = _infer_document_scope(
+        registry=registry,
+        query=query,
+        system_name=system_name,
+        version=version,
+        status=status,
     )
     facts = registry.list_facts(
         system_name=system_name,
         version=version,
         status=status,
     )
+    if document_scope:
+        facts = [fact for fact in facts if fact.document_id in document_scope]
+    registry_fact_ids = {fact.fact_id for fact in facts}
     warnings: list[str] = []
     retrieval_sources: list[str] = []
-    if facts:
-        retrieval_sources.append("registry")
     vector_chunks, vector_warnings = _query_vector_chunks(
-        query=query,
+        query=retrieval_query,
         registry=registry,
         settings=settings,
         system_name=system_name,
         version=version,
         status=status,
+        document_scope=document_scope,
     )
     warnings.extend(vector_warnings)
     if vector_chunks:
         retrieval_sources.append("vector")
     keyword_chunks, keyword_warnings = _query_keyword_chunks(
-        query=query,
+        query=retrieval_query,
         registry=registry,
         settings=settings,
         system_name=system_name,
         version=version,
         status=status,
+        document_scope=document_scope,
     )
     warnings.extend(keyword_warnings)
     if keyword_chunks:
@@ -81,14 +91,19 @@ def answer_query(
         settings=settings,
         system_name=system_name,
         status=status,
+        document_scope=document_scope,
     )
     if graph_warning:
         warnings.append(f"Neo4j graph facts unavailable: {graph_warning}")
     if graph_facts:
         retrieval_sources.append("graph")
     facts = _dedupe_facts(facts + graph_facts)
-    chunks = _dedupe_chunks(_chunks_for_facts(registry, facts) + vector_chunks + keyword_chunks)
-    if not facts and not chunks:
+    retrieved_chunks = _dedupe_chunks(vector_chunks + keyword_chunks)
+    if _is_scope_query(query):
+        retrieved_chunks = _dedupe_chunks(
+            retrieved_chunks + _scope_context_chunks(registry, retrieved_chunks)
+        )
+    if not facts and not retrieved_chunks:
         return _unsupported(
             query=query,
             intent=intent,
@@ -98,8 +113,11 @@ def answer_query(
         )
     selected = _select_relevant_facts(query, facts)
     if selected:
+        selected_sources = list(retrieval_sources)
+        if any(fact.fact_id in registry_fact_ids for fact in selected):
+            selected_sources.insert(0, "registry")
         chunks = _dedupe_chunks(
-            _chunks_for_facts(registry, selected) + vector_chunks + keyword_chunks
+            _chunks_for_facts(registry, selected) + retrieved_chunks
         )
         answer = _render_fact_answer(selected, status=status)
         return QueryResult(
@@ -112,21 +130,24 @@ def answer_query(
             facts=selected,
             chunks=chunks,
             evidence=_evidence_records(chunks),
-            retrieval_sources=retrieval_sources,
+            retrieval_sources=selected_sources,
             warnings=warnings,
         )
+    answer, answer_chunks = _render_chunk_answer(query, retrieved_chunks)
     return QueryResult(
         query=query,
         intent=intent.value,
         system_name=system_name,
         version=version,
         supported=True,
-        answer=f"Found {len(chunks)} evidence chunk(s), but no extracted fact matched exactly.",
-        chunks=chunks,
-        evidence=_evidence_records(chunks),
-        retrieval_sources=retrieval_sources,
+        answer=answer,
+        chunks=answer_chunks,
+        evidence=_evidence_records(answer_chunks),
+        retrieval_sources=[
+            source for source in retrieval_sources if source in {"vector", "keyword"}
+        ],
         warnings=warnings
-        + ["Answer limited to retrieved evidence chunks; no unsupported fact was generated."],
+        + ["Answer is extractive from retrieved chunks; no exact extracted fact matched."],
     )
 
 
@@ -201,7 +222,10 @@ def _answer_coverage_query(
         intent=intent.value,
         system_name=system_name,
         supported=True,
-        answer=f"Found {len(requirement_facts)} requirement evidence record(s) for coverage planning.",
+        answer=(
+            f"Found {len(requirement_facts)} requirement evidence record(s) "
+            "for coverage planning."
+        ),
         facts=requirement_facts,
         chunks=chunks,
         evidence=_evidence_records(chunks),
@@ -209,7 +233,154 @@ def _answer_coverage_query(
     )
 
 
+def _status_filter(
+    *,
+    intent: QueryIntent,
+    version: str | None,
+) -> DocumentStatus | None:
+    if intent == QueryIntent.HISTORICAL_TRUTH:
+        return DocumentStatus.SUPERSEDED
+    if version:
+        return None
+    return DocumentStatus.ACTIVE
+
+
+def _infer_document_scope(
+    *,
+    registry: SQLiteRegistry,
+    query: str,
+    system_name: str | None,
+    version: str | None,
+    status: DocumentStatus | None,
+) -> set[str] | None:
+    query_text = _normalized_token_text(query)
+    if not query_text:
+        return None
+    matches: set[str] = set()
+    for document in registry.list_documents(system_name=system_name, status=status):
+        if version and document.version != version:
+            continue
+        tokens = _source_tokens(document.source_name)
+        if len(tokens) < 2:
+            continue
+        for start in range(len(tokens)):
+            for end in range(start + 2, len(tokens) + 1):
+                phrase_tokens = tokens[start:end]
+                if not any(re.fullmatch(r"v\d+", token) for token in phrase_tokens):
+                    continue
+                if " ".join(phrase_tokens) in query_text:
+                    matches.add(document.document_id)
+                    break
+            if document.document_id in matches:
+                break
+    return matches or None
+
+
+def _normalized_token_text(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
+
+
+def _source_tokens(source_name: str) -> list[str]:
+    stem = source_name.rsplit(".", 1)[0]
+    return re.findall(r"[a-z0-9]+", stem.lower())
+
+
+QUERY_SENSORS = (
+    "temperature",
+    "pressure",
+    "vibration",
+    "humidity",
+    "flow",
+    "voltage",
+    "current",
+    "speed",
+    "level",
+)
+
+
+def _is_scope_query(query: str) -> bool:
+    text = query.lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "covered",
+            "covering",
+            "what is covered",
+            "what are covered",
+            "in scope",
+            "scope",
+        )
+    )
+
+
+def _is_threshold_query(query: str) -> bool:
+    text = query.lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "threshold",
+            "limit",
+            "setpoint",
+            "maximum",
+            "minimum",
+            "critical level",
+        )
+    )
+
+
+def _expand_query_for_retrieval(query: str) -> str:
+    expansions: list[str] = []
+    if _is_scope_query(query):
+        expansions.append(
+            "scope in scope business scope objective objectives included includes "
+            "supports system overview consists"
+        )
+    if _is_threshold_query(query):
+        expansions.append("threshold max maximum critical level normal range min sensor data sheet")
+    return " ".join([query, *expansions])
+
+
+def _scope_context_chunks(
+    registry: SQLiteRegistry,
+    chunks: list[ChunkRecord],
+) -> list[ChunkRecord]:
+    additions: list[ChunkRecord] = []
+    by_document: dict[str, list[ChunkRecord]] = {}
+    for chunk in chunks:
+        if not _contains_scope_start(chunk.text):
+            continue
+        document_chunks = by_document.setdefault(
+            chunk.document_id,
+            registry.list_chunks(document_id=chunk.document_id),
+        )
+        ordered = sorted(document_chunks, key=lambda item: (item.page, item.chunk_index))
+        start_index = next(
+            (index for index, item in enumerate(ordered) if item.chunk_id == chunk.chunk_id),
+            None,
+        )
+        if start_index is None:
+            continue
+        for candidate in ordered[start_index + 1 : start_index + 4]:
+            additions.append(candidate)
+            if _contains_scope_end(candidate.text):
+                break
+    return additions
+
+
+def _contains_scope_start(text: str) -> bool:
+    return bool(re.search(r"\bin\s+scope\b", text, flags=re.IGNORECASE))
+
+
+def _contains_scope_end(text: str) -> bool:
+    return bool(re.search(r"\bout\s+of\s+scope\b", text, flags=re.IGNORECASE))
+
+
 def _select_relevant_facts(query: str, facts: list[FactRecord]) -> list[FactRecord]:
+    if _is_threshold_query(query):
+        selected = _select_threshold_facts(query, facts)
+        if selected:
+            return selected
+        return []
     text = query.lower()
     selected = []
     for fact in facts:
@@ -220,6 +391,69 @@ def _select_relevant_facts(query: str, facts: list[FactRecord]) -> list[FactReco
         elif fact.value.lower() in text:
             selected.append(fact)
     return selected
+
+
+def _select_threshold_facts(query: str, facts: list[FactRecord]) -> list[FactRecord]:
+    candidates = [fact for fact in facts if fact.fact_type == "threshold"]
+    if not candidates:
+        return []
+    sensors = _query_sensors(query)
+    if sensors:
+        sensor_matches = [
+            fact
+            for fact in candidates
+            if _threshold_sensor(fact) in sensors
+            or any(sensor in fact.fact_key for sensor in sensors)
+        ]
+        if sensor_matches:
+            candidates = sensor_matches
+    kinds = _query_threshold_kinds(query)
+    if kinds:
+        kind_matches = [fact for fact in candidates if _threshold_kind(fact) in kinds]
+        if kind_matches:
+            candidates = kind_matches
+    return sorted(candidates, key=lambda fact: _threshold_sort_key(fact, query))
+
+
+def _query_sensors(query: str) -> set[str]:
+    tokens = set(re.findall(r"[a-z0-9]+", query.lower()))
+    return {sensor for sensor in QUERY_SENSORS if sensor in tokens}
+
+
+def _query_threshold_kinds(query: str) -> tuple[str, ...]:
+    text = query.lower()
+    if any(term in text for term in ("critical", "above", ">")):
+        return ("critical",)
+    if any(term in text for term in ("maximum", "max", "upper")):
+        return ("max", "critical")
+    if any(term in text for term in ("minimum", "min", "lower")):
+        return ("min",)
+    if "normal" in text:
+        return ("normal_range",)
+    return ()
+
+
+def _threshold_sensor(fact) -> str:
+    sensor = fact.metadata.get("sensor") if getattr(fact, "metadata", None) else None
+    if sensor:
+        return str(sensor).lower()
+    parts = fact.fact_key.split(":")
+    return parts[1].lower() if len(parts) > 1 else ""
+
+
+def _threshold_kind(fact) -> str:
+    kind = fact.metadata.get("threshold_kind") if getattr(fact, "metadata", None) else None
+    if kind:
+        return str(kind).lower()
+    parts = fact.fact_key.split(":")
+    return parts[2].lower() if len(parts) > 2 else ""
+
+
+def _threshold_sort_key(fact, query: str) -> tuple[int, int, str]:
+    kinds = _query_threshold_kinds(query)
+    kind = _threshold_kind(fact)
+    kind_rank = kinds.index(kind) if kind in kinds else len(kinds)
+    return (kind_rank, 0 if _threshold_sensor(fact) in _query_sensors(query) else 1, fact.fact_key)
 
 
 def _select_relevant_deltas(query: str, deltas: list) -> list:
@@ -236,17 +470,190 @@ def _select_relevant_deltas(query: str, deltas: list) -> list:
     return selected
 
 
-def _render_fact_answer(facts: list[FactRecord], *, status: DocumentStatus) -> str:
+def _render_fact_answer(
+    facts: list[FactRecord],
+    *,
+    status: DocumentStatus | None,
+) -> str:
     parts = []
     seen: set[tuple[str, str, str | None, str, str]] = set()
     for fact in facts:
-        claim_key = (fact.fact_key, fact.value, fact.unit, fact.version, status.value)
+        status_value = status.value if status else fact.status.value
+        claim_key = (fact.fact_key, fact.value, fact.unit, fact.version, status_value)
         if claim_key in seen:
             continue
         seen.add(claim_key)
         value = f"{fact.value} {fact.unit}".strip() if fact.unit else fact.value
-        parts.append(f"{fact.fact_key} = {value} ({status.value}, version {fact.version})")
+        label = _fact_label(fact)
+        parts.append(f"{label} = {value} ({status_value}, version {fact.version})")
     return "; ".join(parts)
+
+
+def _fact_label(fact) -> str:
+    if fact.fact_type == "threshold":
+        sensor = _threshold_sensor(fact) or "value"
+        kind = _threshold_kind(fact)
+        labels = {
+            "normal_range": f"{sensor} normal range",
+            "min": f"{sensor} min threshold",
+            "max": f"{sensor} max threshold",
+            "critical": f"{sensor} critical level",
+        }
+        return labels.get(kind, f"{sensor} threshold")
+    return fact.fact_key
+
+
+def _render_chunk_answer(
+    query: str,
+    chunks: list[ChunkRecord],
+) -> tuple[str, list[ChunkRecord]]:
+    if _is_threshold_query(query):
+        threshold_items = _extract_threshold_items(query, chunks)
+        if threshold_items:
+            lines = ["Based on retrieved evidence, the threshold values are:"]
+            lines.extend(
+                f"- {_fact_label(fact)} = {_fact_value(fact)} ({chunk.source_name} p.{chunk.page})"
+                for fact, chunk in threshold_items[:8]
+            )
+            return "\n".join(lines), _chunks_for_fact_items(threshold_items)
+    if _is_scope_query(query):
+        scope_items = _extract_scope_items(chunks)
+        if scope_items:
+            lines = ["Based on retrieved evidence, the covered scope is:"]
+            lines.extend(
+                f"- {item} ({chunk.source_name} p.{chunk.page})"
+                for item, chunk in scope_items[:12]
+            )
+            return "\n".join(lines), _chunks_for_text_items(scope_items)
+    excerpts = _extract_relevant_excerpts(query, chunks)
+    if excerpts:
+        lines = ["Retrieved evidence excerpts:"]
+        lines.extend(
+            f"- {excerpt} ({chunk.source_name} p.{chunk.page})"
+            for excerpt, chunk in excerpts[:5]
+        )
+        return "\n".join(lines), _chunks_for_text_items(excerpts)
+    return f"Found {len(chunks)} evidence chunk(s), but no exact extracted fact matched.", chunks
+
+
+def _extract_threshold_items(
+    query: str,
+    chunks: list[ChunkRecord],
+) -> list[tuple[object, ChunkRecord]]:
+    items: list[tuple[object, ChunkRecord]] = []
+    for chunk in chunks:
+        selected = _select_threshold_facts(query, list(extract_facts_from_text(chunk.text)))
+        items.extend((fact, chunk) for fact in selected)
+    return _dedupe_fact_items(items)
+
+
+def _fact_value(fact) -> str:
+    return f"{fact.value} {fact.unit}".strip() if fact.unit else fact.value
+
+
+def _extract_scope_items(chunks: list[ChunkRecord]) -> list[tuple[str, ChunkRecord]]:
+    items: list[tuple[str, ChunkRecord]] = []
+    in_scope = False
+    for chunk in sorted(chunks, key=lambda item: (item.source_name, item.page, item.chunk_index)):
+        for line in chunk.text.splitlines():
+            clean = _clean_evidence_line(line)
+            if not clean:
+                continue
+            if _contains_scope_end(clean):
+                in_scope = False
+                break
+            if _contains_scope_start(clean):
+                in_scope = True
+                continue
+            if in_scope and _looks_like_evidence_item(clean):
+                items.append((clean, chunk))
+    if items:
+        return _dedupe_text_items(items)
+
+    # Some parsers split "3.1 In Scope" into the previous chunk. If only the
+    # continuation chunk was retrieved, treat text before "Out of Scope" as scope evidence.
+    for chunk in sorted(chunks, key=lambda item: (item.source_name, item.page, item.chunk_index)):
+        if not _contains_scope_end(chunk.text):
+            continue
+        for line in chunk.text.splitlines():
+            clean = _clean_evidence_line(line)
+            if not clean or _contains_scope_end(clean):
+                break
+            if _looks_like_evidence_item(clean):
+                items.append((clean, chunk))
+    return _dedupe_text_items(items)
+
+
+def _extract_relevant_excerpts(
+    query: str,
+    chunks: list[ChunkRecord],
+) -> list[tuple[str, ChunkRecord]]:
+    query_terms = {
+        token
+        for token in re.findall(r"[a-z0-9]+", query.lower())
+        if len(token) > 2 and token not in {"what", "are", "the", "tell", "about"}
+    }
+    scored: list[tuple[int, str, ChunkRecord]] = []
+    for chunk in chunks:
+        for line in chunk.text.splitlines():
+            clean = _clean_evidence_line(line)
+            if not clean or not _looks_like_evidence_item(clean):
+                continue
+            line_terms = set(re.findall(r"[a-z0-9]+", clean.lower()))
+            score = len(query_terms & line_terms)
+            if score:
+                scored.append((score, clean, chunk))
+    scored.sort(key=lambda item: (-item[0], item[2].page, item[2].chunk_index))
+    return _dedupe_text_items([(line, chunk) for _, line, chunk in scored])
+
+
+def _clean_evidence_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line).strip(" -\t")
+
+
+def _looks_like_evidence_item(line: str) -> bool:
+    if len(line) < 8:
+        return False
+    lower = line.lower()
+    if lower.endswith(".markdown") or re.fullmatch(r"\d{4}-\d{2}-\d{2}", lower):
+        return False
+    if re.fullmatch(r"\d+\s*/\s*\d+", lower):
+        return False
+    if re.fullmatch(r"\d+(?:\.\d+)*\.?\s+[a-z ]+", lower):
+        return False
+    return True
+
+
+def _dedupe_text_items(items: list[tuple[str, ChunkRecord]]) -> list[tuple[str, ChunkRecord]]:
+    deduped: list[tuple[str, ChunkRecord]] = []
+    seen: set[str] = set()
+    for text, chunk in items:
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((text, chunk))
+    return deduped
+
+
+def _chunks_for_text_items(items: list[tuple[str, ChunkRecord]]) -> list[ChunkRecord]:
+    return _dedupe_chunks([chunk for _, chunk in items])
+
+
+def _dedupe_fact_items(items: list[tuple[object, ChunkRecord]]) -> list[tuple[object, ChunkRecord]]:
+    deduped: list[tuple[object, ChunkRecord]] = []
+    seen: set[tuple[str, str, str | None]] = set()
+    for fact, chunk in items:
+        key = (fact.fact_key, fact.value, fact.unit)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((fact, chunk))
+    return deduped
+
+
+def _chunks_for_fact_items(items: list[tuple[object, ChunkRecord]]) -> list[ChunkRecord]:
+    return _dedupe_chunks([chunk for _, chunk in items])
 
 
 def _render_delta_answer(deltas: list) -> str:
@@ -281,12 +688,13 @@ def _query_vector_chunks(
     settings: Settings,
     system_name: str | None,
     version: str | None,
-    status: DocumentStatus,
+    status: DocumentStatus | None,
+    document_scope: set[str] | None,
 ) -> tuple[list[ChunkRecord], list[str]]:
     filters = {
         "system_name": system_name,
         "version": version,
-        "status": status.value,
+        "status": status.value if status else None,
     }
     try:
         selection = select_vector_store(settings)
@@ -305,6 +713,8 @@ def _query_vector_chunks(
         version=version,
         status=status,
     )
+    if document_scope:
+        candidates = [chunk for chunk in candidates if chunk.document_id in document_scope]
     by_id = {chunk.chunk_id: chunk for chunk in candidates}
     return [by_id[chunk_id] for chunk_id in chunk_ids if chunk_id in by_id], []
 
@@ -316,7 +726,8 @@ def _query_keyword_chunks(
     settings: Settings,
     system_name: str | None,
     version: str | None,
-    status: DocumentStatus,
+    status: DocumentStatus | None,
+    document_scope: set[str] | None,
 ) -> tuple[list[ChunkRecord], list[str]]:
     if not settings.keyword_index_enabled:
         return [], []
@@ -338,6 +749,8 @@ def _query_keyword_chunks(
         version=version,
         status=status,
     )
+    if document_scope:
+        candidates = [chunk for chunk in candidates if chunk.document_id in document_scope]
     by_id = {chunk.chunk_id: chunk for chunk in candidates}
     return [by_id[chunk_id] for chunk_id in chunk_ids if chunk_id in by_id], []
 
@@ -347,9 +760,10 @@ def _query_graph_facts(
     registry: SQLiteRegistry,
     settings: Settings,
     system_name: str | None,
-    status: DocumentStatus,
+    status: DocumentStatus | None,
+    document_scope: set[str] | None,
 ) -> tuple[list[FactRecord], str | None]:
-    if not system_name:
+    if not system_name or status is None:
         return [], None
     retriever = GraphRetriever(settings)
     result = (
@@ -362,6 +776,7 @@ def _query_graph_facts(
     chunks = {
         chunk.chunk_id: chunk
         for chunk in registry.list_chunks(system_name=system_name, status=status)
+        if not document_scope or chunk.document_id in document_scope
     }
     facts: list[FactRecord] = []
     for record in result.records:

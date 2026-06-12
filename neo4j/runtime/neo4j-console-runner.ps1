@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 
 $env:JAVA_HOME = "D:\Multi-Agentic-RAG\neo4j\desktop-data\Application\Cache\runtime\zulu21.48.17-ca-jre21.0.10-win_x64"
 $env:PATH = "D:\Multi-Agentic-RAG\neo4j\desktop-data\Application\Cache\runtime\zulu21.48.17-ca-jre21.0.10-win_x64\bin;$env:PATH"

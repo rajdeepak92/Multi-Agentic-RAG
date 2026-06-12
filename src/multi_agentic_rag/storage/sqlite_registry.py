@@ -21,6 +21,23 @@ from multi_agentic_rag.models import (
 )
 from multi_agentic_rag.utils.paths import resolve_path
 
+FTS_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "for",
+    "in",
+    "is",
+    "me",
+    "of",
+    "the",
+    "this",
+    "to",
+    "what",
+    "which",
+}
+
 
 class SQLiteRegistry:
     """Embedded SQLite registry for documents, chunks, facts, deltas, and coverage."""
@@ -888,6 +905,8 @@ class SQLiteRegistry:
         quoted = []
         for token in tokens[:16]:
             clean = token.replace('"', '""')
+            if clean.lower() in FTS_STOPWORDS:
+                continue
             if len(clean) >= 2:
                 quoted.append(f'"{clean}"')
         return " OR ".join(quoted)

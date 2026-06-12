@@ -26,7 +26,7 @@ def detect_intent(query: str) -> QueryIntent:
         return QueryIntent.IMPACT_ANALYSIS
     if _contains_any(text, ("coverage", "test case", "test plan", "scenario")):
         return QueryIntent.COVERAGE_GENERATION
-    if _contains_any(text, ("history", "historical", "previous", "old", "superseded", "v1")):
+    if _contains_any(text, ("history", "historical", "previous", "old", "superseded")):
         return QueryIntent.HISTORICAL_TRUTH
     return QueryIntent.CURRENT_TRUTH
 

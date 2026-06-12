@@ -30,7 +30,7 @@ SENSORS = (
 SENSOR_RE = "|".join(re.escape(sensor) for sensor in SENSORS)
 UNIT_RE = (
     r"(?:deg\s*C|C|F|K|bar|psi|Pa|kPa|MPa|%|percent|rpm|Hz|mA|A|V|W|"
-    r"m/s|g|ms|s|seconds?)"
+    r"mm/s|m/s|g|ms|s|seconds?)"
 )
 THRESHOLD_PATTERNS = [
     re.compile(
@@ -75,6 +75,7 @@ def extract_facts_from_text(text: str) -> list[ExtractedFact]:
     facts: list[ExtractedFact] = []
     facts.extend(_extract_requirements(text))
     facts.extend(_extract_thresholds(text))
+    facts.extend(_extract_threshold_table_rows(text))
     facts.extend(_extract_protocols(text))
     facts.extend(_extract_protocol_details(text))
     facts.extend(_extract_sensors(text))
@@ -164,6 +165,78 @@ def _extract_thresholds(text: str) -> list[ExtractedFact]:
                 )
             )
     return facts
+
+
+def _extract_threshold_table_rows(text: str) -> list[ExtractedFact]:
+    lines = [_clean_line(line) for line in text.splitlines()]
+    facts: list[ExtractedFact] = []
+    threshold_columns = (
+        ("normal_range", "normal range"),
+        ("min", "min threshold"),
+        ("max", "max threshold"),
+        ("critical", "critical level"),
+    )
+    for index, line in enumerate(lines):
+        sensor = _sensor_from_table_label(line)
+        if not sensor:
+            continue
+        values = lines[index + 1 : index + 5]
+        if len(values) < 4 or not all(_looks_like_threshold_value(value) for value in values):
+            continue
+        evidence = " ".join([line, *values])
+        position = text.find(line)
+        for (kind, label), raw_value in zip(threshold_columns, values, strict=True):
+            value, unit = _split_threshold_value(raw_value)
+            facts.append(
+                ExtractedFact(
+                    fact_type="threshold",
+                    fact_key=f"threshold:{sensor}:{kind}",
+                    value=value,
+                    unit=unit,
+                    evidence=evidence,
+                    requirement_id=_nearest_requirement_id(text, max(position, 0)),
+                    metadata={
+                        "sensor": sensor,
+                        "threshold_kind": kind,
+                        "threshold_label": label,
+                        "ontology_class": "sosa:ObservableProperty",
+                    },
+                )
+            )
+    return facts
+
+
+def _clean_line(line: str) -> str:
+    return " ".join(line.split()).strip()
+
+
+def _sensor_from_table_label(line: str) -> str | None:
+    match = re.fullmatch(rf"(?P<sensor>{SENSOR_RE})\s+Sensor", line, flags=re.I)
+    return match.group("sensor").lower() if match else None
+
+
+def _looks_like_threshold_value(value: str) -> bool:
+    return bool(
+        re.fullmatch(
+            rf"(?:[<>]=?\s*)?-?\d+(?:\.\d+)?(?:\s*-\s*-?\d+(?:\.\d+)?)?\s*(?:°?\s*{UNIT_RE})?",
+            value,
+            flags=re.I,
+        )
+    )
+
+
+def _split_threshold_value(raw_value: str) -> tuple[str, str | None]:
+    text = raw_value.replace("°", "").strip()
+    match = re.fullmatch(
+        rf"(?P<value>(?:[<>]=?\s*)?-?\d+(?:\.\d+)?(?:\s*-\s*-?\d+(?:\.\d+)?)?)\s*"
+        rf"(?P<unit>{UNIT_RE})?",
+        text,
+        flags=re.I,
+    )
+    if not match:
+        return text, None
+    value = re.sub(r"\s+", "", match.group("value"))
+    return value, _normalize_unit(match.group("unit"))
 
 
 def _extract_protocols(text: str) -> list[ExtractedFact]:

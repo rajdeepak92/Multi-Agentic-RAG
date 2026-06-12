@@ -46,6 +46,7 @@ def ingest_document(
     source = resolve_path(source_path)
     if not source.exists():
         raise IngestionError(f"Document does not exist: {source}")
+    _validate_source_version(source, version)
 
     content_hash = sha256_file(source)
     active_documents = registry.list_documents(
@@ -200,6 +201,28 @@ def _version_sort_key(version: str) -> tuple[int, ...]:
     if numbers:
         return tuple(int(number) for number in numbers)
     return tuple(ord(character) for character in version.lower())
+
+
+def _validate_source_version(source: Path, version: str) -> None:
+    source_version = _source_version_label(source.name)
+    if not source_version:
+        return
+    if _normalize_version_label(source_version) != _normalize_version_label(version):
+        raise IngestionError(
+            f"Source filename suggests version {source_version}, but --version was {version}."
+        )
+
+
+def _source_version_label(source_name: str) -> str | None:
+    match = re.search(r"(?:^|[^a-z0-9])v(?P<number>\d+)(?:[^a-z0-9]|$)", source_name, re.I)
+    return f"v{match.group('number')}" if match else None
+
+
+def _normalize_version_label(version: str) -> str:
+    numbers = re.findall(r"\d+", version)
+    if numbers:
+        return f"v{'.'.join(numbers)}"
+    return version.lower()
 
 
 def _extract_facts(chunks: list[ChunkRecord]) -> list[FactRecord]:

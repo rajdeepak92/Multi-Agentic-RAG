@@ -5,6 +5,7 @@ from docx import Document
 
 from multi_agentic_rag.config import Settings
 from multi_agentic_rag.coverage import plan_requirement_coverage
+from multi_agentic_rag.exceptions import IngestionError
 from multi_agentic_rag.ingestion import ingest_document
 from multi_agentic_rag.ingestion.parser import load_docx_pages
 from multi_agentic_rag.models import DocumentStatus
@@ -48,6 +49,18 @@ def test_multiple_documents_can_remain_active_in_same_version(tmp_path: Path) ->
         "PROJECT_1_BRD_V1.docx",
         "PROJECT_1_PROTOCOL_V1.docx",
     }
+
+
+def test_ingestion_rejects_filename_version_mismatch(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    source = _write_docx(tmp_path / "PROJECT_1_BRD_V2.docx")
+
+    try:
+        ingest_document(source, system_name="PROJECT_1", version="v1", settings=settings)
+    except IngestionError as exc:
+        assert "Source filename suggests version v2" in str(exc)
+    else:
+        raise AssertionError("Expected version mismatch to be rejected")
 
 
 def test_coverage_plan_generates_25_and_reuses_same_scope(tmp_path: Path) -> None:
