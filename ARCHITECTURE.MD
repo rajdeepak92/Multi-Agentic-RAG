@@ -3,7 +3,7 @@
 ## Current Phase
 
 The current implementation is a local-first Multi-Agentic RAG foundation with a
-document-grounded dummy pytest automation generator.
+document-grounded, dependency-aware pytest automation generator.
 
 ```text
 Knowledge graph + vector retrieval + BM25 keyword retrieval
@@ -13,9 +13,18 @@ Knowledge graph + vector retrieval + BM25 keyword retrieval
 ```
 
 The system is aimed at QA engineers and analysts working with versioned BRD,
-SRS, design, and protocol documents. The current test automation is deliberately
-placeholder-based until real product interfaces exist, but every generated test
-must still trace to document evidence.
+SRS, design, and protocol documents. The current generated automation blocks
+missing protocol/device dependencies instead of faking external calls, and
+every generated test must still trace to document evidence.
+
+## Strategic Roadmap
+
+`STRATEGIC_UPDATE_PLAN.md`, `UPDATED_GOAL.md`, `EXECUTION_FLOW.md`,
+`TEST_GENERATION_STRATEGY.md`, `ARCHITECTURE_TARGET.mermaid`, and
+`feasibility.md` record the planned shift toward LangGraph-orchestrated QA
+automation, graph-backed planning, domain adapters, and mock/simulator-backed
+pytest generation. This architecture document remains the current-state
+technical description.
 
 ## Scientific Contract
 
@@ -32,14 +41,13 @@ lineage, not hard-deleted.
 One intent router fronts three practical workflows:
 
 1. `ingest_document`: parse documents, extract facts, update stores.
-2. `generate_test_automation`: plan coverage, write dummy pytest artifacts,
+2. `generate_test_automation`: plan coverage, write dependency-aware pytest artifacts,
    execute them when requested, and track results.
 3. `answer_document_question`: retrieve evidence and answer conservatively.
 
-The current orchestration is deterministic Python services with an agent-style
-handoff contract. LangGraph is installed and represented as the orchestration
-direction; a later implementation can compile these handoffs into explicit
-LangGraph state graphs.
+The task router uses service-backed LangGraph workflow wrappers. The generation
+internals are still deterministic Python services and can be split into finer
+LangGraph nodes over time.
 
 ## Runtime Boundaries
 
@@ -56,7 +64,7 @@ LangGraph state graphs.
 | Parsing | PyMuPDF, pdfplumber, python-docx, optional OCR | Same pipeline with workers/queue later |
 | Test harness | Generated pytest files, `pytest.ini`, `conftest.py`, fixtures, markers, logging | Real interface clients after dependency audit |
 | LLM | Configured but not required for deterministic local flows | OpenAI for routing, planning, debugging, generation |
-| Embeddings | Hash provider by default; HuggingFace optional | HuggingFace or managed embedding service |
+| Embeddings | BAAI/bge-m3 through HuggingFace; hash fallback for tests | Open-source-first embeddings, managed fallback only if approved |
 | MCP | Placeholder command only | Full MCP server reusing the same services |
 
 Docker is intentionally not required for the local workflow.
@@ -122,6 +130,8 @@ Primary labels:
 - `Protocol`
 - `Topic`
 - `TestCase`
+- `GeneratedTest`
+- `TestRun`
 - `Delta`
 - `Coverage`
 
@@ -142,6 +152,10 @@ Primary relationships:
 - `FROM_DOCUMENT`
 - `TO_DOCUMENT`
 - `COVERS_REQUIREMENT`
+- `HAS_GENERATED_TEST`
+- `IMPLEMENTS_COVERAGE`
+- `HAS_TEST_RUN`
+- `SUPPORTED_BY_CHUNK`
 
 Extraction metadata uses governance hints such as `sosa:Sensor`,
 `sosa:ObservableProperty`, and `ssn:System` only where deterministic rules can
@@ -183,9 +197,10 @@ IntentRouter
 
 Current status:
 
+- The task router runs through service-backed LangGraph workflow wrappers.
 - The handoff is recorded in generated JSON.
-- Services are implemented as deterministic Python functions.
-- LangGraph is the intended stateful orchestrator for the next iteration.
+- Services are implemented as deterministic Python functions and can be split
+  into finer graph nodes over time.
 - OpenAI is the intended reasoning model for routing, scenario reasoning, test
   planning, and debugging.
 - HuggingFace embeddings/rerankers are optional model-backed retrieval
@@ -247,8 +262,8 @@ The generated harness includes:
 - `pytest.ini` with addopts, log CLI configuration, and markers.
 - `conftest.py` with `pytest_addoption`, `pytest_configure`, session fixture,
   and autouse logging fixture.
-- `generated`, `placeholder`, and `requirement(id)` markers.
-- Class methods that assert traceability fields before calling placeholder
+- `generated`, `evidence_bound`, and `requirement(id)` markers.
+- Class methods that assert traceability fields before calling dependency-aware
   validation.
 
 Each generated test checks:
@@ -258,17 +273,17 @@ Each generated test checks:
 - Evidence exists.
 - At least one chunk ID exists.
 - Expected values came from evidence.
-- Placeholder validation returns `True`.
+- Missing external dependencies are skipped/blocked.
+- Mock-mode or document-contract validation returns `True`.
 
-The placeholder helper logs:
+The validation helper logs:
 
 - `DEBUG` for scenario data.
-- `WARNING` for placeholder mode.
-- `INFO` for successful validation, such as
-  `sensor threshold maximum value validation executed successfully`.
+- `ERROR` for dependency blockers.
+- `INFO` for validation mode and label.
 
 It does not call real MQTT, REST, CAN, Modbus, device, or application
-interfaces.
+interfaces unless the dependency audit has configuration for that target.
 
 ## Tracking JSON Contract
 
@@ -279,6 +294,7 @@ Top-level fields include:
 - `schema_version`
 - `system_name`
 - `doc_version`
+- `generated_test_file`
 - `coverage_run_id`
 - `scope_hash`
 - `generated_file`
@@ -288,6 +304,11 @@ Top-level fields include:
 - `workflow_handoff`
 - `retry_policy`
 - `dependency_audit`
+- `selected_scenarios`
+- `requirements`
+- `evidence_refs`
+- `protocols`
+- `domain`
 - `scenarios`
 - `run_history`
 
@@ -307,11 +328,12 @@ Each scenario stores:
 - `last_run_status` after execution
 
 After execution, the runner appends `run_1`, `run_2`, and so on, plus a
-normalized `run_history` item with `PASS`, `FAIL`, or `BLOCKED`.
+normalized `run_history` item with `PASS`, `FAIL`, `SKIP`, or `BLOCKED`.
 
-SQLite also stores generated test file records and test result records. The JSON
-is currently the detailed trace artifact and can later become an export of a
-database trace table.
+SQLite also stores generated test file records and test result records. When
+Neo4j is configured, generated tests, coverage records, and run results are
+mirrored as graph traceability nodes. The JSON is currently the detailed trace
+artifact and can later become an export of a database trace table.
 
 ## Execution And Retry
 
@@ -339,7 +361,7 @@ Retry behavior:
 
 The generator does not freely mutate project dependencies.
 
-Current dummy tests require only:
+Generated tests always require:
 
 - Python
 - pytest

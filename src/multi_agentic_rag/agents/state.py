@@ -12,15 +12,26 @@ class AgentState(BaseModel):
 
     input_type: str | None = None
     user_query: str | None = None
+    source_path: str | None = None
     system_name: str | None = None
     version: str | None = None
+    scenario_count: int | None = None
+    output_dir: str | None = None
+    internal_settings: Any | None = Field(default=None, alias="_settings")
     documents: list[dict[str, Any]] = Field(default_factory=list)
     chunks: list[dict[str, Any]] = Field(default_factory=list)
     retrieved_context: list[dict[str, Any]] = Field(default_factory=list)
     graph_context: list[dict[str, Any]] = Field(default_factory=list)
     delta_records: list[dict[str, Any]] = Field(default_factory=list)
     coverage_records: list[dict[str, Any]] = Field(default_factory=list)
+    ingest_result: dict[str, Any] | None = None
+    query_result: dict[str, Any] | None = None
+    coverage_result: dict[str, Any] | None = None
+    test_generation: dict[str, Any] | None = None
+    test_execution: dict[str, Any] | None = None
+    task_result: dict[str, Any] | None = None
     final_output: dict[str, Any] | None = None
+    workflow_trace: list[dict[str, Any]] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
 
@@ -29,13 +40,24 @@ class AgentStateDict(TypedDict, total=False):
 
     input_type: str | None
     user_query: str | None
+    source_path: str | None
     system_name: str | None
     version: str | None
+    scenario_count: int | None
+    output_dir: str | None
+    _settings: Any | None
     documents: list[dict[str, Any]]
     chunks: list[dict[str, Any]]
     retrieved_context: list[dict[str, Any]]
     graph_context: list[dict[str, Any]]
     delta_records: list[dict[str, Any]]
     coverage_records: list[dict[str, Any]]
+    ingest_result: dict[str, Any] | None
+    query_result: dict[str, Any] | None
+    coverage_result: dict[str, Any] | None
+    test_generation: dict[str, Any] | None
+    test_execution: dict[str, Any] | None
+    task_result: dict[str, Any] | None
     final_output: dict[str, Any] | None
+    workflow_trace: list[dict[str, Any]]
     errors: list[str]

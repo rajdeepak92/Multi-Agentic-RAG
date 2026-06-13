@@ -257,7 +257,11 @@ def _build_graph_if_available(
     graph_store = Neo4jGraphStore(settings)
     available, message = graph_store.check_connection()
     if not available:
-        warnings.append(f"Neo4j graph build skipped: {message}")
+        detail = f"Neo4j graph build skipped: {message}"
+        graph_store.close()
+        if settings.graphrag_required:
+            raise IngestionError(detail)
+        warnings.append(detail)
         return False
     try:
         for superseded_document in superseded_documents:
@@ -284,7 +288,10 @@ def _build_graph_if_available(
             deltas=deltas,
         )
     except Exception as exc:  # pragma: no cover - depends on local Neo4j
-        warnings.append(f"Neo4j graph build failed: {exc}")
+        detail = f"Neo4j graph build failed: {exc}"
+        if settings.graphrag_required:
+            raise IngestionError(detail) from exc
+        warnings.append(detail)
         return False
     finally:
         graph_store.close()

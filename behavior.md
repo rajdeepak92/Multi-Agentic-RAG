@@ -6,14 +6,19 @@ now represented in code.
 
 ## Current Goal
 
-MARAG can act as a document-grounded test-automation code generator in dummy
-placeholder mode until real product interfaces are connected.
+MARAG can act as a document-grounded, dependency-aware test-automation code
+generator. It creates pytest artifacts from evidence and marks protocol/device
+dependency gaps as blocked or skipped instead of faking external calls.
 
 The current supported task categories are:
 
 1. Ingest a document and keep local stores up to date.
-2. Generate pytest automation placeholders from BRD evidence.
+2. Generate dependency-aware pytest automation artifacts from BRD evidence.
 3. Answer informative questions from ingested document evidence.
+
+For the target-state roadmap beyond this current behavior, see
+`STRATEGIC_UPDATE_PLAN.md`, `UPDATED_GOAL.md`, `EXECUTION_FLOW.md`, and
+`TEST_GENERATION_STRATEGY.md`.
 
 ## Test-Automation Generation Flow
 
@@ -33,9 +38,9 @@ The testcase generation path follows this agent-style handoff:
 12. `TrackingJsonAgent`
 13. `DbUpdateAgent`
 
-The current implementation is deterministic Python orchestration behind the
-existing CLI/API/task services. The handoff is recorded in each generated JSON
-tracking file so later LangGraph nodes can adopt the same contract.
+The current task router runs through service-backed LangGraph workflow wrappers
+and delegates generation/execution to deterministic Python services. The
+handoff is also recorded in each generated JSON tracking file.
 
 ## Generated Artifact Layout
 
@@ -57,29 +62,29 @@ The exact project and version names are slugged from `system_name` and
 
 ## Generated Pytest Behavior
 
-Generated test files are class-based pytest automation placeholders.
+Generated test files are class-based pytest automation scaffolds.
 
 Each generated test:
 
 - Is linked to a coverage record.
 - Preserves `requirement_id`, `coverage_id`, `chunk_ids`, evidence, and expected
   values derived from the evidence text.
-- Uses pytest markers for generated, placeholder, and requirement traceability.
+- Uses pytest markers for generated, evidence-bound, and requirement traceability.
 - Uses fixtures from generated `conftest.py`.
 - Logs start and finish for each test.
-- Logs placeholder execution with `WARNING`.
-- Logs successful placeholder validation with `INFO`.
-- Calls a helper that returns `True`, then asserts that value so pytest passes
-  without returning a non-`None` value directly from the test function.
+- Logs scenario execution details.
+- Skips/blocks tests when required protocol, simulator, or device configuration
+  is missing.
+- In explicit mock mode, validates deterministic evidence-derived assertions.
 
-The generated placeholder helper currently logs messages such as:
+The generated helper currently logs messages such as:
 
 ```text
-sensor threshold maximum value validation executed successfully
+protocol/interface behavior validation executing in mock mode
 ```
 
 No real MQTT, REST, CAN, Modbus, device, or application interface calls are made
-yet.
+unless the required endpoint/simulator configuration exists.
 
 ## Tracking JSON Behavior
 
@@ -123,7 +128,7 @@ with `run_1`, `run_2`, and so on. A passing first run is recorded as:
 
 The current `DependencyAuditAgent` behavior is intentionally controlled.
 
-The generator records that dummy placeholder tests require only:
+The generator records local pytest harness dependencies:
 
 - Python
 - pytest
@@ -131,8 +136,11 @@ The generator records that dummy placeholder tests require only:
 - generated `pytest.ini`
 - generated `conftest.py`
 
-It does not mutate project dependencies for protocol clients such as MQTT. Those
-must be proposed and approved before real interface tests are generated.
+For protocol scenarios, it records required external dependencies such as REST
+base URLs, MQTT brokers, Modbus hosts, CAN interfaces, or simulator
+configuration. Missing dependencies produce blocked/skipped execution results.
+It does not mutate project dependencies for protocol clients such as MQTT.
+Those must be proposed and approved before real interface tests are generated.
 
 ## Execution And Retry Behavior
 
@@ -166,7 +174,9 @@ generation, execution, and last result lookup.
 
 ## Current Storage Behavior
 
-SQLite stores generated test file records and execution result records.
+SQLite stores generated test file records and execution result records. When
+Neo4j is configured, generated test assets, coverage links, and run results are
+also mirrored into the graph as traceability nodes.
 
 The generated test file record now includes:
 
@@ -187,12 +197,13 @@ tests.
 The implementation does not yet create real MQTT, REST, CAN, Modbus, or device
 clients.
 
-The implementation does not yet perform real application validation. It forces
-placeholder success only after evidence traceability fields are present.
+The implementation does not yet perform real application validation. It blocks
+missing external protocol/device dependencies by default and only produces
+passing protocol tests in explicit mock mode.
 
-The implementation records the LangGraph-style handoff contract, but the
-test-generation sequence itself is still implemented as deterministic Python
-services rather than a fully compiled LangGraph subgraph.
+The implementation has service-backed LangGraph wrappers for task routing. The
+test-generation internals are still deterministic Python services rather than a
+fully decomposed LangGraph subgraph for each generation step.
 
 The generated tests are intentionally ignored from normal project pytest
 discovery. They are executed explicitly by the MARAG runner.

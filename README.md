@@ -1,10 +1,14 @@
 # multi-agentic-rag
 
-`multi-agentic-rag` is a local-first Multi-Agentic RAG framework for
-version-aware engineering documents. It ingests BRD/SRS/design files, preserves
-evidence by document version, retrieves through graph/vector/keyword stores, and
-currently generates dummy automation-style pytest testcases from requirement
-evidence.
+`multi-agentic-rag` is an Agentic AI-enabled QA automation framework powered by
+Knowledge Graph + GraphRAG + Multi-Agent orchestration.
+
+It is local-first today. It ingests BRD/SRS/design files, preserves evidence by
+document version, retrieves through graph/vector/keyword stores, and currently
+generates dependency-aware pytest testcases from requirement evidence.
+GraphRAG is the intelligence layer for evidence, lineage, and relationship
+reasoning; generated QA automation assets, reports, traceability, and
+evidence-grounded answers are the framework outputs.
 
 The project is built around these rules:
 
@@ -30,7 +34,7 @@ Built today:
 - Evidence-based query, delta, and coverage commands.
 - Coverage planning that requires requirement-linked evidence and stores a
   reusable `coverage_run`.
-- Dummy pytest automation generation under `generated/<system>/<brd_version>/`.
+- Dependency-aware pytest automation generation under `generated/<system>/<brd_version>/`.
 - Sidecar testcase JSON that tracks scenarios, source chunks, expected values,
   dependency audit, workflow handoff, retry policy, and run history.
 - Test execution through pytest with generated `pytest.ini`, `conftest.py`,
@@ -48,6 +52,21 @@ Not built yet:
 - LLM-backed extraction and final answer generation beyond conservative
   evidence assembly.
 
+## Strategic Roadmap
+
+See these planning artifacts for the forward-looking roadmap:
+
+- `UPDATED_GOAL.md`: updated project definition and supported task types.
+- `STRATEGIC_UPDATE_PLAN.md`: gap analysis, conflicts, roadmap, risks, and
+  acceptance criteria.
+- `EXECUTION_FLOW.md`: document-to-test execution lifecycle and failure model.
+- `TEST_GENERATION_STRATEGY.md`: generated pytest strategy, sidecar schema, and
+  future Robot Framework mapping.
+- `ARCHITECTURE_TARGET.mermaid`: target architecture diagram.
+- `feasibility.md`: corrected Option-4 feasibility view.
+
+This README describes what is built and runnable today.
+
 ## Clean Windows Setup
 
 Install these on a clean Windows machine:
@@ -58,7 +77,8 @@ Install these on a clean Windows machine:
 - Neo4j Desktop, optional but recommended for graph-check and graph retrieval.
 - Tesseract OCR, optional and only needed for scanned PDFs.
 - OpenAI/Azure OpenAI/HuggingFace tokens, optional for later LLM or HF-backed
-  model usage. The current dummy automation path can run with local hashing.
+  model usage. Deterministic tests and offline smoke checks can run with local
+  hash embeddings.
 
 From PowerShell:
 
@@ -155,12 +175,15 @@ WEAVIATE_HYBRID_ALPHA=0.65
 CHROMA_PATH=.multi_agentic_rag/chroma
 KEYWORD_INDEX_ENABLED=true
 
-EMBEDDING_PROVIDER=hash
+EMBEDDING_PROVIDER=huggingface
 DEFAULT_EMBEDDING_MODEL=BAAI/bge-m3
 DEFAULT_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+HASH_EMBEDDING_DIMENSIONS=384
 HF_TOKEN=
 HF_HOME=.cache/huggingface
 HF_HUB_CACHE=.cache/huggingface/hub
+
+GRAPHRAG_REQUIRED=true
 
 LLM_PROVIDER=none
 DEFAULT_LLM_MODEL=gpt-5.5
@@ -178,13 +201,18 @@ MCP_ENABLED=false
 MCP_TRANSPORT=stdio
 ```
 
-Use `EMBEDDING_PROVIDER=hash` for deterministic local runs without HuggingFace
-model downloads. Use `EMBEDDING_PROVIDER=huggingface` only after local model
-download/cache behavior is acceptable for your machine.
+Use `EMBEDDING_PROVIDER=huggingface` with `DEFAULT_EMBEDDING_MODEL=BAAI/bge-m3`
+for real BRD/SRS/design-document retrieval. Use `EMBEDDING_PROVIDER=hash` only
+for deterministic unit tests, smoke tests, and offline validation where
+retrieval quality is not being evaluated.
+
+Use `GRAPHRAG_REQUIRED=true` for the target GraphRAG workflow. Set it to
+`false` only for transitional local runs where Neo4j is intentionally
+unavailable.
 
 ## Neo4j Desktop Setup
 
-Neo4j is optional for dummy testcase generation, but required for graph-check and
+Neo4j is optional for local testcase generation, but required for graph-check and
 graph retrieval.
 
 1. Install Neo4j Desktop.
@@ -272,16 +300,24 @@ generated\project_1\brd_v1\conftest.py
 generated\project_1\brd_v1\pytest.ini
 ```
 
-Expected testcase result shape:
+Expected testcase result shape depends on dependency readiness. With missing
+protocol/simulator configuration, protocol scenarios are blocked/skipped:
 
 ```text
-executed: Test run passed: 10 passed, 0 failed, 0 skipped.
+executed: Test run blocked: 0 passed, 0 failed, 10 skipped.
 ```
 
-The tests are placeholder automation tests. They use evidence-derived
-`expected_values`, log at `DEBUG`, `WARNING`, and `INFO`, and return `True`
-after traceability checks pass. They do not call real MQTT, REST, CAN, Modbus,
-device, or application interfaces yet.
+With explicit mock execution mode and evidence-derived checks, generated tests
+can pass deterministically:
+
+```env
+GENERATED_TEST_EXECUTION_MODE=mock
+```
+
+The tests use evidence-derived `expected_values`, log scenario execution, and
+return `True` only after traceability and dependency readiness checks pass.
+They do not call real MQTT, REST, CAN, Modbus, device, or application
+interfaces unless the required configuration exists.
 
 ## Test Automation Flow
 
@@ -303,9 +339,9 @@ IntentRouter
 -> DbUpdateAgent
 ```
 
-Today this handoff is recorded in JSON and implemented as deterministic Python
-services. A later LangGraph orchestration layer can reuse the same state
-contract.
+Today this handoff runs through service-backed LangGraph workflow wrappers and
+deterministic Python services. Later work can split the internal generation
+steps into finer LangGraph nodes.
 
 The retry policy is controlled:
 
@@ -378,9 +414,10 @@ Current endpoints:
 
 ## Conclusion
 
-MARAG is currently a local-first evidence system plus a document-grounded dummy
-test automation generator. The important achievement is traceability: generated
-tests do not invent expected values, and successful execution is tied back to
-requirements, chunks, versions, JSON run history, and SQLite records. Real
-interfaces and LLM-heavy orchestration can be added later on top of this
-contract without weakening the evidence rules.
+MARAG is currently a local-first evidence system plus a document-grounded,
+dependency-aware test automation generator. The important achievement is
+traceability: generated tests do not invent expected values, missing protocol
+dependencies do not become fake passes, and execution is tied back to
+requirements, chunks, versions, JSON run history, SQLite records, and optional
+Neo4j traceability nodes. Real interfaces and LLM-heavy orchestration can be
+added later on top of this contract without weakening the evidence rules.

@@ -119,6 +119,35 @@ class GraphRetriever:
             system_name=system_name,
         )
 
+    def get_test_traceability(self, system_name: str) -> GraphRetrievalResult:
+        """Return requirement-to-coverage-to-generated-test execution lineage."""
+
+        return self._run(
+            """
+            MATCH (:System {system_name: $system_name})-[:HAS_GENERATED_TEST]->(t:GeneratedTest)
+            OPTIONAL MATCH (t)-[:IMPLEMENTS_COVERAGE]->(c:Coverage)
+            OPTIONAL MATCH (c)-[:COVERS_REQUIREMENT]->(r:Requirement)
+            OPTIONAL MATCH (c)-[:SUPPORTED_BY_CHUNK]->(chunk:Chunk)
+            OPTIONAL MATCH (t)-[:HAS_TEST_RUN]->(run:TestRun)
+            RETURN
+                t.test_file_id AS test_file_id,
+                t.file_path AS test_file_path,
+                t.tracking_file_path AS tracking_file_path,
+                t.status AS generated_test_status,
+                c.coverage_id AS coverage_id,
+                c.requirement_id AS coverage_requirement_id,
+                r.requirement_id AS requirement_id,
+                chunk.chunk_id AS chunk_id,
+                run.result_id AS result_id,
+                run.status AS run_status,
+                run.failure_category AS failure_category,
+                run.failure_reason AS failure_reason,
+                run.created_at AS run_created_at
+            ORDER BY t.updated_at DESC, c.scenario_index ASC, run.created_at DESC
+            """,
+            system_name=system_name,
+        )
+
     def get_related_subgraph(
         self,
         *,

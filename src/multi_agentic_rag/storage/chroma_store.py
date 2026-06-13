@@ -94,10 +94,14 @@ class ChromaVectorStore:
         *,
         collection_name: str = GRAPH_COLLECTION_NAME,
         embedding_function: Any | None = None,
+        embedding_provider: str = "hash",
+        embedding_model: str = "multi_agentic_rag_hash_embedding",
     ) -> None:
         self.path = resolve_path(path)
         self.collection_name = collection_name
         self.embedding_function = embedding_function or HashEmbeddingFunction()
+        self.embedding_provider = embedding_provider
+        self.embedding_model = embedding_model
         self._client: Any | None = None
         self._collection: Any | None = None
 
@@ -159,8 +163,7 @@ class ChromaVectorStore:
             )
         ]
 
-    @staticmethod
-    def _metadata(chunk: ChunkRecord) -> dict[str, Any]:
+    def _metadata(self, chunk: ChunkRecord) -> dict[str, Any]:
         return {
             "document_id": chunk.document_id,
             "system_name": chunk.system_name,
@@ -171,6 +174,8 @@ class ChromaVectorStore:
             "section_title": chunk.section_title or "",
             "chunk_index": chunk.chunk_index,
             "content_hash": chunk.content_hash,
+            "embedding_provider": self.embedding_provider,
+            "embedding_model": self.embedding_model,
         }
 
     @staticmethod

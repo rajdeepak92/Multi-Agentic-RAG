@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from dotenv import find_dotenv, load_dotenv
 
 from multi_agentic_rag.config import Settings, get_settings
+from multi_agentic_rag.storage.embedding_factory import select_embedding_function
 from multi_agentic_rag.storage.neo4j_store import Neo4jGraphStore
 from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
 from multi_agentic_rag.storage.vector_factory import select_vector_store
@@ -34,6 +35,7 @@ def run_diagnostics(settings: Settings | None = None) -> list[DiagnosticCheck]:
         _check_python_version(),
         _check_dotenv(),
         _check_openai_key(settings),
+        _check_embedding_provider(settings),
         _check_hf_token(settings),
         _check_sqlite(settings),
         _check_keyword_index(settings),
@@ -93,6 +95,32 @@ def _check_hf_token(settings: Settings) -> DiagnosticCheck:
     if settings.hf_token:
         return DiagnosticCheck("HF_TOKEN", "PASS", "Configured.")
     return DiagnosticCheck("HF_TOKEN", "WARN", "Missing. Public Hugging Face models may still work.")
+
+
+def _check_embedding_provider(settings: Settings) -> DiagnosticCheck:
+    try:
+        selection = select_embedding_function(settings)
+    except Exception as exc:
+        return DiagnosticCheck("Embedding provider", "FAIL", str(exc))
+    if selection.provider == "hash":
+        return DiagnosticCheck(
+            "Embedding provider",
+            "WARN",
+            "Hash embeddings selected; use only for deterministic tests/offline validation.",
+        )
+    try:
+        importlib.import_module("sentence_transformers")
+    except ModuleNotFoundError:
+        return DiagnosticCheck(
+            "Embedding provider",
+            "FAIL",
+            "sentence-transformers is required for EMBEDDING_PROVIDER=huggingface.",
+        )
+    return DiagnosticCheck(
+        "Embedding provider",
+        "PASS",
+        f"{selection.provider}: {selection.model_name}",
+    )
 
 
 def _check_sqlite(settings: Settings) -> DiagnosticCheck:
@@ -218,7 +246,7 @@ def _check_neo4j_ports(settings: Settings) -> DiagnosticCheck:
     if unavailable:
         return DiagnosticCheck(
             "Neo4j ports",
-            "WARN",
+            "FAIL" if settings.graphrag_required else "WARN",
             "Not listening: " + ", ".join(unavailable),
         )
     return DiagnosticCheck(
@@ -231,11 +259,12 @@ def _check_neo4j_ports(settings: Settings) -> DiagnosticCheck:
 
 def _check_neo4j(settings: Settings) -> DiagnosticCheck:
     if not settings.neo4j_uri:
-        return DiagnosticCheck("Neo4j", "WARN", "NEO4J_URI is not configured.")
+        status = "FAIL" if settings.graphrag_required else "WARN"
+        return DiagnosticCheck("Neo4j", status, "NEO4J_URI is not configured.")
     graph_store = Neo4jGraphStore(settings)
     available, message = graph_store.check_connection()
     graph_store.close()
-    status = "PASS" if available else "WARN"
+    status = "PASS" if available else ("FAIL" if settings.graphrag_required else "WARN")
     return DiagnosticCheck("Neo4j", status, message)
 
 

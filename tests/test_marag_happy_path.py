@@ -157,16 +157,52 @@ def test_generated_pytest_file_executes_and_last_result_is_stored(tmp_path: Path
     assert "class TestProject1V1Automation" in generated_file.read_text(encoding="utf-8")
     assert execution.supported
     assert execution.result is not None
-    assert execution.result.status == "passed"
-    assert execution.result.passed == 3
+    assert execution.result.status == "blocked"
+    assert execution.result.passed == 0
+    assert execution.result.skipped == 3
+    assert execution.result.failure_category == "PROTOCOL_UNAVAILABLE"
+    assert execution.result.dependency_blockers
     tracking = json.loads(tracking_file.read_text(encoding="utf-8"))
-    assert tracking["mode"] == "dummy_placeholder_until_interfaces_exist"
-    assert tracking["dependency_audit"]["status"] == "ready"
+    assert tracking["schema_version"] == "test-automation-tracking.v2"
+    assert tracking["mode"] == "dependency_aware_generation"
+    assert tracking["dependency_audit"]["status"] == "blocked"
+    assert tracking["dependency_audit"]["missing_dependencies"]
+    assert tracking["protocols"] == ["REST"]
     assert len(tracking["scenarios"]) == 3
-    assert tracking["run_1"]["status"] == "PASS"
+    assert len(tracking["selected_scenarios"]) == 3
+    assert tracking["run_1"]["status"] == "BLOCKED"
+    assert tracking["run_1"]["failure_category"] == "PROTOCOL_UNAVAILABLE"
+    assert tracking["db_update_status"] == "test_run_result_record_written"
     assert last.supported
     assert last.result is not None
     assert last.result.result_id == execution.result.result_id
+
+
+def test_generated_pytest_file_can_execute_in_explicit_mock_mode(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, generated_test_execution_mode="mock")
+    source = _write_docx(tmp_path / "PROJECT_1_BRD_V1.docx")
+    output_dir = tmp_path / "generated"
+    ingest_document(source, system_name="PROJECT_1", version="v1", settings=settings)
+
+    execution = run_testcases(
+        system_name="PROJECT_1",
+        version="v1",
+        scenario_count=2,
+        output_dir=output_dir,
+        settings=settings,
+    )
+
+    assert execution.supported
+    assert execution.result is not None
+    assert execution.result.status == "passed"
+    assert execution.result.passed == 2
+    tracking = json.loads(Path(execution.tracking_file_path or "").read_text(encoding="utf-8"))
+    assert tracking["dependency_audit"]["status"] == "ready"
+    assert all(
+        scenario["execution_mode"] == "mock"
+        for scenario in tracking["selected_scenarios"]
+        if scenario["protocols"]
+    )
 
 
 def test_generate_testcases_rewrites_when_requested_count_changes(tmp_path: Path) -> None:
@@ -295,7 +331,7 @@ def _write_unlinked_docx(path: Path) -> Path:
     return path
 
 
-def _settings(tmp_path: Path) -> Settings:
+def _settings(tmp_path: Path, *, generated_test_execution_mode: str = "auto") -> Settings:
     runtime = tmp_path / ".runtime"
     return Settings(
         multi_agentic_rag_home=runtime,
@@ -303,4 +339,6 @@ def _settings(tmp_path: Path) -> Settings:
         chroma_path=runtime / "chroma",
         object_store_path=runtime / "objects",
         neo4j_uri=None,
+        embedding_provider="hash",
+        generated_test_execution_mode=generated_test_execution_mode,
     )

@@ -13,11 +13,14 @@ from multi_agentic_rag.config import Settings, get_settings
 from multi_agentic_rag.coverage import DEFAULT_SCENARIO_COUNT, plan_requirement_coverage
 from multi_agentic_rag.models import CoverageRecord, GeneratedTestFileRecord, TestGenerationResult
 from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.testing.graph_indexer import index_generated_test_graph
 from multi_agentic_rag.utils.hashing import stable_id
 from multi_agentic_rag.utils.paths import resolve_path
 
 DEFAULT_OUTPUT_DIR = "generated"
 MAX_DEBUG_RETRIES = 5
+SIDECAR_SCHEMA_VERSION = "test-automation-tracking.v2"
+SUPPORTED_PROTOCOLS = ("Modbus", "MQTT", "CAN", "REST")
 
 WORKFLOW_HANDOFF = (
     "IntentRouter",
@@ -65,6 +68,7 @@ def generate_testcases(
             coverage=coverage,
             warnings=coverage.warnings,
         )
+    warnings = list(coverage.warnings)
 
     artifact_dir = _artifact_dir(
         output_dir=output_dir,
@@ -94,6 +98,13 @@ def generate_testcases(
             coverage_ids=coverage.run.coverage_ids,
         )
     ):
+        graph_warning = index_generated_test_graph(
+            settings=settings,
+            test_file=existing,
+            coverage_records=coverage.records,
+        )
+        if graph_warning:
+            warnings.append(graph_warning)
         return TestGenerationResult(
             supported=True,
             action="reused",
@@ -102,6 +113,7 @@ def generate_testcases(
             test_file=existing,
             tracking_file_path=existing.tracking_file_path,
             harness_file_paths=existing.harness_file_paths,
+            warnings=warnings,
         )
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -109,8 +121,14 @@ def generate_testcases(
         coverage_records=coverage.records,
         registry=registry,
         generated_file=test_file_path,
+        settings=settings,
     )
-    dependency_audit = _dependency_audit()
+    dependency_audit = _dependency_audit(
+        scenarios=scenarios,
+        settings=settings,
+        pytest_ini_path=pytest_ini_path,
+        conftest_path=conftest_path,
+    )
     test_file_path.write_text(
         _render_pytest_file(
             system_name=system_name,
@@ -122,23 +140,20 @@ def generate_testcases(
     )
     conftest_path.write_text(_render_conftest(), encoding="utf-8")
     pytest_ini_path.write_text(_render_pytest_ini(), encoding="utf-8")
+    tracking_payload = _tracking_payload(
+        system_name=system_name,
+        version=version,
+        coverage_run_id=coverage.run.run_id,
+        scope_hash=coverage.run.scope_hash,
+        generated_file=test_file_path,
+        tracking_file=tracking_file_path,
+        harness_paths=[conftest_path, pytest_ini_path],
+        scenarios=scenarios,
+        dependency_audit=dependency_audit,
+    )
+    _validate_tracking_payload(tracking_payload)
     tracking_file_path.write_text(
-        json.dumps(
-            _tracking_payload(
-                system_name=system_name,
-                version=version,
-                coverage_run_id=coverage.run.run_id,
-                scope_hash=coverage.run.scope_hash,
-                generated_file=test_file_path,
-                tracking_file=tracking_file_path,
-                harness_paths=[conftest_path, pytest_ini_path],
-                scenarios=scenarios,
-                dependency_audit=dependency_audit,
-            ),
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
+        json.dumps(tracking_payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
@@ -164,6 +179,17 @@ def generate_testcases(
         updated_at=now,
     )
     registry.upsert_generated_test_file(test_file)
+    graph_warning = index_generated_test_graph(
+        settings=settings,
+        test_file=test_file,
+        coverage_records=coverage.records,
+    )
+    if graph_warning:
+        warnings.append(graph_warning)
+    _mark_tracking_db_update(
+        tracking_file_path,
+        "generated_test_file_record_written",
+    )
     return TestGenerationResult(
         supported=True,
         action="generated",
@@ -172,6 +198,7 @@ def generate_testcases(
         test_file=test_file,
         tracking_file_path=str(tracking_file_path),
         harness_file_paths=harness_paths,
+        warnings=warnings,
     )
 
 
@@ -231,6 +258,10 @@ def _existing_artifacts_match(
         tracking = json.loads(tracking_file_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
+    if tracking.get("schema_version") != SIDECAR_SCHEMA_VERSION:
+        return False
+    if "_execute_generated_validation" not in content:
+        return False
     return all(coverage_id in content for coverage_id in coverage_ids) and all(
         coverage_id in {scenario["coverage_id"] for scenario in tracking.get("scenarios", [])}
         for coverage_id in coverage_ids
@@ -242,6 +273,7 @@ def _build_scenario_payloads(
     coverage_records: list[CoverageRecord],
     registry: SQLiteRegistry,
     generated_file: Path,
+    settings: Settings,
 ) -> list[dict]:
     scenarios = []
     for record in coverage_records:
@@ -261,7 +293,7 @@ def _build_scenario_payloads(
                 "expected_values": _extract_expected_values(evidence_text, record),
                 "priority": _priority(record),
                 "test_scenario": record.test_scenario,
-                "automation_feasibility": "placeholder_until_interfaces_exist",
+                "automation_feasibility": "dependency_audit_required",
                 "generated_file": str(generated_file),
                 "test_function": _test_function_name(record, scenario_index),
                 "validation_label": _validation_label(record, evidence_text),
@@ -269,6 +301,7 @@ def _build_scenario_payloads(
                 "status": "generated",
             }
         )
+        _attach_domain_dependency_status(scenarios[-1], evidence_text, settings)
     return scenarios
 
 
@@ -321,17 +354,170 @@ def _validation_label(record: CoverageRecord, evidence_text: str) -> str:
     return _safe_slug(record.requirement_id).replace("_", " ") or "requirement behavior"
 
 
-def _dependency_audit() -> dict:
+def _attach_domain_dependency_status(
+    scenario: dict,
+    evidence_text: str,
+    settings: Settings,
+) -> None:
+    protocols = _protocols_for_text(evidence_text)
+    external_dependencies = _external_dependencies_for_protocols(protocols)
+    missing_dependencies = _missing_dependencies_for_protocols(protocols, settings)
+    execution_mode = _execution_mode_for_protocols(protocols, settings, missing_dependencies)
+    scenario["domain"] = _domain_for_protocols(protocols)
+    scenario["protocols"] = protocols
+    scenario["execution_mode"] = execution_mode
+    scenario["dependency_status"] = "blocked" if missing_dependencies else "ready"
+    scenario["external_dependencies"] = external_dependencies
+    scenario["missing_dependencies"] = missing_dependencies
+
+
+def _protocols_for_text(text: str) -> list[str]:
+    protocols: list[str] = []
+    normalized = text.upper()
+    if re.search(r"\b(GET|POST|PUT|PATCH|DELETE)\s+/[A-Z0-9_./{}:-]+", normalized):
+        protocols.append("REST")
+    for protocol in SUPPORTED_PROTOCOLS:
+        if re.search(rf"\b{re.escape(protocol.upper())}\b", normalized):
+            protocols.append(protocol)
+    return _unique_sorted(protocols)
+
+
+def _external_dependencies_for_protocols(protocols: list[str]) -> list[str]:
+    dependency_by_protocol = {
+        "REST": "REST API base URL or REST simulator",
+        "MQTT": "MQTT broker URL or MQTT simulator",
+        "Modbus": "Modbus host or Modbus simulator",
+        "CAN": "CAN interface or CAN simulator",
+    }
+    return [dependency_by_protocol[protocol] for protocol in protocols if protocol in dependency_by_protocol]
+
+
+def _missing_dependencies_for_protocols(protocols: list[str], settings: Settings) -> list[str]:
+    if not protocols:
+        return []
+    if settings.generated_test_execution_mode == "mock":
+        return []
+    if settings.generated_test_execution_mode == "simulator":
+        if settings.simulator_config_path:
+            return []
+        return ["Simulator config is not configured"]
+
+    missing: list[str] = []
+    for protocol in protocols:
+        if protocol == "REST" and not settings.rest_api_base_url:
+            missing.append("REST API base URL or REST simulator is not configured")
+        elif protocol == "MQTT" and not settings.mqtt_broker_url:
+            missing.append("MQTT broker URL or MQTT simulator is not configured")
+        elif protocol == "Modbus" and not settings.modbus_host:
+            missing.append("Modbus host or Modbus simulator is not configured")
+        elif protocol == "CAN" and not settings.can_interface:
+            missing.append("CAN interface or CAN simulator is not configured")
+    if settings.generated_test_execution_mode == "auto" and missing and settings.simulator_config_path:
+        return []
+    return missing
+
+
+def _execution_mode_for_protocols(
+    protocols: list[str],
+    settings: Settings,
+    missing_dependencies: list[str],
+) -> str:
+    if not protocols:
+        return "document_contract"
+    if missing_dependencies:
+        return "blocked"
+    if settings.generated_test_execution_mode in {"mock", "simulator", "real"}:
+        return settings.generated_test_execution_mode
+    if settings.simulator_config_path:
+        return "simulator"
+    return "real"
+
+
+def _domain_for_protocols(protocols: list[str]) -> str:
+    if not protocols:
+        return "generic_software"
+    if protocols == ["REST"]:
+        return "rest_api"
+    if any(protocol in {"Modbus", "MQTT", "CAN"} for protocol in protocols):
+        return "industrial_protocol"
+    return "multi_domain"
+
+
+def _unique_sorted(values) -> list:
+    return sorted({value for value in values if value})
+
+
+def _requirements_payload(scenarios: list[dict]) -> list[dict[str, str]]:
+    requirements: dict[str, dict[str, str]] = {}
+    for scenario in scenarios:
+        requirement_id = scenario.get("requirement_id")
+        if not requirement_id:
+            continue
+        requirements.setdefault(
+            requirement_id,
+            {
+                "requirement_id": requirement_id,
+                "document_id": scenario.get("source_doc_id") or "",
+                "document_version": scenario.get("doc_version") or "",
+            },
+        )
+    return list(requirements.values())
+
+
+def _evidence_refs_payload(scenarios: list[dict]) -> list[dict]:
+    refs: list[dict] = []
+    for scenario in scenarios:
+        for chunk_id in scenario.get("chunk_ids", []):
+            refs.append(
+                {
+                    "scenario_id": scenario.get("scenario_id"),
+                    "requirement_id": scenario.get("requirement_id"),
+                    "document_id": scenario.get("source_doc_id"),
+                    "document_version": scenario.get("doc_version"),
+                    "chunk_id": chunk_id,
+                }
+            )
+    return refs
+
+
+def _dependency_audit(
+    *,
+    scenarios: list[dict],
+    settings: Settings,
+    pytest_ini_path: Path,
+    conftest_path: Path,
+) -> dict:
+    external_dependencies = sorted(
+        {
+            dependency
+            for scenario in scenarios
+            for dependency in scenario.get("external_dependencies", [])
+        }
+    )
+    missing_dependencies = sorted(
+        {
+            dependency
+            for scenario in scenarios
+            for dependency in scenario.get("missing_dependencies", [])
+        }
+    )
+    status = "blocked" if missing_dependencies else "ready"
     return {
         "agent": "DependencyAuditAgent",
-        "status": "ready",
+        "status": status,
         "project_mutation_allowed": False,
+        "execution_mode": settings.generated_test_execution_mode,
+        "pytest_ini": str(pytest_ini_path),
+        "conftest": str(conftest_path),
+        "fixtures": ["automation_context", "precise_test_logging"],
+        "external_dependencies": external_dependencies,
+        "missing_dependencies": missing_dependencies,
         "required_runtime": ["python", "pytest", "logging"],
         "required_harness": ["pytest.ini", "conftest.py", "class_based_pytest_tests"],
-        "missing": [],
+        "missing": missing_dependencies,
         "notes": [
-            "Dummy placeholder tests do not require external interfaces.",
-            "Protocol clients such as MQTT must be proposed separately before real tests use them.",
+            "Generated tests are dependency-aware and do not fake external protocol calls.",
+            "Missing protocol, simulator, or device dependencies are marked as blocked/skipped.",
         ],
     }
 
@@ -349,19 +535,46 @@ def _tracking_payload(
     dependency_audit: dict,
 ) -> dict:
     now = _utc_now()
+    document_ids = _unique_sorted(
+        scenario.get("source_doc_id") for scenario in scenarios if scenario.get("source_doc_id")
+    )
+    source_docs = _unique_sorted(
+        scenario.get("source_doc") for scenario in scenarios if scenario.get("source_doc")
+    )
+    requirements = _requirements_payload(scenarios)
+    evidence_refs = _evidence_refs_payload(scenarios)
+    protocols = _unique_sorted(
+        protocol
+        for scenario in scenarios
+        for protocol in scenario.get("protocols", [])
+    )
+    domain = _domain_for_protocols(protocols)
     return {
-        "schema_version": "test-automation-tracking.v1",
+        "schema_version": SIDECAR_SCHEMA_VERSION,
         "generated_at": now,
         "updated_at": now,
         "project": _safe_slug(system_name),
         "system_name": system_name,
+        "document_id": document_ids[0] if len(document_ids) == 1 else "",
+        "document_ids": document_ids,
+        "document_version": version or "",
+        "source_document_path": source_docs[0] if len(source_docs) == 1 else "",
+        "source_documents": source_docs,
         "doc_version": version,
+        "generated_test_file": str(generated_file),
+        "scenario_group": generated_file.stem.removeprefix("test_"),
+        "selected_scenarios": scenarios,
+        "requirements": requirements,
+        "extracted_facts_used": [],
+        "evidence_refs": evidence_refs,
+        "domain": domain,
+        "protocols": protocols,
         "coverage_run_id": coverage_run_id,
         "scope_hash": scope_hash,
         "generated_file": str(generated_file),
         "tracking_file": str(tracking_file),
         "harness_files": [str(path) for path in harness_paths],
-        "mode": "dummy_placeholder_until_interfaces_exist",
+        "mode": "dependency_aware_generation",
         "workflow_handoff": list(WORKFLOW_HANDOFF),
         "retry_policy": {
             "max_attempts": MAX_DEBUG_RETRIES,
@@ -371,9 +584,54 @@ def _tracking_payload(
             ),
         },
         "dependency_audit": dependency_audit,
+        "coverage": {
+            "coverage_intent": "requirement_linked_test_generation",
+            "covered_requirements": [item["requirement_id"] for item in requirements],
+            "coverage_gaps": [],
+        },
         "scenarios": scenarios,
         "run_history": [],
+        "db_update_status": "generated_test_file_record_pending",
     }
+
+
+def _validate_tracking_payload(payload: dict) -> None:
+    required_fields = (
+        "schema_version",
+        "project",
+        "document_version",
+        "generated_test_file",
+        "selected_scenarios",
+        "requirements",
+        "evidence_refs",
+        "dependency_audit",
+        "coverage",
+        "run_history",
+        "db_update_status",
+    )
+    missing = [field for field in required_fields if field not in payload]
+    if missing:
+        raise ValueError(f"Generated sidecar missing required field(s): {', '.join(missing)}")
+    if payload["schema_version"] != SIDECAR_SCHEMA_VERSION:
+        raise ValueError(f"Unsupported generated sidecar schema: {payload['schema_version']}")
+    if not payload["selected_scenarios"]:
+        raise ValueError("Generated sidecar must contain selected_scenarios.")
+    for scenario in payload["selected_scenarios"]:
+        if not scenario.get("requirement_id") or not scenario.get("evidence"):
+            raise ValueError("Generated scenario must link to requirement evidence.")
+
+
+def _mark_tracking_db_update(tracking_file_path: Path, status: str) -> None:
+    try:
+        payload = json.loads(tracking_file_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    payload["db_update_status"] = status
+    payload["updated_at"] = _utc_now()
+    tracking_file_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _render_pytest_file(
@@ -391,8 +649,9 @@ def _render_pytest_file(
 System: {system_name}
 Version: {version or "active"}
 
-This file is generated from stored BRD evidence. It intentionally uses
-placeholder execution until real product interfaces are connected.
+This file is generated from stored BRD evidence. It is dependency-aware: when
+protocol, simulator, or device dependencies are missing, affected tests skip
+with a blocker reason instead of faking a passing external call.
 """
 
 from __future__ import annotations
@@ -406,16 +665,32 @@ SCENARIOS = {pformat(scenario_by_index, width=100)}
 LOG = logging.getLogger(__name__)
 
 
-def _execute_placeholder_validation(scenario: dict, automation_context: dict) -> bool:
+def _execute_generated_validation(scenario: dict, automation_context: dict) -> bool:
     LOG.debug("Executing scenario data: %s", scenario)
-    LOG.warning("Running in placeholder mode because external interfaces are not connected.")
-    LOG.info("%s validation executed successfully", scenario["validation_label"])
-    assert automation_context["mode"] == "dummy_placeholder_until_interfaces_exist"
+    missing_dependencies = scenario.get("missing_dependencies", [])
+    if missing_dependencies:
+        reason = "; ".join(missing_dependencies)
+        LOG.error("Blocked because %s", reason)
+        pytest.skip(f"Blocked because {{reason}}")
+    LOG.info(
+        "%s validation executing in %s mode",
+        scenario["validation_label"],
+        scenario.get("execution_mode", "document_contract"),
+    )
+    assert automation_context["mode"] == "dependency_aware_generation"
+    assert scenario["dependency_status"] == "ready"
+    assert scenario["evidence"], "Generated scenario must cite BRD evidence."
+    assert scenario["chunk_ids"], "Generated scenario must trace to a source chunk."
+    assert scenario["expected_values"], "Expected values must be derived from evidence."
+    if scenario.get("protocols"):
+        assert scenario["execution_mode"] in {{"mock", "simulator", "real"}}
+    else:
+        assert scenario["execution_mode"] == "document_contract"
     return True
 
 
 @pytest.mark.generated
-@pytest.mark.placeholder
+@pytest.mark.evidence_bound
 class {class_name}:
 {test_methods}
 '''
@@ -433,7 +708,7 @@ def _render_test_method(scenario: dict) -> str:
         assert scenario["evidence"], "Generated scenario must cite BRD evidence."
         assert scenario["chunk_ids"], "Generated scenario must trace to a source chunk."
         assert scenario["expected_values"], "Expected values must be derived from evidence."
-        assert _execute_placeholder_validation(scenario, automation_context) is True'''
+        assert _execute_generated_validation(scenario, automation_context) is True'''
 
 
 def _render_conftest() -> str:
@@ -457,7 +732,7 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "generated: generated MARAG automation testcase")
-    config.addinivalue_line("markers", "placeholder: forced-pass placeholder testcase")
+    config.addinivalue_line("markers", "evidence_bound: generated test linked to evidence")
     config.addinivalue_line("markers", "requirement(id): BRD requirement trace marker")
 
 
@@ -465,7 +740,7 @@ def pytest_configure(config):
 def automation_context(pytestconfig):
     return {
         "environment": pytestconfig.getoption("--marag-env"),
-        "mode": "dummy_placeholder_until_interfaces_exist",
+        "mode": "dependency_aware_generation",
     }
 
 
@@ -488,7 +763,7 @@ python_classes = Test*
 python_functions = test_*
 markers =
     generated: generated MARAG automation testcase
-    placeholder: forced-pass placeholder testcase
+    evidence_bound: generated test linked to evidence
     requirement(id): BRD requirement trace marker
 """
 

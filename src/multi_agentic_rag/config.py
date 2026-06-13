@@ -53,7 +53,9 @@ class Settings(BaseSettings):
 
     default_embedding_model: str = Field(default="BAAI/bge-m3")
     default_reranker_model: str = Field(default="BAAI/bge-reranker-v2-m3")
-    embedding_provider: Literal["hash", "huggingface"] = Field(default="hash")
+    embedding_provider: Literal["hash", "huggingface"] = Field(default="huggingface")
+    hash_embedding_dimensions: int = Field(default=384)
+    graphrag_required: bool = Field(default=False)
 
     llm_provider: Literal["none", "openai", "azure_openai"] = Field(default="none")
     default_llm_model: str = Field(default="gpt-5.5")
@@ -63,6 +65,15 @@ class Settings(BaseSettings):
 
     enable_pdf_ocr: bool = Field(default=False)
     tesseract_cmd: str | None = Field(default=None)
+
+    generated_test_execution_mode: Literal["mock", "simulator", "real", "auto"] = Field(
+        default="auto"
+    )
+    simulator_config_path: Path | None = Field(default=None)
+    modbus_host: str | None = Field(default=None)
+    mqtt_broker_url: str | None = Field(default=None)
+    can_interface: str | None = Field(default=None)
+    rest_api_base_url: str | None = Field(default=None)
 
     api_host: str = Field(default="127.0.0.1")
     api_port: int = Field(default=8000)

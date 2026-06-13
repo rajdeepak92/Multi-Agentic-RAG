@@ -207,6 +207,8 @@ class SQLiteRegistry:
                     passed INTEGER NOT NULL,
                     failed INTEGER NOT NULL,
                     skipped INTEGER NOT NULL,
+                    failure_category TEXT,
+                    failure_reason TEXT,
                     dependency_blockers_json TEXT NOT NULL,
                     output TEXT NOT NULL,
                     created_at TEXT NOT NULL
@@ -233,6 +235,8 @@ class SQLiteRegistry:
                 "harness_file_paths_json",
                 "TEXT NOT NULL DEFAULT '[]'",
             )
+            self._ensure_column(connection, "test_run_results", "failure_category", "TEXT")
+            self._ensure_column(connection, "test_run_results", "failure_reason", "TEXT")
 
     def upsert_document(self, document: DocumentRecord) -> None:
         payload = document.model_dump(mode="json")
@@ -781,12 +785,14 @@ class SQLiteRegistry:
                 INSERT INTO test_run_results (
                     result_id, test_file_id, run_id, system_name, version, file_path,
                     status, exit_code, passed, failed, skipped,
-                    dependency_blockers_json, output, created_at
+                    failure_category, failure_reason, dependency_blockers_json,
+                    output, created_at
                 )
                 VALUES (
                     :result_id, :test_file_id, :run_id, :system_name, :version, :file_path,
                     :status, :exit_code, :passed, :failed, :skipped,
-                    :dependency_blockers_json, :output, :created_at
+                    :failure_category, :failure_reason, :dependency_blockers_json,
+                    :output, :created_at
                 )
                 ON CONFLICT(result_id) DO UPDATE SET
                     status=excluded.status,
@@ -794,6 +800,8 @@ class SQLiteRegistry:
                     passed=excluded.passed,
                     failed=excluded.failed,
                     skipped=excluded.skipped,
+                    failure_category=excluded.failure_category,
+                    failure_reason=excluded.failure_reason,
                     dependency_blockers_json=excluded.dependency_blockers_json,
                     output=excluded.output
                 """,

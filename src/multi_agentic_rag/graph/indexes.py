@@ -9,6 +9,11 @@ INDEX_QUERIES = (
     "CREATE CONSTRAINT fact_id IF NOT EXISTS FOR (f:Fact) REQUIRE f.fact_id IS UNIQUE",
     "CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (e:Entity) REQUIRE e.entity_id IS UNIQUE",
     "CREATE CONSTRAINT delta_id IF NOT EXISTS FOR (d:Delta) REQUIRE d.delta_id IS UNIQUE",
+    "CREATE CONSTRAINT coverage_id IF NOT EXISTS FOR (c:Coverage) REQUIRE c.coverage_id IS UNIQUE",
+    "CREATE CONSTRAINT generated_test_file_id IF NOT EXISTS "
+    "FOR (t:GeneratedTest) REQUIRE t.test_file_id IS UNIQUE",
+    "CREATE CONSTRAINT test_run_result_id IF NOT EXISTS "
+    "FOR (r:TestRun) REQUIRE r.result_id IS UNIQUE",
     "CREATE INDEX fact_key IF NOT EXISTS FOR (f:Fact) ON (f.fact_key)",
     "CREATE INDEX fact_type IF NOT EXISTS FOR (f:Fact) ON (f.fact_type)",
     "CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.entity_type)",
@@ -19,4 +24,8 @@ INDEX_QUERIES = (
     "CREATE INDEX chunk_version IF NOT EXISTS FOR (c:Chunk) ON (c.version)",
     "CREATE INDEX fact_status IF NOT EXISTS FOR (f:Fact) ON (f.status)",
     "CREATE INDEX fact_version IF NOT EXISTS FOR (f:Fact) ON (f.version)",
+    "CREATE INDEX coverage_requirement_id IF NOT EXISTS "
+    "FOR (c:Coverage) ON (c.requirement_id)",
+    "CREATE INDEX generated_test_status IF NOT EXISTS FOR (t:GeneratedTest) ON (t.status)",
+    "CREATE INDEX test_run_status IF NOT EXISTS FOR (r:TestRun) ON (r.status)",
 )

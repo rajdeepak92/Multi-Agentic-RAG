@@ -19,6 +19,7 @@ from multi_agentic_rag.testing.generator import (
     generate_testcases,
     tracking_file_for,
 )
+from multi_agentic_rag.testing.graph_indexer import index_test_run_graph
 from multi_agentic_rag.utils.hashing import stable_id
 
 MAX_DEBUG_RETRIES = 5
@@ -56,6 +57,7 @@ def run_testcases(
         )
 
     final_result: TestRunResultRecord | None = None
+    graph_warnings: list[str] = []
     attempts = max(1, max_attempts)
     for attempt in range(1, attempts + 1):
         file_path = Path(generation.test_file.file_path)
@@ -72,6 +74,13 @@ def run_testcases(
                 blocker=f"Generated testcase file is missing: {file_path}",
             )
             registry.insert_test_run_result(final_result)
+            graph_warning = index_test_run_graph(
+                settings=settings,
+                result=final_result,
+                test_file=generation.test_file,
+            )
+            if graph_warning:
+                graph_warnings.append(graph_warning)
             _record_tracking_run(
                 tracking_file_path=tracking_file_path,
                 result=final_result,
@@ -87,7 +96,7 @@ def run_testcases(
                 result=final_result,
                 tracking_file_path=str(tracking_file_path),
                 attempts=attempt,
-                warnings=final_result.dependency_blockers,
+                warnings=[*final_result.dependency_blockers, *graph_warnings],
             )
 
         syntax_error = _syntax_error(file_path)
@@ -101,6 +110,13 @@ def run_testcases(
                 output=syntax_error,
             )
             registry.insert_test_run_result(final_result)
+            graph_warning = index_test_run_graph(
+                settings=settings,
+                result=final_result,
+                test_file=generation.test_file,
+            )
+            if graph_warning:
+                graph_warnings.append(graph_warning)
             should_retry = attempt < attempts
             _record_tracking_run(
                 tracking_file_path=tracking_file_path,
@@ -125,7 +141,14 @@ def run_testcases(
         output = "\n".join(part for part in [process.stdout, process.stderr] if part).strip()
         blockers = _dependency_blockers(output)
         passed, failed, skipped = _parse_pytest_counts(output)
-        status = "passed" if process.returncode == 0 else ("blocked" if blockers else "failed")
+        status = _execution_status(
+            returncode=process.returncode,
+            blockers=blockers,
+            passed=passed,
+            failed=failed,
+            skipped=skipped,
+        )
+        failure_category = _failure_category(status=status, blockers=blockers, output=output)
         failure_reason = _failure_reason(status=status, blockers=blockers, output=output)
         final_result = TestRunResultRecord(
             result_id=stable_id(
@@ -144,11 +167,20 @@ def run_testcases(
             passed=passed,
             failed=failed,
             skipped=skipped,
+            failure_category=failure_category,
+            failure_reason=failure_reason,
             dependency_blockers=blockers,
             output=output[-8000:],
             created_at=_utc_now(),
         )
         registry.insert_test_run_result(final_result)
+        graph_warning = index_test_run_graph(
+            settings=settings,
+            result=final_result,
+            test_file=generation.test_file,
+        )
+        if graph_warning:
+            graph_warnings.append(graph_warning)
         should_retry = (
             status == "failed"
             and attempt < attempts
@@ -182,6 +214,13 @@ def run_testcases(
             blocker="No pytest execution result was produced.",
         )
         registry.insert_test_run_result(final_result)
+        graph_warning = index_test_run_graph(
+            settings=settings,
+            result=final_result,
+            test_file=generation.test_file,
+        )
+        if graph_warning:
+            graph_warnings.append(graph_warning)
 
     return TestExecutionResult(
         supported=True,
@@ -191,7 +230,7 @@ def run_testcases(
         result=final_result,
         tracking_file_path=generation.test_file.tracking_file_path,
         attempts=attempt,
-        warnings=final_result.dependency_blockers,
+        warnings=[*final_result.dependency_blockers, *graph_warnings],
     )
 
 
@@ -265,6 +304,8 @@ def _blocked_result(
         passed=0,
         failed=0,
         skipped=0,
+        failure_category="DEPENDENCY_MISSING",
+        failure_reason=blocker,
         dependency_blockers=[blocker],
         output=blocker,
         created_at=_utc_now(),
@@ -279,6 +320,7 @@ def _failed_result(
     file_path: str,
     *,
     output: str,
+    failure_category: str = "GENERATION_ERROR",
 ) -> TestRunResultRecord:
     return TestRunResultRecord(
         result_id=stable_id("test_result", test_file_id, _utc_now()),
@@ -292,6 +334,8 @@ def _failed_result(
         passed=0,
         failed=1,
         skipped=0,
+        failure_category=failure_category,
+        failure_reason=output,
         dependency_blockers=[],
         output=output,
         created_at=_utc_now(),
@@ -301,6 +345,9 @@ def _failed_result(
 def _dependency_blockers(output: str) -> list[str]:
     blockers = []
     patterns = (
+        r"Blocked because .+",
+        r"Skipped because .+",
+        r"PROTOCOL_UNAVAILABLE: .+",
         r"ModuleNotFoundError: No module named '([^']+)'",
         r"ImportError: (.+)",
         r"ConnectionRefusedError: (.+)",
@@ -324,6 +371,25 @@ def _first_count(output: str, label: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+def _execution_status(
+    *,
+    returncode: int,
+    blockers: list[str],
+    passed: int,
+    failed: int,
+    skipped: int,
+) -> str:
+    if blockers:
+        return "blocked"
+    if failed:
+        return "failed"
+    if skipped and not passed:
+        return "skipped"
+    if returncode == 0:
+        return "passed"
+    return "failed"
+
+
 def _failure_reason(*, status: str, blockers: list[str], output: str) -> str | None:
     if status == "passed":
         return None
@@ -333,6 +399,23 @@ def _failure_reason(*, status: str, blockers: list[str], output: str) -> str | N
         if line.startswith(("E   ", "FAILED ", "ERROR ")):
             return line[:500]
     return output[-500:] if output else "pytest failed without output"
+
+
+def _failure_category(*, status: str, blockers: list[str], output: str) -> str | None:
+    if status == "passed":
+        return None
+    joined_blockers = " ".join(blockers)
+    if any(protocol in joined_blockers for protocol in ("MQTT", "Modbus", "CAN", "REST")):
+        return "PROTOCOL_UNAVAILABLE"
+    if blockers:
+        return "DEPENDENCY_MISSING"
+    if "SyntaxError" in output or "PyCompileError" in output:
+        return "GENERATION_ERROR"
+    if "AssertionError" in output or "assert " in output or "FAILED " in output:
+        return "ASSERTION_FAILURE"
+    if status == "skipped":
+        return "DEPENDENCY_MISSING"
+    return "ENVIRONMENT_ERROR"
 
 
 def _fixable_generated_failure(output: str) -> bool:
@@ -361,10 +444,13 @@ def _record_tracking_run(
         "passed": "PASS",
         "failed": "FAIL",
         "blocked": "BLOCKED",
+        "skipped": "SKIP",
     }.get(result.status, result.status.upper())
     run_payload = {
         "state": "executed",
         "timestamp": timestamp,
+        "run_id": result.result_id,
+        "command": f"{sys.executable} -m pytest {Path(result.file_path).name}",
         "status": status,
         "result_id": result.result_id,
         "attempt": attempt,
@@ -372,14 +458,21 @@ def _record_tracking_run(
         "passed": result.passed,
         "failed": result.failed,
         "skipped": result.skipped,
+        "failure_category": result.failure_category,
         "dependency_blockers": result.dependency_blockers,
         "failure_reason": failure_reason,
         "fix_attempted": fix_attempted,
+        "stdout_path": "",
+        "stderr_path": "",
     }
     payload[f"run_{attempt}"] = run_payload
     payload.setdefault("run_history", []).append(run_payload)
     payload["updated_at"] = timestamp
+    payload["db_update_status"] = "test_run_result_record_written"
     for scenario in payload.get("scenarios", []):
+        scenario["last_run_status"] = status
+        scenario["last_run_id"] = result.result_id
+    for scenario in payload.get("selected_scenarios", []):
         scenario["last_run_status"] = status
         scenario["last_run_id"] = result.result_id
     tracking_file_path.write_text(

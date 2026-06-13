@@ -11,6 +11,8 @@ NODE_LABELS = (
     "Protocol",
     "Topic",
     "TestCase",
+    "GeneratedTest",
+    "TestRun",
     "Fact",
     "Delta",
     "Coverage",
@@ -32,4 +34,8 @@ RELATIONSHIP_TYPES = (
     "FROM_DOCUMENT",
     "TO_DOCUMENT",
     "COVERS_REQUIREMENT",
+    "HAS_GENERATED_TEST",
+    "IMPLEMENTS_COVERAGE",
+    "HAS_TEST_RUN",
+    "SUPPORTED_BY_CHUNK",
 )

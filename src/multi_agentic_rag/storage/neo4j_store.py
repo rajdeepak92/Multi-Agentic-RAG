@@ -7,7 +7,15 @@ from typing import Any
 
 from multi_agentic_rag.config import Settings
 from multi_agentic_rag.graph.indexes import INDEX_QUERIES
-from multi_agentic_rag.models import ChunkRecord, DeltaRecord, DocumentRecord, FactRecord
+from multi_agentic_rag.models import (
+    ChunkRecord,
+    CoverageRecord,
+    DeltaRecord,
+    DocumentRecord,
+    FactRecord,
+    GeneratedTestFileRecord,
+    TestRunResultRecord,
+)
 
 
 class Neo4jGraphStore:
@@ -211,6 +219,142 @@ class Neo4jGraphStore:
                     """,
                     delta.model_dump(mode="json"),
                 )
+
+    def upsert_generated_test_graph(
+        self,
+        *,
+        test_file: GeneratedTestFileRecord,
+        coverage_records: list[CoverageRecord],
+    ) -> None:
+        """Upsert generated automation assets and coverage links into Neo4j."""
+
+        with self.session() as session:
+            session.run(
+                """
+                MERGE (s:System {system_name: $system_name})
+                MERGE (t:GeneratedTest {test_file_id: $test_file_id})
+                SET t.run_id = $run_id,
+                    t.version = $version,
+                    t.scope_hash = $scope_hash,
+                    t.file_path = $file_path,
+                    t.tracking_file_path = $tracking_file_path,
+                    t.status = $status,
+                    t.coverage_ids = $coverage_ids,
+                    t.created_at = $created_at,
+                    t.updated_at = $updated_at
+                MERGE (s)-[:HAS_GENERATED_TEST]->(t)
+                """,
+                test_file.model_dump(mode="json"),
+            )
+            for coverage in coverage_records:
+                self._upsert_coverage_link(session, test_file=test_file, coverage=coverage)
+
+    def upsert_test_run_graph(
+        self,
+        *,
+        result: TestRunResultRecord,
+        test_file: GeneratedTestFileRecord | None = None,
+    ) -> None:
+        """Upsert generated test execution status and link it to the test asset."""
+
+        with self.session() as session:
+            if test_file:
+                session.run(
+                    """
+                    MERGE (s:System {system_name: $system_name})
+                    MERGE (t:GeneratedTest {test_file_id: $test_file_id})
+                    SET t.run_id = $run_id,
+                        t.version = $version,
+                        t.scope_hash = $scope_hash,
+                        t.file_path = $file_path,
+                        t.tracking_file_path = $tracking_file_path,
+                        t.status = $status,
+                        t.coverage_ids = $coverage_ids,
+                        t.created_at = $created_at,
+                        t.updated_at = $updated_at
+                    MERGE (s)-[:HAS_GENERATED_TEST]->(t)
+                    """,
+                    test_file.model_dump(mode="json"),
+                )
+            session.run(
+                """
+                MERGE (s:System {system_name: $system_name})
+                MERGE (t:GeneratedTest {test_file_id: $test_file_id})
+                SET t.file_path = coalesce(t.file_path, $file_path),
+                    t.version = coalesce(t.version, $version)
+                MERGE (r:TestRun {result_id: $result_id})
+                SET r.run_id = $run_id,
+                    r.system_name = $system_name,
+                    r.version = $version,
+                    r.file_path = $file_path,
+                    r.status = $status,
+                    r.exit_code = $exit_code,
+                    r.passed = $passed,
+                    r.failed = $failed,
+                    r.skipped = $skipped,
+                    r.failure_category = $failure_category,
+                    r.failure_reason = $failure_reason,
+                    r.dependency_blockers = $dependency_blockers,
+                    r.created_at = $created_at
+                MERGE (s)-[:HAS_GENERATED_TEST]->(t)
+                MERGE (t)-[:HAS_TEST_RUN]->(r)
+                """,
+                result.model_dump(mode="json"),
+            )
+
+    @staticmethod
+    def _upsert_coverage_link(
+        session: Any,
+        *,
+        test_file: GeneratedTestFileRecord,
+        coverage: CoverageRecord,
+    ) -> None:
+        session.run(
+            """
+            MATCH (t:GeneratedTest {test_file_id: $test_file_id})
+            MERGE (c:Coverage {coverage_id: $coverage_id})
+            SET c.requirement_id = $requirement_id,
+                c.use_case = $use_case,
+                c.test_scenario = $test_scenario,
+                c.automation_feasibility = $automation_feasibility,
+                c.priority = $priority,
+                c.coverage_status = $coverage_status,
+                c.document_id = $document_id,
+                c.version = $version,
+                c.chunk_id = $chunk_id,
+                c.scenario_index = $scenario_index,
+                c.source_hash = $source_hash
+            MERGE (t)-[:IMPLEMENTS_COVERAGE]->(c)
+            """,
+            {
+                "test_file_id": test_file.test_file_id,
+                **coverage.model_dump(mode="json"),
+            },
+        )
+        if coverage.requirement_id:
+            session.run(
+                """
+                MATCH (c:Coverage {coverage_id: $coverage_id})
+                MERGE (r:Requirement {requirement_id: $requirement_id})
+                SET r.version = coalesce(r.version, $version),
+                    r.document_id = coalesce(r.document_id, $document_id),
+                    r.chunk_id = coalesce(r.chunk_id, $chunk_id)
+                MERGE (c)-[:COVERS_REQUIREMENT]->(r)
+                """,
+                coverage.model_dump(mode="json"),
+            )
+        if coverage.chunk_id:
+            session.run(
+                """
+                MATCH (c:Coverage {coverage_id: $coverage_id})
+                MATCH (chunk:Chunk {chunk_id: $chunk_id})
+                MERGE (c)-[:SUPPORTED_BY_CHUNK]->(chunk)
+                """,
+                {
+                    "coverage_id": coverage.coverage_id,
+                    "chunk_id": coverage.chunk_id,
+                },
+            )
 
     @staticmethod
     def _upsert_fact(session: Any, fact: FactRecord) -> None:

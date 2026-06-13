@@ -70,6 +70,8 @@ class TestRunResultRecord(BaseModel):
     passed: int = 0
     failed: int = 0
     skipped: int = 0
+    failure_category: str | None = None
+    failure_reason: str | None = None
     dependency_blockers: list[str] = Field(default_factory=list)
     output: str = ""
     created_at: str

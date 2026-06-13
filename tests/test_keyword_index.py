@@ -60,6 +60,7 @@ def test_keyword_evidence_supports_query_when_no_fact_matches(tmp_path: Path) ->
         sqlite_db_path=tmp_path / ".runtime" / "registry.db",
         chroma_path=tmp_path / ".runtime" / "chroma",
         neo4j_uri=None,
+        embedding_provider="hash",
     )
     registry = SQLiteRegistry(settings.sqlite_db_path)
     registry.initialize()
@@ -88,6 +89,7 @@ def test_version_label_does_not_force_historical_query(tmp_path: Path) -> None:
         sqlite_db_path=tmp_path / ".runtime" / "registry.db",
         chroma_path=tmp_path / ".runtime" / "chroma",
         neo4j_uri=None,
+        embedding_provider="hash",
     )
     registry = SQLiteRegistry(settings.sqlite_db_path)
     registry.initialize()
@@ -166,6 +168,7 @@ def test_threshold_query_uses_table_evidence_not_generic_sensor_facts(tmp_path: 
         sqlite_db_path=tmp_path / ".runtime" / "registry.db",
         chroma_path=tmp_path / ".runtime" / "chroma",
         neo4j_uri=None,
+        embedding_provider="hash",
     )
     registry = SQLiteRegistry(settings.sqlite_db_path)
     registry.initialize()
@@ -232,6 +235,7 @@ def test_explicit_version_query_can_retrieve_superseded_document(tmp_path: Path)
         sqlite_db_path=tmp_path / ".runtime" / "registry.db",
         chroma_path=tmp_path / ".runtime" / "chroma",
         neo4j_uri=None,
+        embedding_provider="hash",
     )
     registry = SQLiteRegistry(settings.sqlite_db_path)
     registry.initialize()

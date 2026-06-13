@@ -27,7 +27,10 @@ def compile_graph() -> Any:
     graph.add_node("generate_output", nodes.generate_output)
 
     graph.set_entry_point("route_input")
-    graph.add_edge("route_input", "route_query")
+    graph.add_edge("route_input", "ingest_document")
+    graph.add_edge("ingest_document", "build_graph")
+    graph.add_edge("build_graph", "compute_delta")
+    graph.add_edge("compute_delta", "route_query")
     graph.add_edge("route_query", "retrieve_context")
     graph.add_edge("retrieve_context", "verify_evidence")
     graph.add_edge("verify_evidence", "generate_output")
@@ -41,6 +44,9 @@ class _FallbackWorkflow:
     def invoke(self, state: AgentStateDict) -> AgentStateDict:
         for step in (
             nodes.route_input,
+            nodes.ingest_document,
+            nodes.build_graph,
+            nodes.compute_delta,
             nodes.route_query,
             nodes.retrieve_context,
             nodes.verify_evidence,

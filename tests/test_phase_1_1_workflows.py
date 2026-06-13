@@ -137,4 +137,5 @@ def _settings(tmp_path: Path) -> Settings:
         sqlite_db_path=runtime / "registry.db",
         chroma_path=runtime / "chroma",
         neo4j_uri=None,
+        embedding_provider="hash",
     )

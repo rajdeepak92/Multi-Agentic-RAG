@@ -31,6 +31,8 @@ class WeaviateVectorStore:
         collection_name: str = "MultiAgenticRagChunk",
         hybrid_alpha: float = 0.65,
         embedding_function: Any | None = None,
+        embedding_provider: str = "hash",
+        embedding_model: str = "multi_agentic_rag_hash_embedding",
         timeout_seconds: float = 10.0,
     ) -> None:
         self.url = url.rstrip("/")
@@ -38,6 +40,8 @@ class WeaviateVectorStore:
         self.collection_name = self._validate_collection_name(collection_name)
         self.hybrid_alpha = hybrid_alpha
         self.embedding_function = embedding_function or HashEmbeddingFunction()
+        self.embedding_provider = embedding_provider
+        self.embedding_model = embedding_model
         self.timeout_seconds = timeout_seconds
 
     def index_chunks(self, chunks: list[ChunkRecord]) -> None:
@@ -88,17 +92,19 @@ class WeaviateVectorStore:
             {
                 "chunk_id": record.get("chunk_id"),
                 "text": record.get("text"),
-                "metadata": {
-                    "document_id": record.get("document_id"),
-                    "system_name": record.get("system_name"),
-                    "version": record.get("version"),
-                    "status": record.get("status"),
+                    "metadata": {
+                        "document_id": record.get("document_id"),
+                        "system_name": record.get("system_name"),
+                        "version": record.get("version"),
+                        "status": record.get("status"),
                     "source_name": record.get("source_name"),
                     "page": record.get("page"),
-                    "section_title": record.get("section_title") or "",
-                    "chunk_index": record.get("chunk_index"),
-                    "content_hash": record.get("content_hash"),
-                },
+                        "section_title": record.get("section_title") or "",
+                        "chunk_index": record.get("chunk_index"),
+                        "content_hash": record.get("content_hash"),
+                        "embedding_provider": record.get("embedding_provider"),
+                        "embedding_model": record.get("embedding_model"),
+                    },
                 "score": record.get("_additional", {}).get("score"),
                 "distance": record.get("_additional", {}).get("distance"),
             }
@@ -142,6 +148,8 @@ class WeaviateVectorStore:
                         {"name": "section_title", "dataType": ["text"]},
                         {"name": "chunk_index", "dataType": ["int"]},
                         {"name": "content_hash", "dataType": ["text"]},
+                        {"name": "embedding_provider", "dataType": ["text"]},
+                        {"name": "embedding_model", "dataType": ["text"]},
                         {"name": "text", "dataType": ["text"]},
                     ],
                 },
@@ -154,8 +162,7 @@ class WeaviateVectorStore:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    @staticmethod
-    def _properties(chunk: ChunkRecord) -> dict[str, Any]:
+    def _properties(self, chunk: ChunkRecord) -> dict[str, Any]:
         return {
             "chunk_id": chunk.chunk_id,
             "document_id": chunk.document_id,
@@ -167,6 +174,8 @@ class WeaviateVectorStore:
             "section_title": chunk.section_title or "",
             "chunk_index": chunk.chunk_index,
             "content_hash": chunk.content_hash,
+            "embedding_provider": self.embedding_provider,
+            "embedding_model": self.embedding_model,
             "text": chunk.text,
         }
 
@@ -201,6 +210,8 @@ class WeaviateVectorStore:
               section_title
               chunk_index
               content_hash
+              embedding_provider
+              embedding_model
               text
               _additional {{
                 score

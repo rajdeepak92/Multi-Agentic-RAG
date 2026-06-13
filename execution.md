@@ -1,24 +1,29 @@
 # MARAG Execution Guide
 
 This guide explains how Multi-Agentic-RAG (MARAG) currently works for document
-ingestion, document-grounded chat, coverage planning, dummy pytest automation
+ingestion, document-grounded chat, coverage planning, dependency-aware pytest automation
 generation, testcase execution, and result tracking.
 
 MARAG is local-first. It does not use Docker. Neo4j, Weaviate, OpenAI, and
-HuggingFace-backed models can be enabled, but the current dummy automation
+HuggingFace-backed models can be enabled, but the current automation
 execution path can run with local Python, pytest, SQLite, and ingested evidence.
+
+For the forward-looking roadmap toward GraphRAG-backed QA automation,
+LangGraph workflows, domain adapters, mock/simulator-backed pytest generation,
+and future Robot Framework mapping, see `STRATEGIC_UPDATE_PLAN.md`,
+`UPDATED_GOAL.md`, `EXECUTION_FLOW.md`, and `TEST_GENERATION_STRATEGY.md`.
 
 ## 1. Supported Task Types
 
 MARAG currently routes work into three practical task types:
 
 1. Ingest documents and keep local stores up to date.
-2. Generate dummy automation-style pytest tests from an instructed document.
+2. Generate dependency-aware automation-style pytest tests from an instructed document.
 3. Answer informative chatbot questions from ingested document evidence.
 
-The current test-generation implementation is deterministic Python
-orchestration behind the CLI/API/task router. It records an agent-style handoff
-contract so a later LangGraph subgraph can adopt the same flow.
+The current task router uses service-backed LangGraph workflow wrappers and
+delegates generation/execution to deterministic Python services. The generated
+JSON records the agent-style handoff for deeper node decomposition later.
 
 ## 2. Fresh Windows Setup
 
@@ -62,6 +67,10 @@ KEYWORD_INDEX_ENABLED=true
 NEO4J_URI=bolt://127.0.0.1:7687
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=<your_neo4j_password>
+GRAPHRAG_REQUIRED=true
+
+EMBEDDING_PROVIDER=huggingface
+DEFAULT_EMBEDDING_MODEL=BAAI/bge-m3
 
 LLM_PROVIDER=none
 OPENAI_API_KEY=
@@ -79,7 +88,11 @@ uv run pytest -c pyproject.toml tests
 ```
 
 Neo4j and Weaviate may warn if they are not running. That is a setup signal,
-not a dummy-test generation blocker.
+not a local test-generation blocker.
+
+For real GraphRAG runs, keep `GRAPHRAG_REQUIRED=true` and start Neo4j before
+ingestion. For deterministic tests or offline smoke runs only, use
+`EMBEDDING_PROVIDER=hash` and `GRAPHRAG_REQUIRED=false`.
 
 ## 3. Document Inbox Convention
 
@@ -166,7 +179,7 @@ No evidence means no coverage claim.
 
 ## 7. Test-Automation Generation Flow
 
-Generate dummy pytest automation artifacts:
+Generate pytest automation artifacts:
 
 ```powershell
 uv run multi-agentic-rag generate-tests --system PROJECT_1 --version v1 --count 5
@@ -205,8 +218,8 @@ TrackingJsonAgent
 DbUpdateAgent
 ```
 
-The current code records this handoff but does not yet compile it as a dedicated
-LangGraph subgraph.
+The task router runs through LangGraph workflow wrappers. The individual
+test-generation substeps are still implemented as deterministic services.
 
 ## 8. Generated Pytest Behavior
 
@@ -219,23 +232,24 @@ Each test function:
 - Checks that evidence is present.
 - Checks that at least one source chunk ID is present.
 - Checks that expected values were derived from evidence.
-- Calls a placeholder validation helper.
-- Asserts that the helper returns `True`.
+- Calls a dependency-aware validation helper.
+- Blocks/skips when protocol, simulator, or device configuration is missing.
+- In explicit mock mode, asserts deterministic evidence-derived checks.
 
 The helper logs with precise levels:
 
 - `DEBUG` for scenario data.
-- `WARNING` for placeholder mode.
-- `INFO` for successful placeholder validation.
+- `ERROR` for blocked dependency reasons.
+- `INFO` for validation mode and label.
 
-Current dummy behavior does not call real MQTT, REST, CAN, Modbus, device, or
-application interfaces. It force-passes only after traceability fields are
-present.
+Current behavior does not call real MQTT, REST, CAN, Modbus, device, or
+application interfaces unless configuration exists. Missing dependencies are
+reported as blocked/skipped instead of fake passes.
 
 Example generated log message:
 
 ```text
-sensor threshold maximum value validation executed successfully
+protocol/interface behavior validation executing in mock mode
 ```
 
 ## 9. Tracking JSON Contract
@@ -253,8 +267,14 @@ The JSON stores:
 - `doc_version`
 - `coverage_run_id`
 - `scope_hash`
+- `generated_test_file`
 - `generated_file`
+- `selected_scenarios`
+- `requirements`
+- `evidence_refs`
 - `harness_files`
+- `protocols`
+- `domain`
 - `dependency_audit`
 - `retry_policy`
 - `workflow_handoff`
@@ -294,7 +314,7 @@ moved into a database trace table and kept only as an export artifact.
 
 The generator does not freely mutate project dependencies.
 
-Current dummy placeholder tests require only:
+Generated tests always require the local pytest harness:
 
 - Python
 - pytest
@@ -302,10 +322,10 @@ Current dummy placeholder tests require only:
 - generated `pytest.ini`
 - generated `conftest.py`
 
-If a future BRD scenario requires MQTT, REST, CAN, Modbus, or another interface
-library, MARAG should treat that as a controlled dependency audit result. It
-should propose the missing dependency/config first, then apply project changes
-only through an approved implementation step.
+If a BRD scenario requires MQTT, REST, CAN, Modbus, or another interface,
+MARAG records the missing endpoint, simulator, or client configuration in the
+dependency audit and run result. Project dependency changes still require an
+approved implementation step.
 
 ## 11. Execute Generated Testcases
 
@@ -464,4 +484,5 @@ Example task request:
 - It does not hide missing dependencies; blockers are reported and stored.
 - It does not mutate dependencies from inside testcase generation.
 - It does not treat superseded evidence as current truth unless a version is requested.
-- It does not call real external interfaces in dummy placeholder mode.
+- It does not call real external interfaces unless the required dependency
+  configuration is present.
