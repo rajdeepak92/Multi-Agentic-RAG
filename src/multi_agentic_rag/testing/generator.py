@@ -12,7 +12,7 @@ from textwrap import shorten
 from multi_agentic_rag.config import Settings, get_settings
 from multi_agentic_rag.coverage import DEFAULT_SCENARIO_COUNT, plan_requirement_coverage
 from multi_agentic_rag.models import CoverageRecord, GeneratedTestFileRecord, TestGenerationResult
-from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.registry import Registry, select_registry
 from multi_agentic_rag.testing.graph_indexer import index_generated_test_graph
 from multi_agentic_rag.utils.hashing import stable_id
 from multi_agentic_rag.utils.paths import resolve_path
@@ -60,7 +60,7 @@ def generate_testcases(
     """Create or reuse generated pytest automation placeholders for coverage records."""
 
     settings = _settings_for_execution_mode(settings or get_settings(), execution_mode)
-    registry = SQLiteRegistry(settings.sqlite_db_path)
+    registry = select_registry(settings).registry
     registry.initialize()
     coverage = plan_requirement_coverage(
         system_name=system_name,
@@ -331,7 +331,7 @@ def _existing_artifacts_match(
 def _build_scenario_payloads(
     *,
     coverage_records: list[CoverageRecord],
-    registry: SQLiteRegistry,
+    registry: Registry,
     generated_file: Path,
     settings: Settings,
     force_run_all: bool = False,

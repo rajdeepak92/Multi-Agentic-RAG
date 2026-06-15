@@ -66,6 +66,12 @@ class Neo4jGraphStore:
     def check_connection(self) -> tuple[bool, str]:
         if not self.configured:
             return False, "NEO4J_URI is not configured."
+        if _neo4j_uri_is_local(self.settings.neo4j_uri) and not self.settings.allow_local_dev_mode:
+            return (
+                False,
+                "Localhost Neo4j requires ALLOW_LOCAL_DEV_MODE=true. Strict mode expects "
+                "a managed or remote Neo4j URI.",
+            )
         try:
             self._get_driver().verify_connectivity()
         except Exception as exc:  # pragma: no cover - depends on local Neo4j
@@ -548,3 +554,10 @@ class Neo4jGraphStore:
                 "system_name": fact.system_name,
             },
         )
+
+
+def _neo4j_uri_is_local(uri: str | None) -> bool:
+    if not uri:
+        return False
+    normalized = uri.lower()
+    return any(host in normalized for host in ("localhost", "127.0.0.1", "0.0.0.0"))

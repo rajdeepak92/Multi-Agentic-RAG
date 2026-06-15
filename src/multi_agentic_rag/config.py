@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Runtime settings for the local-first package."""
+    """Runtime settings for strict GraphRAG runtime and explicit local development."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -24,10 +24,13 @@ class Settings(BaseSettings):
     hf_hub_cache: Path = Field(default=Path(".cache/huggingface/hub"))
 
     multi_agentic_rag_home: Path = Field(default=Path(".multi_agentic_rag"))
-    multi_agentic_rag_profile: str = Field(default="local")
-    marag_target_mode: Literal["local", "target-graphrag"] = Field(default="local")
+    multi_agentic_rag_profile: str = Field(default="target")
+    marag_target_mode: Literal["local", "target-graphrag"] = Field(
+        default="target-graphrag"
+    )
+    allow_local_dev_mode: bool = Field(default=False)
 
-    neo4j_uri: str | None = Field(default="bolt://localhost:7687")
+    neo4j_uri: str | None = Field(default=None)
     neo4j_username: str = Field(default="neo4j")
     neo4j_password: str = Field(default="password12345")
     neo4j_database: str | None = Field(default=None)
@@ -42,9 +45,13 @@ class Settings(BaseSettings):
 
     chroma_path: Path = Field(default=Path(".multi_agentic_rag/chroma"))
     sqlite_db_path: Path = Field(default=Path(".multi_agentic_rag/registry.db"))
+    registry_provider: Literal["postgresql", "sqlite"] = Field(default="postgresql")
+    postgres_dsn: str | None = Field(default=None)
     object_store_path: Path = Field(default=Path(".multi_agentic_rag/objects"))
 
-    vector_store_provider: Literal["auto", "weaviate", "chroma"] = Field(default="auto")
+    vector_store_provider: Literal["auto", "weaviate", "chroma"] = Field(
+        default="weaviate"
+    )
     weaviate_url: str | None = Field(default=None)
     weaviate_api_key: str | None = Field(default=None)
     weaviate_collection: str = Field(default="MultiAgenticRagChunk")
@@ -54,12 +61,12 @@ class Settings(BaseSettings):
 
     default_embedding_model: str = Field(default="BAAI/bge-m3")
     default_reranker_model: str = Field(default="BAAI/bge-reranker-v2-m3")
-    embedding_provider: Literal["hash", "huggingface"] = Field(default="hash")
-    reranker_provider: Literal["none", "huggingface"] = Field(default="none")
+    embedding_provider: Literal["hash", "huggingface"] = Field(default="huggingface")
+    reranker_provider: Literal["none", "huggingface"] = Field(default="huggingface")
     hash_embedding_dimensions: int = Field(default=384)
-    graphrag_required: bool = Field(default=False)
+    graphrag_required: bool = Field(default=True)
 
-    llm_provider: Literal["none", "openai", "azure_openai"] = Field(default="none")
+    llm_provider: Literal["none", "openai", "azure_openai"] = Field(default="openai")
     default_llm_model: str = Field(default="gpt-4.1-mini")
     azure_openai_endpoint: str | None = Field(default=None)
     azure_openai_api_key: str | None = Field(default=None)

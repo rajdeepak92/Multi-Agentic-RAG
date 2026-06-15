@@ -18,7 +18,7 @@ from multi_agentic_rag.models import DocumentStatus, TaskResult, TestExecutionRe
 from multi_agentic_rag.retrieval import answer_query
 from multi_agentic_rag.storage.neo4j_store import Neo4jGraphStore
 from multi_agentic_rag.storage.cleanup import clean_system_state
-from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.registry import select_registry
 from multi_agentic_rag.storage.vector_factory import select_vector_store
 from multi_agentic_rag.tasks import handle_task
 from multi_agentic_rag.testing import generate_testcases, get_last_test_result, run_testcases
@@ -45,27 +45,29 @@ console = Console()
 
 @app.command("init")
 def init() -> None:
-    """Create local runtime directories and SQLite registry."""
+    """Create runtime directories and initialize the configured registry."""
 
     settings = get_settings()
     paths = ensure_runtime_dirs(settings)
-    registry = SQLiteRegistry(settings.sqlite_db_path)
-    registry.initialize()
-    console.print("[bold green]Initialized multi-agentic-rag local workspace.[/bold green]")
+    registry_selection = select_registry(settings)
+    registry_selection.registry.initialize()
+    console.print("[bold green]Initialized multi-agentic-rag workspace.[/bold green]")
     console.print(f"Home: {paths['home']}")
     console.print(f"Documents: {paths['documents']}")
     console.print(f"Chroma: {paths['chroma']}")
     console.print(f"Objects: {paths['objects']}")
     console.print(f"Exports: {paths['exports']}")
-    console.print(f"SQLite registry: {paths['registry']}")
+    console.print(f"Registry provider: {registry_selection.provider} ({registry_selection.reason})")
+    if registry_selection.provider == "sqlite":
+        console.print(f"SQLite registry: {paths['registry']}")
     try:
         selection = select_vector_store(settings)
         console.print(f"Vector provider: {selection.provider} ({selection.reason})")
     except Exception as exc:
         console.print(f"[yellow]WARN[/yellow] Vector provider not ready: {exc}")
     console.print("\nNext steps:")
-    console.print("1. Create or edit .env with local settings.")
-    console.print("2. Start Neo4j manually from Neo4j Desktop if graph indexing is needed.")
+    console.print("1. Create or edit .env with target service settings.")
+    console.print("2. Ensure PostgreSQL, Neo4j, Weaviate, OpenAI, and Hugging Face are ready.")
     console.print("3. Run: multi-agentic-rag doctor")
 
 
@@ -93,12 +95,20 @@ def doctor(
 ) -> None:
     """Validate local environment and optional services."""
 
+    settings = get_settings()
+    target_mode = (
+        target_graphrag
+        or settings.marag_target_mode == "target-graphrag"
+        or settings.graphrag_required
+    )
     checks = run_diagnostics(
-        target_graphrag=target_graphrag,
+        settings=settings,
+        target_graphrag=target_mode,
         system_name=system,
         version=version,
     )
     _print_checks(checks)
+    strict = strict or target_mode
     failure_statuses = {"FAIL", "WARN"} if strict else {"FAIL"}
     if any(check.status in failure_statuses for check in checks):
         raise typer.Exit(code=1)
@@ -285,7 +295,7 @@ def delta(
 ) -> None:
     """Show deterministic deltas."""
 
-    registry = SQLiteRegistry(get_settings().sqlite_db_path)
+    registry = select_registry(get_settings()).registry
     registry.initialize()
     records = registry.list_deltas(
         system_name=system,

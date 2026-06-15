@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from multi_agentic_rag.config import Settings
+from multi_agentic_rag.storage.registry import require_local_dev_mode
 from multi_agentic_rag.storage.chroma_store import HashEmbeddingFunction
 from multi_agentic_rag.utils.paths import resolve_path
 
@@ -133,6 +134,7 @@ def select_embedding_function(settings: Settings) -> EmbeddingSelection:
 
     provider = settings.embedding_provider.lower()
     if provider == "hash":
+        require_local_dev_mode(settings, "EMBEDDING_PROVIDER=hash")
         return EmbeddingSelection(
             provider="hash",
             model_name="multi_agentic_rag_hash_embedding",

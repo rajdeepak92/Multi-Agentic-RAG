@@ -13,6 +13,10 @@ def test_disabled_optional_providers_do_not_warn_for_missing_credentials() -> No
         llm_provider="none",
         embedding_provider="hash",
         vector_store_provider="chroma",
+        registry_provider="sqlite",
+        allow_local_dev_mode=True,
+        marag_target_mode="local",
+        graphrag_required=False,
         openai_api_key=None,
         hf_token=None,
         weaviate_url=None,
@@ -24,7 +28,12 @@ def test_disabled_optional_providers_do_not_warn_for_missing_credentials() -> No
 
 
 def test_hash_embedding_provider_is_warned_as_test_only() -> None:
-    settings = Settings(embedding_provider="hash")
+    settings = Settings(
+        embedding_provider="hash",
+        allow_local_dev_mode=True,
+        marag_target_mode="local",
+        graphrag_required=False,
+    )
 
     check = _check_embedding_provider(settings)
 

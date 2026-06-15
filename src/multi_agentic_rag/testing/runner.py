@@ -14,7 +14,7 @@ from time import perf_counter
 from multi_agentic_rag.config import Settings, get_settings
 from multi_agentic_rag.coverage import DEFAULT_SCENARIO_COUNT
 from multi_agentic_rag.models import TestExecutionResult, TestRunResultRecord
-from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.registry import select_registry
 from multi_agentic_rag.testing.generator import (
     DEFAULT_OUTPUT_DIR,
     generate_testcases,
@@ -40,7 +40,7 @@ def run_testcases(
     """Run tracked generated pytest artifacts, creating them first if needed."""
 
     settings = settings or get_settings()
-    registry = SQLiteRegistry(settings.sqlite_db_path)
+    registry = select_registry(settings).registry
     registry.initialize()
     generation = generate_testcases(
         system_name=system_name,
@@ -265,7 +265,7 @@ def get_last_test_result(
     """Return the last stored testcase result without executing anything."""
 
     settings = settings or get_settings()
-    registry = SQLiteRegistry(settings.sqlite_db_path)
+    registry = select_registry(settings).registry
     registry.initialize()
     result = registry.get_latest_test_result(system_name=system_name, version=version)
     if not result:

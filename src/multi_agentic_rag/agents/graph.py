@@ -47,14 +47,42 @@ def compile_graph() -> Any:
     graph.add_edge("version_delta", "route_query")
     graph.add_edge("route_query", "retrieve_context")
     graph.add_edge("retrieve_context", "verify_evidence")
-    graph.add_edge("verify_evidence", "domain_analyzer")
+    graph.add_conditional_edges(
+        "verify_evidence",
+        nodes.route_after_evidence,
+        {
+            "continue": "domain_analyzer",
+            "final_report": "report_generator",
+        },
+    )
     graph.add_edge("domain_analyzer", "dependency_audit")
-    graph.add_edge("dependency_audit", "test_harness")
+    graph.add_conditional_edges(
+        "dependency_audit",
+        nodes.route_after_dependency_audit,
+        {
+            "continue": "test_harness",
+            "blocked": "report_generator",
+        },
+    )
     graph.add_edge("test_harness", "test_writer")
     graph.add_edge("test_writer", "robot_mapping")
     graph.add_edge("robot_mapping", "syntax_validation")
-    graph.add_edge("syntax_validation", "test_execution")
-    graph.add_edge("test_execution", "failure_classifier")
+    graph.add_conditional_edges(
+        "syntax_validation",
+        nodes.route_after_syntax_validation,
+        {
+            "continue": "test_execution",
+            "retry": "test_writer",
+        },
+    )
+    graph.add_conditional_edges(
+        "test_execution",
+        nodes.route_after_execution,
+        {
+            "continue": "failure_classifier",
+            "retry": "test_execution",
+        },
+    )
     graph.add_edge("failure_classifier", "json_sidecar")
     graph.add_edge("json_sidecar", "database_update")
     graph.add_edge("database_update", "report_generator")

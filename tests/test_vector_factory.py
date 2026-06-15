@@ -12,8 +12,14 @@ def test_auto_vector_provider_uses_chroma_without_weaviate_url(tmp_path: Path) -
         multi_agentic_rag_home=tmp_path / ".runtime",
         sqlite_db_path=tmp_path / ".runtime" / "registry.db",
         chroma_path=tmp_path / ".runtime" / "chroma",
+        registry_provider="sqlite",
+        allow_local_dev_mode=True,
+        marag_target_mode="local",
+        graphrag_required=False,
         neo4j_uri=None,
         embedding_provider="hash",
+        reranker_provider="none",
+        llm_provider="none",
         vector_store_provider="auto",
         weaviate_url=None,
     )
@@ -31,8 +37,14 @@ def test_auto_vector_provider_uses_weaviate_when_url_is_configured(tmp_path: Pat
         multi_agentic_rag_home=tmp_path / ".runtime",
         sqlite_db_path=tmp_path / ".runtime" / "registry.db",
         chroma_path=tmp_path / ".runtime" / "chroma",
+        registry_provider="sqlite",
+        allow_local_dev_mode=True,
+        marag_target_mode="local",
+        graphrag_required=False,
         neo4j_uri=None,
         embedding_provider="hash",
+        reranker_provider="none",
+        llm_provider="none",
         vector_store_provider="auto",
         weaviate_url="http://127.0.0.1:8080",
     )
@@ -50,8 +62,14 @@ def test_weaviate_provider_requires_url(tmp_path: Path) -> None:
         multi_agentic_rag_home=tmp_path / ".runtime",
         sqlite_db_path=tmp_path / ".runtime" / "registry.db",
         chroma_path=tmp_path / ".runtime" / "chroma",
+        registry_provider="sqlite",
+        allow_local_dev_mode=True,
+        marag_target_mode="local",
+        graphrag_required=False,
         neo4j_uri=None,
         embedding_provider="hash",
+        reranker_provider="none",
+        llm_provider="none",
         vector_store_provider="weaviate",
         weaviate_url=None,
     )
@@ -62,6 +80,48 @@ def test_weaviate_provider_requires_url(tmp_path: Path) -> None:
         assert "WEAVIATE_URL" in str(exc)
     else:
         raise AssertionError("Expected RuntimeError for missing WEAVIATE_URL")
+
+
+def test_auto_chroma_fallback_is_rejected_when_local_dev_is_disabled(tmp_path: Path) -> None:
+    settings = Settings(
+        multi_agentic_rag_home=tmp_path / ".runtime",
+        sqlite_db_path=tmp_path / ".runtime" / "registry.db",
+        chroma_path=tmp_path / ".runtime" / "chroma",
+        registry_provider="postgresql",
+        postgres_dsn="postgresql://user:pass@host/db",
+        allow_local_dev_mode=False,
+        embedding_provider="huggingface",
+        vector_store_provider="auto",
+        weaviate_url=None,
+    )
+
+    try:
+        select_vector_store(settings)
+    except RuntimeError as exc:
+        assert "ALLOW_LOCAL_DEV_MODE=true" in str(exc)
+    else:
+        raise AssertionError("Expected strict mode to reject Chroma fallback")
+
+
+def test_hash_embeddings_are_rejected_when_local_dev_is_disabled(tmp_path: Path) -> None:
+    settings = Settings(
+        multi_agentic_rag_home=tmp_path / ".runtime",
+        sqlite_db_path=tmp_path / ".runtime" / "registry.db",
+        chroma_path=tmp_path / ".runtime" / "chroma",
+        registry_provider="postgresql",
+        postgres_dsn="postgresql://user:pass@host/db",
+        allow_local_dev_mode=False,
+        embedding_provider="hash",
+        vector_store_provider="weaviate",
+        weaviate_url="https://weaviate.example.com",
+    )
+
+    try:
+        select_vector_store(settings)
+    except RuntimeError as exc:
+        assert "ALLOW_LOCAL_DEV_MODE=true" in str(exc)
+    else:
+        raise AssertionError("Expected strict mode to reject hash embeddings")
 
 
 def test_vector_metadata_records_embedding_provider_and_model(tmp_path: Path) -> None:

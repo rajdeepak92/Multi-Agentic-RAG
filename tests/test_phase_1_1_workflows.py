@@ -136,6 +136,13 @@ def _settings(tmp_path: Path) -> Settings:
         multi_agentic_rag_home=runtime,
         sqlite_db_path=runtime / "registry.db",
         chroma_path=runtime / "chroma",
+        registry_provider="sqlite",
+        allow_local_dev_mode=True,
+        marag_target_mode="local",
+        graphrag_required=False,
         neo4j_uri=None,
+        vector_store_provider="chroma",
         embedding_provider="hash",
+        reranker_provider="none",
+        llm_provider="none",
     )

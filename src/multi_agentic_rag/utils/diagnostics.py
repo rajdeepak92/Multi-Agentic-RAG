@@ -15,7 +15,7 @@ from multi_agentic_rag.retrieval.reranker import BGEReranker, select_reranker
 from multi_agentic_rag.simulators import check_rest_mqtt_simulators
 from multi_agentic_rag.storage.embedding_factory import select_embedding_function
 from multi_agentic_rag.storage.neo4j_store import Neo4jGraphStore
-from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.registry import select_registry
 from multi_agentic_rag.storage.vector_factory import select_vector_store
 from multi_agentic_rag.storage.weaviate_store import WeaviateVectorStore
 from multi_agentic_rag.utils.paths import resolve_path
@@ -46,7 +46,7 @@ def run_diagnostics(
         _check_openai_key(settings),
         _check_embedding_provider(settings),
         _check_hf_token(settings),
-        _check_sqlite(settings),
+        _check_registry(settings),
         _check_keyword_index(settings),
         _check_object_store(settings),
         _check_chroma(settings),
@@ -89,6 +89,8 @@ def _check_openai_key(settings: Settings) -> DiagnosticCheck:
         )
     if settings.openai_api_key:
         return DiagnosticCheck("OPENAI_API_KEY", "PASS", "Configured.")
+    if settings.llm_provider == "openai":
+        return DiagnosticCheck("OPENAI_API_KEY", "WARN", "Missing. Required for OpenAI routing.")
     return DiagnosticCheck(
         "OPENAI_API_KEY",
         "WARN",
@@ -134,25 +136,27 @@ def _check_embedding_provider(settings: Settings) -> DiagnosticCheck:
     )
 
 
-def _check_sqlite(settings: Settings) -> DiagnosticCheck:
+def _check_registry(settings: Settings) -> DiagnosticCheck:
     try:
-        registry = SQLiteRegistry(settings.sqlite_db_path)
-        registry.initialize()
+        selection = select_registry(settings)
+        selection.registry.initialize()
     except Exception as exc:
-        return DiagnosticCheck("SQLite registry", "FAIL", str(exc))
-    return DiagnosticCheck("SQLite registry", "PASS", str(resolve_path(settings.sqlite_db_path)))
+        return DiagnosticCheck("Registry", "FAIL", str(exc))
+    if selection.provider == "sqlite":
+        return DiagnosticCheck("Registry", "PASS", str(resolve_path(settings.sqlite_db_path)))
+    return DiagnosticCheck("Registry", "PASS", "PostgreSQL registry initialized.")
 
 
 def _check_keyword_index(settings: Settings) -> DiagnosticCheck:
     if not settings.keyword_index_enabled:
-        return DiagnosticCheck("SQLite FTS5 keyword index", "WARN", "Disabled by settings.")
+        return DiagnosticCheck("Keyword index", "WARN", "Disabled by settings.")
     try:
-        registry = SQLiteRegistry(settings.sqlite_db_path)
+        registry = select_registry(settings).registry
         registry.initialize()
         registry.search_chunks("doctor", top_k=1)
     except Exception as exc:
-        return DiagnosticCheck("SQLite FTS5 keyword index", "WARN", str(exc))
-    return DiagnosticCheck("SQLite FTS5 keyword index", "PASS", "Ready.")
+        return DiagnosticCheck("Keyword index", "WARN", str(exc))
+    return DiagnosticCheck("Keyword index", "PASS", "Ready.")
 
 
 def _check_object_store(settings: Settings) -> DiagnosticCheck:
@@ -165,6 +169,8 @@ def _check_object_store(settings: Settings) -> DiagnosticCheck:
 
 
 def _check_chroma(settings: Settings) -> DiagnosticCheck:
+    if settings.vector_store_provider == "weaviate" and not settings.allow_local_dev_mode:
+        return DiagnosticCheck("ChromaDB", "PASS", "Weaviate selected; Chroma is not required.")
     try:
         path = resolve_path(settings.chroma_path)
         path.mkdir(parents=True, exist_ok=True)
@@ -178,13 +184,20 @@ def _check_chroma(settings: Settings) -> DiagnosticCheck:
 
 def _check_weaviate(settings: Settings) -> DiagnosticCheck:
     if settings.vector_store_provider == "chroma":
+        if not settings.allow_local_dev_mode:
+            return DiagnosticCheck(
+                "Weaviate",
+                "FAIL",
+                "VECTOR_STORE_PROVIDER=chroma requires ALLOW_LOCAL_DEV_MODE=true.",
+            )
         return DiagnosticCheck(
             "Weaviate",
             "PASS",
             "Chroma provider selected; Weaviate is not required.",
         )
     if not settings.weaviate_url:
-        return DiagnosticCheck("Weaviate", "PASS", "WEAVIATE_URL not set; Chroma fallback is used.")
+        status = "WARN" if settings.allow_local_dev_mode else "FAIL"
+        return DiagnosticCheck("Weaviate", status, "WEAVIATE_URL is required for strict mode.")
     store = WeaviateVectorStore(
         url=settings.weaviate_url,
         api_key=settings.weaviate_api_key,
@@ -226,6 +239,12 @@ def _check_pdf_parsers(settings: Settings) -> DiagnosticCheck:
 
 
 def _check_neo4j_desktop_config(settings: Settings) -> DiagnosticCheck:
+    if not settings.allow_local_dev_mode and not _neo4j_uri_is_local(settings.neo4j_uri):
+        return DiagnosticCheck(
+            "Neo4j Desktop config",
+            "PASS",
+            "Managed/remote Neo4j expected; Desktop config is not required.",
+        )
     missing = []
     for name, path in (
         ("NEO4J_DBMS_HOME", settings.neo4j_dbms_home),
@@ -245,6 +264,12 @@ def _check_neo4j_desktop_config(settings: Settings) -> DiagnosticCheck:
 
 
 def _check_neo4j_ports(settings: Settings) -> DiagnosticCheck:
+    if not _neo4j_uri_is_local(settings.neo4j_uri):
+        return DiagnosticCheck(
+            "Neo4j ports",
+            "PASS",
+            "Managed/remote Neo4j URI; local port probe skipped.",
+        )
     checks = (
         ("Bolt", settings.neo4j_bolt_port),
         ("Browser", settings.neo4j_browser_port),
@@ -287,6 +312,13 @@ def _tcp_port_open(host: str, port: int) -> bool:
         return False
 
 
+def _neo4j_uri_is_local(uri: str | None) -> bool:
+    if not uri:
+        return True
+    normalized = uri.lower()
+    return any(host in normalized for host in ("localhost", "127.0.0.1", "0.0.0.0"))
+
+
 def _check_fastapi_app_import() -> DiagnosticCheck:
     try:
         importlib.import_module("multi_agentic_rag.api.main")
@@ -306,6 +338,16 @@ def _target_graphrag_checks(
             "Target mode",
             settings.marag_target_mode == "target-graphrag" or settings.graphrag_required,
             "Set MARAG_TARGET_MODE=target-graphrag or GRAPHRAG_REQUIRED=true.",
+        ),
+        _require_target_setting(
+            "Target registry",
+            settings.registry_provider == "postgresql" and bool(settings.postgres_dsn),
+            "Target mode requires REGISTRY_PROVIDER=postgresql and POSTGRES_DSN.",
+        ),
+        _require_target_setting(
+            "Target vector store",
+            settings.vector_store_provider == "weaviate" and bool(settings.weaviate_url),
+            "Target mode requires VECTOR_STORE_PROVIDER=weaviate and WEAVIATE_URL.",
         ),
         _require_target_setting(
             "Target embeddings",

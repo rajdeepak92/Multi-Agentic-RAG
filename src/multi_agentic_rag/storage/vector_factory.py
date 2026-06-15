@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from multi_agentic_rag.config import Settings
 from multi_agentic_rag.storage.chroma_store import ChromaVectorStore
 from multi_agentic_rag.storage.embedding_factory import select_embedding_function
+from multi_agentic_rag.storage.registry import require_local_dev_mode
 from multi_agentic_rag.storage.vector_store import VectorStore
 from multi_agentic_rag.storage.weaviate_store import WeaviateVectorStore
 
@@ -21,7 +22,7 @@ class VectorStoreSelection:
 
 
 def select_vector_store(settings: Settings) -> VectorStoreSelection:
-    """Select Weaviate when configured, otherwise fall back to local Chroma."""
+    """Select the configured vector store with strict local fallback guards."""
 
     provider = settings.vector_store_provider.lower()
     if provider not in {"auto", "weaviate", "chroma"}:
@@ -43,6 +44,7 @@ def select_vector_store(settings: Settings) -> VectorStoreSelection:
         )
     if provider == "weaviate":
         raise RuntimeError("VECTOR_STORE_PROVIDER=weaviate requires WEAVIATE_URL.")
+    require_local_dev_mode(settings, "VECTOR_STORE_PROVIDER=chroma or auto Chroma fallback")
     return VectorStoreSelection(
         provider="chroma",
         store=ChromaVectorStore(

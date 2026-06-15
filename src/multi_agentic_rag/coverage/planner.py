@@ -14,7 +14,7 @@ from multi_agentic_rag.models import (
     FactRecord,
 )
 from multi_agentic_rag.retrieval.graph_retriever import GraphRetriever
-from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.registry import Registry, select_registry
 from multi_agentic_rag.utils.hashing import stable_id
 
 DEFAULT_SCENARIO_COUNT = 25
@@ -39,7 +39,7 @@ def plan_requirement_coverage(
     """Create or reuse a requirement-linked coverage plan."""
 
     settings = settings or get_settings()
-    registry = SQLiteRegistry(settings.sqlite_db_path)
+    registry = select_registry(settings).registry
     registry.initialize()
     documents = _scope_documents(registry, system_name=system_name, version=version)
     if not documents:
@@ -136,7 +136,7 @@ def plan_requirement_coverage(
 
 
 def _scope_documents(
-    registry: SQLiteRegistry,
+    registry: Registry,
     *,
     system_name: str,
     version: str | None,
@@ -151,7 +151,7 @@ def _scope_documents(
 
 
 def _scope_requirement_facts(
-    registry: SQLiteRegistry,
+    registry: Registry,
     *,
     system_name: str,
     version: str | None,
@@ -238,7 +238,7 @@ def _build_coverage_records(
 
 def _version_impact_by_key(
     *,
-    registry: SQLiteRegistry,
+    registry: Registry,
     system_name: str,
     version: str | None,
 ) -> dict[str, str]:
@@ -258,7 +258,7 @@ def _version_impact_by_key(
 
 def _previous_coverage_by_semantic_key(
     *,
-    registry: SQLiteRegistry,
+    registry: Registry,
     version: str | None,
 ) -> dict[str, CoverageRecord]:
     previous: dict[str, CoverageRecord] = {}

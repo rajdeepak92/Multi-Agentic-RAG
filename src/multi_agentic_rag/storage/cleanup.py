@@ -10,7 +10,7 @@ from typing import Any
 
 from multi_agentic_rag.config import Settings, get_settings
 from multi_agentic_rag.storage.neo4j_store import Neo4jGraphStore
-from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.registry import select_registry
 from multi_agentic_rag.storage.vector_factory import select_vector_store
 from multi_agentic_rag.testing.generator import DEFAULT_OUTPUT_DIR, _safe_slug
 from multi_agentic_rag.utils.paths import ensure_runtime_dirs, resolve_path
@@ -39,8 +39,13 @@ def clean_system_state(
     """Remove one system from local runtime stores without touching other systems."""
 
     settings = settings or get_settings()
-    registry = SQLiteRegistry(settings.sqlite_db_path)
-    registry.initialize()
+    registry_selection = select_registry(settings)
+    if registry_selection.provider != "sqlite":
+        raise RuntimeError(
+            "clean-system-state deletes local runtime files and currently supports only "
+            "REGISTRY_PROVIDER=sqlite with ALLOW_LOCAL_DEV_MODE=true."
+        )
+    registry_selection.registry.initialize()
     runtime_paths = ensure_runtime_dirs(settings)
     sqlite_deleted, managed_files = _delete_sqlite_system(settings, system_name)
 

@@ -1,468 +1,404 @@
-# multi-agentic-rag
+# Agentic GraphRAG QA
 
-`multi-agentic-rag` is an Agentic AI-enabled QA automation framework powered by
-Knowledge Graph + GraphRAG + Multi-Agent orchestration.
+## Description
 
-It is local-first today. It ingests BRD/SRS/design files, preserves evidence by
-document version, retrieves through graph/vector/keyword stores, and currently
-generates dependency-aware pytest testcases from requirement evidence.
-GraphRAG is the intelligence layer for evidence, lineage, and relationship
-reasoning; generated QA automation assets, reports, traceability, and
-evidence-grounded answers are the framework outputs.
+Agentic GraphRAG QA is a document-grounded QA automation framework for versioned engineering documents such as BRDs, SRS files, protocol specs, and test documentation. It ingests source documents, extracts traceable facts, stores metadata in PostgreSQL, indexes evidence in Weaviate, builds a Neo4j knowledge graph, plans coverage, generates pytest automation artifacts, runs them, and records results back into durable metadata and graph state.
 
-The project is built around these rules:
+The repository is strict by default. Current default settings target PostgreSQL, managed or remote Neo4j, Weaviate, BGE embeddings and reranking, and OpenAI-ready routing/synthesis. Local SQLite, Chroma, localhost Neo4j, and hash embeddings remain available only for tests and offline development when `ALLOW_LOCAL_DEV_MODE=true`.
 
-```text
-No evidence -> no answer.
-No version -> no truth.
-No delta -> no impact claim.
-No requirement link -> no coverage claim.
+Current capabilities are implemented in code. Strict-default capabilities require the configured external services to be live. Future additions are listed separately and are not implied to be complete.
+
+## Flow Diagram
+
+```mermaid
+flowchart TD
+    A[Versioned BRD / SRS / test docs] --> B[Document ingestion]
+    B --> C[Chunking and fact extraction]
+    C --> D[(PostgreSQL metadata registry)]
+    C --> E[(Weaviate vector index)]
+    C --> F[(Neo4j knowledge graph)]
+    D --> G[GraphRAG retrieval]
+    E --> G
+    F --> G
+    G --> H[LangGraph QA agents]
+    H --> I[Coverage planning]
+    I --> J[Generated pytest and Robot wrapper artifacts]
+    J --> K[Pytest execution]
+    K --> L[Coverage and result feedback]
+    L --> D
+    L --> F
+    G --> M[Document-scoped chat]
 ```
 
-Docker is not part of the local workflow. The current runtime uses Python,
-SQLite, a filesystem object store, SQLite FTS5/BM25, ChromaDB fallback vectors,
-optional Weaviate, and optional Neo4j Desktop.
+The same evidence layer supports chat, delta analysis, coverage planning, testcase generation, and result feedback. In strict mode, missing graph evidence blocks GraphRAG workflows instead of silently falling back to local-only behavior.
 
-## Current Behavior
-
-Built today:
-
-- Document ingestion from PDF/DOCX into chunks, facts, SQLite, BM25, object
-  artifacts, vectors, and optional Neo4j.
-- Version lifecycle where newer documents supersede older active documents
-  without deleting old evidence.
-- Evidence-based query, delta, and coverage commands.
-- Graph-backed coverage planning that uses Neo4j requirement facts when
-  available, falls back to SQLite evidence in local mode, and stores a reusable
-  `coverage_run`.
-- Dependency-aware pytest automation generation under `generated/<system>/<brd_version>/`.
-- Sidecar testcase JSON that tracks scenarios, source chunks, expected values,
-  dependency audit, workflow handoff, retry policy, and run history.
-- Robot Framework wrapper generation beside every generated pytest file.
-- Test execution through pytest with generated `pytest.ini`, `conftest.py`,
-  fixtures, markers, hooks, logging, syntax validation, JUnit XML reports, and
-  stored results.
-- Explicit `--mock` execution mode for generated mock-device flows when no real
-  device, simulator, or protocol endpoint is configured.
-- CLI and FastAPI routes for ingestion, query, coverage, task routing, test
-  generation, test execution, and last-result lookup.
-
-Not built yet:
-
-- Production UI/auth.
-- Full MCP server.
-- PostgreSQL/OpenSearch/MinIO production backends.
-- Real device/protocol interface automation.
-- Fully compiled LangGraph subgraphs for every agent handoff.
-- Mandatory LLM-backed operation. OpenAI/Azure routing, fallback extraction, and
-  answer synthesis are optional and gated by configuration.
-
-## Strategic Roadmap
-
-See these planning artifacts for the forward-looking roadmap:
-
-- `UPDATED_GOAL.md`: updated project definition and supported task types.
-- `STRATEGIC_UPDATE_PLAN.md`: gap analysis, conflicts, roadmap, risks, and
-  acceptance criteria.
-- `TARGET_ARCHITECTURE.md`: target framework identity and layer architecture.
-- `VERSION_AWARE_TEST_STRATEGY.md`: active/superseded lifecycle, deltas, reuse,
-  and selective execution.
-- `TEST_AUTOMATION_STRATEGY.md`: pytest, sidecar, reports, Robot mapping, and
-  adapter strategy.
-- `LANGGRAPH_ORCHESTRATION_PLAN.md`: target agent nodes and final validation.
-- `DOMAIN_PLUGIN_STRATEGY.md`: domain packs and protocol adapter roadmap.
-- `EXECUTION_FLOW.md`: document-to-test execution lifecycle and failure model.
-- `TEST_GENERATION_STRATEGY.md`: generated pytest strategy, sidecar schema, and
-  future Robot Framework mapping.
-- `ARCHITECTURE_TARGET.mermaid`: target architecture diagram.
-- `feasibility.md`: corrected Option-4 feasibility view.
-
-This README describes what is built and runnable today.
-
-## Clean Windows Setup
-
-Install these on a clean Windows machine:
-
-- Python 3.12 or newer.
-- `uv`.
-- PowerShell.
-- Neo4j Desktop, optional but recommended for graph-check and graph retrieval.
-- Tesseract OCR, optional and only needed for scanned PDFs.
-- OpenAI/Azure OpenAI/HuggingFace tokens, optional for later LLM or HF-backed
-  model usage. Deterministic tests and offline smoke checks can run with local
-  hash embeddings.
-
-From PowerShell:
+## Clone
 
 ```powershell
-cd "D:\Multi-Agentic-RAG"
-python --version
-uv --version
-uv venv .venv --prompt Multi-Agentic-RAG
-.\.venv\Scripts\Activate.ps1
+git clone <repo-url>
+cd Multi-Agentic-RAG
+```
+
+Use Windows PowerShell or another shell with Python 3.12 and `uv` available.
+
+## Environment Dependencies
+
+Required for strict target runtime:
+
+- Python 3.12+
+- `uv`
+- PostgreSQL reachable from `POSTGRES_DSN`
+- Neo4j reachable from `NEO4J_URI`
+- Weaviate reachable from `WEAVIATE_URL`
+- Hugging Face model access for `BAAI/bge-m3` and `BAAI/bge-reranker-v2-m3`
+- OpenAI API access when `LLM_PROVIDER=openai`
+
+Required Python dependencies are declared in `pyproject.toml` and locked through `uv.lock`. Managed service credentials must be supplied through `.env`; do not commit secrets.
+
+## Setup
+
+1. Create the virtual environment and install dependencies.
+
+```powershell
 uv sync --locked
-copy .env.example .env
-notepad .env
 ```
 
-If you intentionally changed `pyproject.toml`, run `uv sync` so `uv.lock` is
-updated. For normal fresh-clone setup, prefer `uv sync --locked` so dependency
-resolution matches the committed lock file.
-
-This project does not require `requirements.txt`. Dependencies are declared in
-`pyproject.toml` and locked in `uv.lock`. Do not create a separate
-`requirements.txt` unless you are exporting one for another tool.
-
-Initialize and validate:
+2. Create `.env` from the template.
 
 ```powershell
-uv run multi-agentic-rag init
-uv run multi-agentic-rag doctor
-uv run pytest -c pyproject.toml tests
+Copy-Item .env.example .env
 ```
 
-Run commands from the repository root, not from `C:\Users\<you>`.
+3. Fill strict runtime settings in `.env`.
 
-## Required Folder Structure
-
-Create the source inbox before ingestion:
-
-```text
-D:\Multi-Agentic-RAG\
-|-- documents\
-|   `-- inbox\
-|       `-- PROJECT_1\
-|           |-- SIIMCS_BRD_V1.pdf
-|           `-- SIIMCS_BRD_V2.pdf
-|-- neo4j\
-|   |-- dumps\        # optional local Neo4j dumps, ignored
-|   `-- import\       # optional local Neo4j import files, ignored
-|-- .env
-|-- .env.example
-|-- pyproject.toml
-|-- uv.lock
-|-- src\
-`-- tests\
-```
-
-MARAG creates these runtime folders as needed:
-
-```text
-.multi_agentic_rag/
-  documents/       # managed source copies
-  objects/         # parsed JSONL artifacts
-  chroma/          # Chroma fallback vectors
-  exports/
-  registry.db      # SQLite metadata, FTS5, coverage, and test result records
-
-generated/
-  project_1/
-    brd_v1/
-      test_project_1_brd_v1.py
-      test_project_1_brd_v1.robot
-      test_project_1_brd_v1.json
-      reports/
-        coverage.json
-      conftest.py
-      pytest.ini
-```
-
-Do not manually edit `.multi_agentic_rag` unless debugging runtime state.
-
-## Environment Values
-
-`.env` is local and ignored by git. Start from `.env.example`, then set values
-for your machine.
-
-Minimum local values:
-
-```env
-MULTI_AGENTIC_RAG_HOME=.multi_agentic_rag
-MULTI_AGENTIC_RAG_PROFILE=local
-MARAG_TARGET_MODE=local
-SQLITE_DB_PATH=.multi_agentic_rag/registry.db
-OBJECT_STORE_PATH=.multi_agentic_rag/objects
-
-VECTOR_STORE_PROVIDER=auto
-WEAVIATE_URL=
-WEAVIATE_API_KEY=
-WEAVIATE_COLLECTION=MultiAgenticRagChunk
-WEAVIATE_HYBRID_ALPHA=0.65
-CHROMA_PATH=.multi_agentic_rag/chroma
-KEYWORD_INDEX_ENABLED=true
-
-EMBEDDING_PROVIDER=hash
-DEFAULT_EMBEDDING_MODEL=BAAI/bge-m3
-RERANKER_PROVIDER=none
-DEFAULT_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
-HASH_EMBEDDING_DIMENSIONS=384
-HF_TOKEN=
-HF_HOME=.cache/huggingface
-HF_HUB_CACHE=.cache/huggingface/hub
-
-GRAPHRAG_REQUIRED=false
-
-LLM_PROVIDER=none
-DEFAULT_LLM_MODEL=gpt-4.1-mini
-OPENAI_API_KEY=
-AZURE_OPENAI_ENDPOINT=
-AZURE_OPENAI_API_KEY=
-AZURE_OPENAI_DEPLOYMENT=
-AZURE_OPENAI_API_VERSION=2025-04-01-preview
-
-GENERATED_TEST_EXECUTION_MODE=auto
-SIMULATOR_CONFIG_PATH=
-REST_SIMULATOR_ENABLED=false
-MQTT_SIMULATOR_ENABLED=false
-MODBUS_HOST=
-MQTT_BROKER_URL=
-CAN_INTERFACE=
-REST_API_BASE_URL=
-ROBOT_GENERATION_ENABLED=false
-
-ENABLE_PDF_OCR=false
-TESSERACT_CMD=
-
-API_HOST=127.0.0.1
-API_PORT=8000
-MCP_ENABLED=false
-MCP_TRANSPORT=stdio
-```
-
-Local-first mode intentionally uses hash embeddings, SQLite, Chroma, and
-deterministic routing/extraction so a developer can run without external model
-or graph services.
-
-Use target GraphRAG mode only for stricter Option-4 validation:
-
-```env
-MARAG_TARGET_MODE=target-graphrag
-GRAPHRAG_REQUIRED=true
+```dotenv
+REGISTRY_PROVIDER=postgresql
+POSTGRES_DSN=postgresql+psycopg://marag_user:change-me@postgres.example.com:5432/marag
+NEO4J_URI=neo4j+s://neo4j.example.com
+WEAVIATE_URL=https://weaviate.example.com
 EMBEDDING_PROVIDER=huggingface
 RERANKER_PROVIDER=huggingface
 LLM_PROVIDER=openai
-REST_SIMULATOR_ENABLED=true
-MQTT_SIMULATOR_ENABLED=true
+OPENAI_API_KEY=sk-change-me
+ALLOW_LOCAL_DEV_MODE=false
 ```
 
-Then validate:
+4. Validate strict readiness.
 
 ```powershell
-uv run multi-agentic-rag doctor --target-graphrag --system PROJECT_1 --version v1
+uv run multi-agentic-rag doctor --system PROJECT_1 --version v1
 ```
 
-## Neo4j Desktop Setup
+If external services are not configured, this command fails by design. For local tests and offline development only, enable the local override block in `.env`:
 
-Neo4j is optional for local testcase generation, but when it is reachable the
-coverage planner uses Neo4j requirement facts as the scenario-selection
-backbone. Neo4j is required for graph-check, graph retrieval, and target
-GraphRAG mode.
-
-1. Install Neo4j Desktop.
-2. Create a local DBMS.
-3. Set and remember the DBMS password.
-4. Start the DBMS.
-5. Confirm Browser runs on `http://127.0.0.1:7474` and Bolt on
-   `bolt://127.0.0.1:7687`.
-6. Put the matching values in `.env`:
-
-```env
+```dotenv
+MARAG_TARGET_MODE=local
+ALLOW_LOCAL_DEV_MODE=true
+GRAPHRAG_REQUIRED=false
+REGISTRY_PROVIDER=sqlite
+VECTOR_STORE_PROVIDER=chroma
+EMBEDDING_PROVIDER=hash
+RERANKER_PROVIDER=none
+LLM_PROVIDER=none
 NEO4J_URI=bolt://127.0.0.1:7687
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=<your_neo4j_password>
-NEO4J_DATABASE=neo4j
-NEO4J_HOST=127.0.0.1
-NEO4J_BOLT_PORT=7687
-NEO4J_BROWSER_PORT=7474
+WEAVIATE_URL=
+OPENAI_API_KEY=
 ```
 
-Optional helper-script values:
+## Additional Tools
 
-```env
-NEO4J_DESKTOP_EXE=
-NEO4J_DESKTOP_DATA_PATH=
-NEO4J_DBMS_HOME=
-NEO4J_JAVA_HOME=
-NEO4J_DUMPS_DIR=neo4j/dumps
-NEO4J_IMPORT_DIR=neo4j/import
-```
+- `uv run pytest -q` runs the repository test suite.
+- `uv run multi-agentic-rag --help` shows CLI commands.
+- `uv run multi-agentic-rag api` starts the FastAPI service.
+- `uv run multi-agentic-rag mcp-info` prints the current MCP placeholder boundary.
+- PyMuPDF, pdfplumber, and python-docx handle document parsing.
+- Tesseract OCR is optional and used only when `ENABLE_PDF_OCR=true`.
+- Neo4j Desktop helper scripts are local-dev conveniences, not strict target requirements.
 
-After Neo4j is running:
+## Use Cases
+
+- Ingest BRD/SRS versions and ask only evidence-backed questions.
+- Detect V1 to V2 fact deltas and link impact back to requirements.
+- Generate requirement coverage scenarios from document evidence.
+- Generate pytest automation artifacts with JSON sidecars and Robot wrapper files.
+- Execute generated pytest files, record pass/fail/blocked/skipped results, and link them back to coverage.
+- Reuse unchanged V1-linked coverage when V2 does not change the underlying requirement evidence.
+
+## Benefits
+
+- Evidence-gated answers: no evidence means no supported answer.
+- Version-aware truth: active and superseded documents are kept separate.
+- Graph-backed planning: strict target mode requires Neo4j evidence for GraphRAG workflows.
+- Deterministic local testing: offline tests can still use SQLite, Chroma, and hash embeddings with an explicit flag.
+- Traceable automation: generated tests carry document, chunk, fact, coverage, run, and result identifiers.
+- Dependency-aware execution: missing real devices, simulators, or protocol endpoints are marked blocked/skipped rather than faked as passing.
+
+## Feasibility Matrix
+
+<table>
+  <thead>
+    <tr>
+      <th>Capability</th>
+      <th>Tool/tech</th>
+      <th>Current status</th>
+      <th>Strict default</th>
+      <th>Why chosen this tool/tech</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><th colspan="5">Runtime And Interfaces</th></tr>
+    <tr>
+      <td>CLI workflows</td>
+      <td>Typer and Rich</td>
+      <td>Implemented</td>
+      <td>Enabled</td>
+      <td>Provides typed commands and readable terminal output for operator runbooks.</td>
+    </tr>
+    <tr>
+      <td>HTTP service</td>
+      <td>FastAPI</td>
+      <td>Implemented</td>
+      <td>Enabled when started</td>
+      <td>Exposes the same service functions behind a lightweight API boundary.</td>
+    </tr>
+    <tr>
+      <td>Agent orchestration</td>
+      <td>LangGraph with Python node services</td>
+      <td>Implemented with conditional gates</td>
+      <td>Enabled</td>
+      <td>Keeps routing, evidence checks, generation, execution, and reporting as inspectable nodes.</td>
+    </tr>
+    <tr><th colspan="5">Storage And Retrieval</th></tr>
+    <tr>
+      <td>Metadata registry</td>
+      <td>PostgreSQL through psycopg</td>
+      <td>Implemented</td>
+      <td>Required</td>
+      <td>Provides durable relational state for documents, facts, deltas, coverage, generated files, and results.</td>
+    </tr>
+    <tr>
+      <td>Local registry</td>
+      <td>SQLite</td>
+      <td>Implemented</td>
+      <td>Blocked unless local-dev mode is enabled</td>
+      <td>Supports deterministic offline tests without requiring managed infrastructure.</td>
+    </tr>
+    <tr>
+      <td>Vector retrieval</td>
+      <td>Weaviate</td>
+      <td>Implemented</td>
+      <td>Required</td>
+      <td>Combines vector and BM25-style retrieval behind an external scalable vector service.</td>
+    </tr>
+    <tr>
+      <td>Local vector fallback</td>
+      <td>ChromaDB</td>
+      <td>Implemented</td>
+      <td>Blocked unless local-dev mode is enabled</td>
+      <td>Supports repeatable developer tests and demos without a vector service.</td>
+    </tr>
+    <tr>
+      <td>Knowledge graph</td>
+      <td>Neo4j</td>
+      <td>Implemented</td>
+      <td>Required for GraphRAG</td>
+      <td>Stores document lineage, facts, requirement links, generated tests, coverage, and run results as graph context.</td>
+    </tr>
+    <tr><th colspan="5">AI And Ranking</th></tr>
+    <tr>
+      <td>Embeddings</td>
+      <td>BAAI/bge-m3 via sentence-transformers</td>
+      <td>Implemented</td>
+      <td>Required</td>
+      <td>Provides strong multilingual/general retrieval embeddings without changing vector-store contracts.</td>
+    </tr>
+    <tr>
+      <td>Reranking</td>
+      <td>BAAI/bge-reranker-v2-m3</td>
+      <td>Implemented</td>
+      <td>Required</td>
+      <td>Improves evidence ordering before extractive or LLM-assisted answers are produced.</td>
+    </tr>
+    <tr>
+      <td>Structured LLM routing and synthesis</td>
+      <td>OpenAI Responses API</td>
+      <td>Implemented as optional runtime path</td>
+      <td>Configured by default</td>
+      <td>Provides structured decisions while preserving deterministic fallbacks and evidence validation.</td>
+    </tr>
+    <tr>
+      <td>Offline embeddings</td>
+      <td>Deterministic hash embeddings</td>
+      <td>Implemented</td>
+      <td>Blocked unless local-dev mode is enabled</td>
+      <td>Keeps tests fast, deterministic, and independent of model downloads.</td>
+    </tr>
+    <tr><th colspan="5">Document Understanding</th></tr>
+    <tr>
+      <td>PDF parsing</td>
+      <td>PyMuPDF and pdfplumber</td>
+      <td>Implemented</td>
+      <td>Enabled</td>
+      <td>Handles common engineering PDF text extraction paths with fallback parser coverage.</td>
+    </tr>
+    <tr>
+      <td>DOCX parsing</td>
+      <td>python-docx</td>
+      <td>Implemented</td>
+      <td>Enabled</td>
+      <td>Supports business and requirements documents distributed as Word files.</td>
+    </tr>
+    <tr>
+      <td>Fact extraction</td>
+      <td>Rule extractors plus optional LLM fallback</td>
+      <td>Implemented</td>
+      <td>Rule extraction always available; LLM requires provider readiness</td>
+      <td>Preserves deterministic facts first and uses LLM extraction only when evidence remains source-grounded.</td>
+    </tr>
+    <tr><th colspan="5">QA Automation</th></tr>
+    <tr>
+      <td>Coverage planning</td>
+      <td>Graph-backed scenario selection with registry fallback only in local mode</td>
+      <td>Implemented</td>
+      <td>Graph evidence required</td>
+      <td>Ensures scenarios are tied to requirement evidence and graph lineage in target runs.</td>
+    </tr>
+    <tr>
+      <td>Generated tests</td>
+      <td>pytest files, JSON sidecars, harness files</td>
+      <td>Implemented</td>
+      <td>Enabled</td>
+      <td>Creates executable Python artifacts that preserve traceability and dependency status.</td>
+    </tr>
+    <tr>
+      <td>Robot wrapper</td>
+      <td>Generated Robot Framework file</td>
+      <td>Generated wrapper only</td>
+      <td>Generated when test artifacts are written</td>
+      <td>Provides a future integration surface while pytest remains the current execution engine.</td>
+    </tr>
+    <tr>
+      <td>Execution tracking</td>
+      <td>pytest, JUnit XML, registry rows, graph links</td>
+      <td>Implemented</td>
+      <td>Enabled</td>
+      <td>Captures pass/fail/skipped/blocked results and links them to generated tests and coverage.</td>
+    </tr>
+    <tr><th colspan="5">Operations And Safety</th></tr>
+    <tr>
+      <td>Readiness checks</td>
+      <td><code>multi-agentic-rag doctor</code></td>
+      <td>Implemented</td>
+      <td>Strict automatically in target mode</td>
+      <td>Surfaces missing providers and graph readiness before ingestion or generation.</td>
+    </tr>
+    <tr>
+      <td>Local cleanup</td>
+      <td><code>clean-system-state</code></td>
+      <td>Implemented for SQLite/Chroma/local files</td>
+      <td>Blocked in PostgreSQL target mode</td>
+      <td>Prevents accidental managed-state deletion while preserving a local reset path.</td>
+    </tr>
+    <tr>
+      <td>Object artifacts</td>
+      <td>Local filesystem</td>
+      <td>Implemented</td>
+      <td>Enabled for this pass</td>
+      <td>Stores parsed chunks and copied source artifacts simply while managed object storage remains future work.</td>
+    </tr>
+  </tbody>
+</table>
+
+## Future Additions
+
+- Managed object storage for parsed artifacts and generated reports.
+- Real Robot Framework execution, not only generated wrapper files.
+- Domain plugin packs for richer extractors, simulators, protocol adapters, and validation keywords.
+- Human review UI for coverage scenarios, evidence, and generated testcase approval.
+- CI/CD integration for strict service readiness and scheduled regression execution.
+- Richer graph analytics for impact propagation and requirement risk scoring.
+
+## Execution Flows
+
+### 1. Ingest facts and answer from evidence
 
 ```powershell
-uv run multi-agentic-rag graph-check
+uv run multi-agentic-rag doctor --system PROJECT_1 --version v1
+uv run multi-agentic-rag ingest documents/inbox/PROJECT_1/SIIMCS_BRD_V1.pdf --system PROJECT_1 --version v1
+uv run multi-agentic-rag query "What is the current temperature threshold?" --system PROJECT_1 --version v1
 ```
 
-## Gitignore Contract
+`query` requires `--system`. Framework, setup, and out-of-scope questions are rejected by document-scoped chat.
 
-The repo ignores local-only artifacts:
-
-- `.env` for secrets and machine-specific paths.
-- `.venv/` for the local Python environment.
-- `.multi_agentic_rag/` for SQLite, parsed objects, managed document copies,
-  Chroma vectors, and exports.
-- `.cache/` for local model/package caches.
-- `generated/` for MARAG generated pytest and JSON testcase artifacts.
-- `tests/generated/` for the older generated-test location.
-- `neo4j/runtime/`, `neo4j/dumps/`, `neo4j/import/`, and
-  `neo4j-desktop-data/` for local Neo4j data.
-- Python build/test caches and ad hoc local `*.db`, `*.sqlite`, and `*.log`
-  files.
-
-The `documents/inbox/PROJECT_1/` folder is not ignored by default because this
-repo currently uses dummy BRD files as reproducible local inputs.
-
-## Happy Path
-
-Use the exact flow below for the current PROJECT_1 BRD example:
+### 2. Generate and execute tests
 
 ```powershell
-uv sync --locked
-uv run multi-agentic-rag ingest-folder "documents\inbox\PROJECT_1" --system PROJECT_1 --version v1
-uv run multi-agentic-rag coverage-plan --system PROJECT_1 --version v1 --count 10
-uv run multi-agentic-rag generate-tests --system PROJECT_1 --version v1 --count 10
-uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v1 --count 10
-uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v1 --count 5
-uv run multi-agentic-rag generate-tests --system PROJECT_1 --version v1 --count 10 --mock
-uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v1 --count 10 --mock
+uv run multi-agentic-rag coverage-plan --system PROJECT_1 --version v1 --count 25
+uv run multi-agentic-rag generate-tests --system PROJECT_1 --version v1 --count 25
+uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v1 --count 25
+uv run multi-agentic-rag last-results --system PROJECT_1 --version v1
 ```
 
-Expected shape after ingestion:
+Generated tests are dependency-aware. Missing devices, simulators, brokers, or endpoints are reported as blocked/skipped, not as fake passes.
 
-```text
-Folder Ingestion
-File              Status  Chunks  Facts
-SIIMCS_BRD_V1.pdf active  14      77
-SIIMCS_BRD_V2.pdf active  20      104
-```
-
-Expected generated artifact path:
-
-```text
-generated\project_1\brd_v1\test_project_1_brd_v1.py
-generated\project_1\brd_v1\test_project_1_brd_v1.json
-generated\project_1\brd_v1\conftest.py
-generated\project_1\brd_v1\pytest.ini
-```
-
-Expected testcase result shape depends on dependency readiness. With missing
-protocol/simulator configuration, protocol scenarios are blocked/skipped:
-
-```text
-executed: Test run blocked: 0 passed, 0 failed, 10 skipped.
-```
-
-With explicit mock execution mode and evidence-derived checks, generated tests
-can pass deterministically:
-
-```env
-GENERATED_TEST_EXECUTION_MODE=mock
-```
-
-The tests use evidence-derived `expected_values`, log scenario execution, and
-return `True` only after traceability and dependency readiness checks pass.
-They do not call real MQTT, REST, CAN, Modbus, device, or application
-interfaces unless the required configuration exists.
-
-## Test Automation Flow
-
-For testcase generation, the current service flow is:
-
-```text
-IntentRouter
--> DocumentResolver
--> EvidenceCollector
--> ScenarioSelector
--> TestPlanAgent
--> DependencyAuditAgent
--> HarnessAgent
--> TestCodeWriterAgent
--> PytestValidationAgent
--> ExecutionAgent
--> FailureDebuggerAgent
--> TrackingJsonAgent
--> DbUpdateAgent
-```
-
-Today this handoff runs through service-backed LangGraph workflow wrappers and
-deterministic Python services. Later work can split the internal generation
-steps into finer LangGraph nodes.
-
-The retry policy is controlled:
-
-```text
-generate -> validate syntax -> run pytest -> classify failure
--> regenerate only for fixable generated-code failures -> retry up to 5
-```
-
-Missing modules, refused connections, timeouts, and unavailable services are
-recorded as environment blockers instead of blindly rewriting tests.
-
-## CLI Commands
-
-| Command | Purpose |
-| --- | --- |
-| `uv run multi-agentic-rag init` | Create local runtime folders and SQLite registry |
-| `uv run multi-agentic-rag doctor` | Check local config and optional services |
-| `uv run multi-agentic-rag ingest-doc <path> --system PROJECT_1 --version v1` | Ingest one PDF/DOCX |
-| `uv run multi-agentic-rag ingest-folder <folder> --system PROJECT_1 --version v1` | Ingest all PDF/DOCX files in a folder |
-| `uv run multi-agentic-rag query "<question>" --system PROJECT_1 --version v1` | Ask evidence-based questions |
-| `uv run multi-agentic-rag delta --system PROJECT_1 --from v1 --to v2` | Show deterministic version deltas |
-| `uv run multi-agentic-rag coverage --system PROJECT_1 --version v1` | Show coverage records |
-| `uv run multi-agentic-rag coverage-plan --system PROJECT_1 --version v1 --count 10` | Generate or reuse scenario coverage |
-| `uv run multi-agentic-rag generate-tests --system PROJECT_1 --version v1 --count 10` | Generate or reuse pytest automation artifacts |
-| `uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v1 --count 10` | Execute generated pytest tests and store result |
-| `uv run multi-agentic-rag last-results --system PROJECT_1 --version v1` | Read the latest stored test result without rerunning |
-| `uv run multi-agentic-rag task "<request>" --system PROJECT_1 --version v1` | Route a natural-language task |
-| `uv run multi-agentic-rag graph-check` | Validate Neo4j read/write/delete behavior |
-| `uv run multi-agentic-rag api` | Start FastAPI |
-| `uv run multi-agentic-rag mcp-info` | Show the planned MCP boundary |
-
-`multi-rag` is an alias for the same CLI app.
-
-## API
-
-Start FastAPI:
+### 3. V1 to V2 update and delta
 
 ```powershell
-uv run multi-agentic-rag api
+uv run multi-agentic-rag ingest documents/inbox/PROJECT_1/SIIMCS_BRD_V1.pdf --system PROJECT_1 --version v1
+uv run multi-agentic-rag ingest documents/inbox/PROJECT_1/SIIMCS_BRD_V2.pdf --system PROJECT_1 --version v2
+uv run multi-agentic-rag delta --system PROJECT_1 --from v1 --to v2
 ```
 
-Open:
+The registry keeps superseded V1 evidence and active V2 evidence separately. Delta claims are made only when stored fact deltas exist.
 
-```text
-http://127.0.0.1:8000/health
-http://127.0.0.1:8000/doctor
-http://127.0.0.1:8000/docs
+### 4. Post-update coverage reuse and selective execution
+
+```powershell
+uv run multi-agentic-rag coverage-plan --system PROJECT_1 --version v2 --count 25
+uv run multi-agentic-rag generate-tests --system PROJECT_1 --version v2 --count 25
+uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v2 --count 25
 ```
 
-Current endpoints:
+Unchanged V1-linked scenarios are reused and skipped by default. To execute reused scenarios too:
 
-- `GET /health`
-- `GET /doctor`
-- `POST /documents/ingest`
-- `POST /query`
-- `POST /delta`
-- `POST /coverage`
-- `POST /coverage/plan`
-- `POST /tasks`
-- `POST /tests/generate`
-- `POST /tests/run`
-- `POST /tests/last-result`
+```powershell
+uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v2 --count 25 --force-run-all
+```
 
-## Documentation Map
+### 5. Document-scoped chat
 
-- `execution.md` explains the current execution behavior step by step.
-- `behavior.md` summarizes the current achieved behavior and limits.
-- `ARCHITECTURE.md` describes the system boundaries and workflow design.
-- `ARCHITECTURE.mermaid` contains the visual architecture diagram.
+```powershell
+uv run multi-agentic-rag query "What are the covered areas of BRD V2?" --system PROJECT_1 --version v2
+```
+
+The chat path answers only from selected project evidence. It rejects missing `--system`, framework questions, setup questions, and questions where no evidence exists.
+
+## Domain Adaptability
+
+The framework is domain-adaptable because document parsing, fact extraction, graph indexing, coverage planning, and generated execution adapters are separate layers. The current extraction rules handle requirements, thresholds, protocols, sensors, endpoints, topics, and test references. The generated-test layer records protocol dependency status for REST, MQTT, Modbus, and CAN-style evidence.
+
+New domains should add extractors and validation adapters without changing the registry contract. The durable identifiers are document, chunk, fact, semantic key, coverage, generated file, and test-result IDs.
+
+## Domain Challenges
+
+- Ambiguous requirements need human review before automation can be trusted.
+- Scanned PDFs may require OCR and still need manual quality checks.
+- Domain tables can be parsed differently across PDFs, DOCX files, and exporter versions.
+- Real hardware and simulators are often unavailable during generation, so execution may be blocked by design.
+- Protocol evidence may be enough to generate placeholders but not enough to create a real integration test.
+- Version labels in filenames and CLI arguments must match; mismatches are rejected.
+
+## Fallbacks
+
+- No evidence -> no supported answer.
+- No delta rows -> no impact claim.
+- Missing Neo4j graph evidence in strict GraphRAG mode -> workflow blocks.
+- Missing PostgreSQL DSN in strict mode -> registry initialization fails.
+- Missing Weaviate URL in strict mode -> vector provider readiness fails.
+- Hash embeddings, SQLite, Chroma, and localhost Neo4j -> allowed only when `ALLOW_LOCAL_DEV_MODE=true`.
+- Missing real protocol/device dependencies -> generated pytest execution blocks or skips.
+- Explicit `--mock` -> no real connection is established, and generated artifacts label the run as mock mode.
 
 ## Conclusion
 
-MARAG is currently a local-first evidence system plus a document-grounded,
-dependency-aware test automation generator. The important achievement is
-traceability: generated tests do not invent expected values, missing protocol
-dependencies do not become fake passes, and execution is tied back to
-requirements, chunks, versions, JSON run history, SQLite records, and optional
-Neo4j traceability nodes. Real interfaces and LLM-heavy orchestration can be
-added later on top of this contract without weakening the evidence rules.
+Agentic GraphRAG QA is built to keep QA automation evidence-bound, version-aware, and operationally honest. Strict defaults target managed GraphRAG infrastructure. Local fallbacks remain available for deterministic development, but only behind an explicit switch so production-like runs fail loudly when required services or evidence are missing.

@@ -19,6 +19,13 @@ class AgentState(BaseModel):
     force_run_all: bool = False
     execution_mode: str | None = None
     output_dir: str | None = None
+    intent: str | None = None
+    execution_plan: dict[str, Any] | None = None
+    missing_dependencies: list[str] = Field(default_factory=list)
+    generated_code_paths: list[str] = Field(default_factory=list)
+    test_results: list[dict[str, Any]] = Field(default_factory=list)
+    next_node: str | None = None
+    retry_count: int = 0
     internal_settings: Any | None = Field(default=None, alias="_settings")
     documents: list[dict[str, Any]] = Field(default_factory=list)
     chunks: list[dict[str, Any]] = Field(default_factory=list)
@@ -56,6 +63,13 @@ class AgentStateDict(TypedDict, total=False):
     force_run_all: bool
     execution_mode: str | None
     output_dir: str | None
+    intent: str | None
+    execution_plan: dict[str, Any] | None
+    missing_dependencies: list[str]
+    generated_code_paths: list[str]
+    test_results: list[dict[str, Any]]
+    next_node: str | None
+    retry_count: int
     _settings: Any | None
     documents: list[dict[str, Any]]
     chunks: list[dict[str, Any]]

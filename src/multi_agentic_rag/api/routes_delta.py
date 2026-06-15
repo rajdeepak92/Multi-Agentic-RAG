@@ -7,7 +7,7 @@ from fastapi import APIRouter
 
 from multi_agentic_rag.config import get_settings
 from multi_agentic_rag.models import DeltaRecord
-from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.registry import select_registry
 
 router = APIRouter(tags=["delta"])
 
@@ -22,7 +22,7 @@ class DeltaRequest(BaseModel):
 
 @router.post("/delta", response_model=list[DeltaRecord])
 def delta(request: DeltaRequest) -> list[DeltaRecord]:
-    registry = SQLiteRegistry(get_settings().sqlite_db_path)
+    registry = select_registry(get_settings()).registry
     registry.initialize()
     return registry.list_deltas(
         system_name=request.system_name,

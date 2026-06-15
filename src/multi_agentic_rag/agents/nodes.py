@@ -33,6 +33,14 @@ def route_input(state: AgentStateDict) -> AgentStateDict:
     _trace(state, "IntentRouterAgent", "started")
     if state.get("input_type"):
         _normalize_execution_mode(state)
+        state["intent"] = state.get("input_type")
+        state["execution_plan"] = {
+            "intent": state.get("input_type"),
+            "system_name": state.get("system_name"),
+            "version": state.get("version"),
+            "scenario_count": state.get("scenario_count"),
+            "execution_mode": state.get("execution_mode"),
+        }
         _handoff(state, "IntentRouterAgent", "DocumentResolverAgent", "explicit input_type provided")
         _trace(state, "IntentRouterAgent", "completed")
         return state
@@ -91,6 +99,14 @@ def route_input(state: AgentStateDict) -> AgentStateDict:
         state["input_type"] = "unknown"
         state.setdefault("errors", []).append("No supported MARAG input was provided.")
     _normalize_execution_mode(state)
+    state["intent"] = state.get("input_type")
+    state["execution_plan"] = {
+        "intent": state.get("input_type"),
+        "system_name": state.get("system_name"),
+        "version": state.get("version"),
+        "scenario_count": state.get("scenario_count"),
+        "execution_mode": state.get("execution_mode"),
+    }
     _trace(
         state,
         "IntentRouterAgent",
@@ -312,6 +328,7 @@ def dependency_audit(state: AgentStateDict) -> AgentStateDict:
         "status": "pending_test_generation",
         "mutation_allowed": False,
     }
+    state["missing_dependencies"] = []
     _trace(state, "DependencyAuditAgent", "completed", execution_mode=mode)
     _handoff(
         state,
@@ -583,6 +600,47 @@ def build_task_result(state: AgentStateDict) -> AgentStateDict:
     return state
 
 
+def route_after_evidence(state: AgentStateDict) -> str:
+    """Route after evidence verification."""
+
+    next_node = "final_report" if state.get("errors") else "continue"
+    state["next_node"] = next_node
+    return next_node
+
+
+def route_after_dependency_audit(state: AgentStateDict) -> str:
+    """Route after dependency audit."""
+
+    next_node = "blocked" if state.get("missing_dependencies") else "continue"
+    state["next_node"] = next_node
+    return next_node
+
+
+def route_after_syntax_validation(state: AgentStateDict) -> str:
+    """Route after generated-code syntax validation."""
+
+    if state.get("errors") and state.get("retry_count", 0) < 1:
+        state["retry_count"] = state.get("retry_count", 0) + 1
+        next_node = "retry"
+    else:
+        next_node = "continue"
+    state["next_node"] = next_node
+    return next_node
+
+
+def route_after_execution(state: AgentStateDict) -> str:
+    """Route after pytest execution."""
+
+    result = (state.get("test_execution") or {}).get("result") or {}
+    if result.get("status") == "failed" and state.get("retry_count", 0) < 1:
+        state["retry_count"] = state.get("retry_count", 0) + 1
+        next_node = "retry"
+    else:
+        next_node = "continue"
+    state["next_node"] = next_node
+    return next_node
+
+
 def generate_output(state: AgentStateDict) -> AgentStateDict:
     """Backward-compatible alias for the previous terminal node."""
 
@@ -633,6 +691,12 @@ def _generate_tests(state: AgentStateDict) -> TaskResult:
         execution_mode=state.get("execution_mode"),
     )
     state["test_generation"] = result.model_dump(mode="json")
+    if result.test_file:
+        paths = [result.test_file.file_path]
+        paths.extend(result.test_file.harness_file_paths)
+        if result.test_file.robot_file_path:
+            paths.append(result.test_file.robot_file_path)
+        state["generated_code_paths"] = paths
     _trace(state, "TestWriterAgent", "completed", supported=result.supported)
     return TaskResult(
         supported=result.supported,
@@ -657,6 +721,8 @@ def _run_tests(state: AgentStateDict) -> TaskResult:
         execution_mode=state.get("execution_mode"),
     )
     state["test_execution"] = result.model_dump(mode="json")
+    if result.result:
+        state.setdefault("test_results", []).append(result.result.model_dump(mode="json"))
     _trace(
         state,
         "FailureClassifierAgent",

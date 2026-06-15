@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from multi_agentic_rag.models import DocumentStatus
-from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.registry import Registry
 
 
 class KeywordRetriever:
     """BM25 keyword retriever for IDs, protocols, endpoints, and exact terms."""
 
-    def __init__(self, registry: SQLiteRegistry) -> None:
+    def __init__(self, registry: Registry) -> None:
         self.registry = registry
 
     def retrieve(

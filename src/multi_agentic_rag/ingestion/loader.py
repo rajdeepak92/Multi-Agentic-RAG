@@ -24,7 +24,7 @@ from multi_agentic_rag.models import (
 )
 from multi_agentic_rag.storage.neo4j_store import Neo4jGraphStore
 from multi_agentic_rag.storage.object_store import LocalObjectStore
-from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.registry import select_registry
 from multi_agentic_rag.storage.vector_factory import select_vector_store
 from multi_agentic_rag.utils.hashing import sha256_file, stable_id
 from multi_agentic_rag.utils.paths import ensure_runtime_dirs, resolve_path
@@ -41,7 +41,7 @@ def ingest_document(
 
     settings = settings or get_settings()
     runtime_paths = ensure_runtime_dirs(settings)
-    registry = SQLiteRegistry(settings.sqlite_db_path)
+    registry = select_registry(settings).registry
     registry.initialize()
 
     source = resolve_path(source_path)

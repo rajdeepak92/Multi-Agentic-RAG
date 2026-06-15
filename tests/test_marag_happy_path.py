@@ -172,6 +172,94 @@ def test_coverage_plan_blocks_when_documents_have_no_requirement_links(tmp_path:
     assert result.message == "No requirement evidence found. No coverage claim can be made."
 
 
+def test_target_mode_blocks_missing_graph_evidence(tmp_path: Path) -> None:
+    local_settings = _settings(tmp_path)
+    source = _write_docx(tmp_path / "PROJECT_1_BRD_V1.docx")
+    ingest_document(source, system_name="PROJECT_1", version="v1", settings=local_settings)
+    target_settings = local_settings.model_copy(
+        update={
+            "marag_target_mode": "target-graphrag",
+            "graphrag_required": True,
+            "neo4j_uri": None,
+        }
+    )
+
+    result = plan_requirement_coverage(
+        system_name="PROJECT_1",
+        version="v1",
+        scenario_count=2,
+        settings=target_settings,
+    )
+
+    assert not result.supported
+    assert "Graph-backed scenario selection unavailable" in result.message
+
+
+def test_v2_coverage_reuses_unchanged_v1_scenarios(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    v1_source = _write_docx(tmp_path / "PROJECT_1_BRD_V1.docx")
+    v2_source = _write_docx(tmp_path / "PROJECT_1_BRD_V2.docx")
+    ingest_document(v1_source, system_name="PROJECT_1", version="v1", settings=settings)
+    v1_plan = plan_requirement_coverage(
+        system_name="PROJECT_1",
+        version="v1",
+        scenario_count=2,
+        settings=settings,
+    )
+    ingest_document(v2_source, system_name="PROJECT_1", version="v2", settings=settings)
+
+    v2_plan = plan_requirement_coverage(
+        system_name="PROJECT_1",
+        version="v2",
+        scenario_count=2,
+        settings=settings,
+    )
+
+    assert v1_plan.supported
+    assert v2_plan.supported
+    assert {record.impact_status for record in v2_plan.records} == {"unchanged"}
+    assert {record.coverage_status for record in v2_plan.records} == {"reused"}
+    assert all(record.previous_coverage_id for record in v2_plan.records)
+
+
+def test_force_run_all_executes_reused_v2_scenarios(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, generated_test_execution_mode="mock")
+    v1_source = _write_docx(tmp_path / "PROJECT_1_BRD_V1.docx")
+    v2_source = _write_docx(tmp_path / "PROJECT_1_BRD_V2.docx")
+    output_dir = tmp_path / "generated"
+    ingest_document(v1_source, system_name="PROJECT_1", version="v1", settings=settings)
+    plan_requirement_coverage(
+        system_name="PROJECT_1",
+        version="v1",
+        scenario_count=2,
+        settings=settings,
+    )
+    ingest_document(v2_source, system_name="PROJECT_1", version="v2", settings=settings)
+
+    skipped = run_testcases(
+        system_name="PROJECT_1",
+        version="v2",
+        scenario_count=2,
+        output_dir=output_dir,
+        settings=settings,
+    )
+    forced = run_testcases(
+        system_name="PROJECT_1",
+        version="v2",
+        scenario_count=2,
+        output_dir=output_dir,
+        force_run_all=True,
+        settings=settings,
+    )
+
+    assert skipped.result is not None
+    assert skipped.result.status == "skipped"
+    assert skipped.result.skipped == 2
+    assert forced.result is not None
+    assert forced.result.status == "passed"
+    assert forced.result.passed == 2
+
+
 def test_generated_pytest_file_executes_and_last_result_is_stored(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     source = _write_docx(tmp_path / "PROJECT_1_BRD_V1.docx")
@@ -464,7 +552,14 @@ def _settings(tmp_path: Path, *, generated_test_execution_mode: str = "auto") ->
         sqlite_db_path=runtime / "registry.db",
         chroma_path=runtime / "chroma",
         object_store_path=runtime / "objects",
+        registry_provider="sqlite",
+        allow_local_dev_mode=True,
+        marag_target_mode="local",
+        graphrag_required=False,
         neo4j_uri=None,
+        vector_store_provider="chroma",
         embedding_provider="hash",
+        reranker_provider="none",
+        llm_provider="none",
         generated_test_execution_mode=generated_test_execution_mode,
     )

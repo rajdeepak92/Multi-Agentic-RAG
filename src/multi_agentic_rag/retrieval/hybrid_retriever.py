@@ -13,7 +13,7 @@ from multi_agentic_rag.retrieval.graph_retriever import GraphRetriever
 from multi_agentic_rag.retrieval.intent import QueryIntent, detect_intent
 from multi_agentic_rag.retrieval.keyword_retriever import KeywordRetriever
 from multi_agentic_rag.retrieval.reranker import select_reranker
-from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.registry import Registry, select_registry
 from multi_agentic_rag.storage.vector_factory import select_vector_store
 
 
@@ -26,10 +26,29 @@ def answer_query(
 ) -> QueryResult:
     """Return a deterministic answer only when evidence exists."""
 
-    settings = settings or get_settings()
-    registry = SQLiteRegistry(settings.sqlite_db_path)
-    registry.initialize()
     intent = detect_intent(query)
+    if not system_name:
+        return _unsupported(
+            query=query,
+            intent=intent,
+            system_name=system_name,
+            version=version,
+            reason="Document-scoped chat requires --system.",
+        )
+    if _is_framework_or_out_of_scope_query(query):
+        return _unsupported(
+            query=query,
+            intent=intent,
+            system_name=system_name,
+            version=version,
+            reason=(
+                "Framework, setup, and out-of-scope questions are not answered by chat. "
+                "Ask only about evidence in the selected system."
+            ),
+        )
+    settings = settings or get_settings()
+    registry = select_registry(settings).registry
+    registry.initialize()
     retrieval_query = _expand_query_for_retrieval(query)
 
     if intent == QueryIntent.DELTA_ANALYSIS:
@@ -195,7 +214,7 @@ def _answer_delta_query(
     settings: Settings,
     intent: QueryIntent,
 ) -> QueryResult:
-    registry = SQLiteRegistry(settings.sqlite_db_path)
+    registry = select_registry(settings).registry
     deltas = registry.list_deltas(system_name=system_name)
     active_facts = registry.list_facts(system_name=system_name, status=DocumentStatus.ACTIVE)
     historical_facts = registry.list_facts(
@@ -242,7 +261,7 @@ def _answer_coverage_query(
     settings: Settings,
     intent: QueryIntent,
 ) -> QueryResult:
-    registry = SQLiteRegistry(settings.sqlite_db_path)
+    registry = select_registry(settings).registry
     facts = registry.list_facts(system_name=system_name, status=DocumentStatus.ACTIVE)
     requirement_facts = [fact for fact in facts if fact.fact_type == "requirement"]
     if not requirement_facts:
@@ -284,7 +303,7 @@ def _status_filter(
 
 def _infer_document_scope(
     *,
-    registry: SQLiteRegistry,
+    registry: Registry,
     query: str,
     system_name: str | None,
     version: str | None,
@@ -365,6 +384,26 @@ def _is_threshold_query(query: str) -> bool:
     )
 
 
+def _is_framework_or_out_of_scope_query(query: str) -> bool:
+    text = query.lower()
+    blocked_phrases = (
+        "how does this framework",
+        "how does the framework",
+        "what is this framework",
+        "explain the framework",
+        "setup",
+        "install",
+        "readme",
+        "architecture",
+        "langgraph",
+        "postgresql",
+        "weaviate",
+        "openai",
+        "docker",
+    )
+    return any(phrase in text for phrase in blocked_phrases)
+
+
 def _expand_query_for_retrieval(query: str) -> str:
     expansions: list[str] = []
     if _is_scope_query(query):
@@ -378,7 +417,7 @@ def _expand_query_for_retrieval(query: str) -> str:
 
 
 def _scope_context_chunks(
-    registry: SQLiteRegistry,
+    registry: Registry,
     chunks: list[ChunkRecord],
 ) -> list[ChunkRecord]:
     additions: list[ChunkRecord] = []
@@ -708,7 +747,7 @@ def _render_delta_answer(deltas: list) -> str:
     return "; ".join(parts)
 
 
-def _chunks_for_facts(registry: SQLiteRegistry, facts: list[FactRecord]) -> list[ChunkRecord]:
+def _chunks_for_facts(registry: Registry, facts: list[FactRecord]) -> list[ChunkRecord]:
     chunks_by_id: dict[str, ChunkRecord] = {}
     for fact in facts:
         chunks = registry.list_chunks(document_id=fact.document_id)
@@ -721,7 +760,7 @@ def _chunks_for_facts(registry: SQLiteRegistry, facts: list[FactRecord]) -> list
 def _query_vector_chunks(
     *,
     query: str,
-    registry: SQLiteRegistry,
+    registry: Registry,
     settings: Settings,
     system_name: str | None,
     version: str | None,
@@ -759,7 +798,7 @@ def _query_vector_chunks(
 def _query_keyword_chunks(
     *,
     query: str,
-    registry: SQLiteRegistry,
+    registry: Registry,
     settings: Settings,
     system_name: str | None,
     version: str | None,
@@ -794,7 +833,7 @@ def _query_keyword_chunks(
 
 def _query_graph_facts(
     *,
-    registry: SQLiteRegistry,
+    registry: Registry,
     settings: Settings,
     system_name: str | None,
     version: str | None,

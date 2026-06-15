@@ -28,9 +28,11 @@ def ensure_runtime_dirs(settings: Settings) -> dict[str, Path]:
     chroma = resolve_path(settings.chroma_path)
     exports = home / EXPORTS_DIR_NAME
     objects = resolve_path(settings.object_store_path)
-    for path in (home, documents, chroma, exports, objects):
+    for path in (home, documents, exports, objects):
         path.mkdir(parents=True, exist_ok=True)
-    settings.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
+    if settings.allow_local_dev_mode:
+        chroma.mkdir(parents=True, exist_ok=True)
+        settings.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
     return {
         "home": home,
         "documents": documents,

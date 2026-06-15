@@ -59,8 +59,15 @@ def test_keyword_evidence_supports_query_when_no_fact_matches(tmp_path: Path) ->
         multi_agentic_rag_home=tmp_path / ".runtime",
         sqlite_db_path=tmp_path / ".runtime" / "registry.db",
         chroma_path=tmp_path / ".runtime" / "chroma",
+        registry_provider="sqlite",
+        allow_local_dev_mode=True,
+        marag_target_mode="local",
+        graphrag_required=False,
         neo4j_uri=None,
+        vector_store_provider="chroma",
         embedding_provider="hash",
+        reranker_provider="none",
+        llm_provider="none",
     )
     registry = SQLiteRegistry(settings.sqlite_db_path)
     registry.initialize()
@@ -88,8 +95,15 @@ def test_version_label_does_not_force_historical_query(tmp_path: Path) -> None:
         multi_agentic_rag_home=tmp_path / ".runtime",
         sqlite_db_path=tmp_path / ".runtime" / "registry.db",
         chroma_path=tmp_path / ".runtime" / "chroma",
+        registry_provider="sqlite",
+        allow_local_dev_mode=True,
+        marag_target_mode="local",
+        graphrag_required=False,
         neo4j_uri=None,
+        vector_store_provider="chroma",
         embedding_provider="hash",
+        reranker_provider="none",
+        llm_provider="none",
     )
     registry = SQLiteRegistry(settings.sqlite_db_path)
     registry.initialize()
@@ -167,8 +181,15 @@ def test_threshold_query_uses_table_evidence_not_generic_sensor_facts(tmp_path: 
         multi_agentic_rag_home=tmp_path / ".runtime",
         sqlite_db_path=tmp_path / ".runtime" / "registry.db",
         chroma_path=tmp_path / ".runtime" / "chroma",
+        registry_provider="sqlite",
+        allow_local_dev_mode=True,
+        marag_target_mode="local",
+        graphrag_required=False,
         neo4j_uri=None,
+        vector_store_provider="chroma",
         embedding_provider="hash",
+        reranker_provider="none",
+        llm_provider="none",
     )
     registry = SQLiteRegistry(settings.sqlite_db_path)
     registry.initialize()
@@ -234,8 +255,15 @@ def test_explicit_version_query_can_retrieve_superseded_document(tmp_path: Path)
         multi_agentic_rag_home=tmp_path / ".runtime",
         sqlite_db_path=tmp_path / ".runtime" / "registry.db",
         chroma_path=tmp_path / ".runtime" / "chroma",
+        registry_provider="sqlite",
+        allow_local_dev_mode=True,
+        marag_target_mode="local",
+        graphrag_required=False,
         neo4j_uri=None,
+        vector_store_provider="chroma",
         embedding_provider="hash",
+        reranker_provider="none",
+        llm_provider="none",
     )
     registry = SQLiteRegistry(settings.sqlite_db_path)
     registry.initialize()

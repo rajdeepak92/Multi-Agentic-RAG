@@ -20,7 +20,7 @@ from multi_agentic_rag.models import (
 )
 from multi_agentic_rag.retrieval import answer_query
 from multi_agentic_rag.storage.neo4j_store import Neo4jGraphStore
-from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
+from multi_agentic_rag.storage.registry import select_registry
 from multi_agentic_rag.utils.hashing import sha256_file
 from multi_agentic_rag.utils.paths import ensure_runtime_dirs, resolve_path
 
@@ -251,7 +251,7 @@ def ingest_version_pair(
     warnings.extend(result_v1.warnings)
     warnings.extend(result_v2.warnings)
 
-    registry = SQLiteRegistry(settings.sqlite_db_path)
+    registry = select_registry(settings).registry
     registry.initialize()
     active_document = registry.get_active_document(system_name)
     superseded_documents = registry.list_documents(
@@ -302,7 +302,7 @@ def run_demo_workflow(*, settings: Settings | None = None) -> DemoRunResult:
         system_name="SIIMCS_DEMO",
         settings=settings,
     )
-    registry = SQLiteRegistry(settings.sqlite_db_path)
+    registry = select_registry(settings).registry
     registry.initialize()
     active_facts = registry.list_facts(system_name="SIIMCS_DEMO", status=DocumentStatus.ACTIVE)
     superseded_facts = registry.list_facts(
