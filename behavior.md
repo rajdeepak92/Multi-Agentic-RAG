@@ -20,6 +20,31 @@ For the target-state roadmap beyond this current behavior, see
 `STRATEGIC_UPDATE_PLAN.md`, `UPDATED_GOAL.md`, `EXECUTION_FLOW.md`, and
 `TEST_GENERATION_STRATEGY.md`.
 
+## Coverage Planning Source
+
+Coverage/scenario planning now prefers the Neo4j knowledge graph when graph
+evidence is available.
+
+Current behavior:
+
+- Ingestion writes document, chunk, fact, entity, and delta records to Neo4j
+  when Neo4j is reachable.
+- `coverage-plan`, `generate-tests`, `run-testcases`, and natural-language
+  testcase tasks call the same coverage planner.
+- The coverage planner queries Neo4j for requirement facts for the requested
+  `system/version`.
+- Scenario selection is built from the Neo4j-selected requirement facts.
+- SQLite registry records are still used to attach durable evidence text, chunk
+  IDs, document IDs, versions, and source hashes.
+- If Neo4j is unavailable in local mode, MARAG falls back to SQLite registry
+  facts and reports that graph-backed scenario selection was unavailable.
+- In target GraphRAG mode, missing Neo4j graph evidence blocks planning instead
+  of silently falling back.
+
+The coverage reuse scope includes the planning source and selected fact IDs, so
+old SQLite-only coverage runs are not silently reused once graph-backed
+selection is available.
+
 ## Test-Automation Generation Flow
 
 The testcase generation path follows this agent-style handoff:

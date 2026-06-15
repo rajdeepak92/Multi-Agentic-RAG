@@ -17,7 +17,7 @@ GraphRAG is the intelligence layer. The product outputs are:
 - Structured coverage records.
 - Pytest automation artifacts.
 - JSON sidecars and run history.
-- Future Robot Framework suites and keyword mappings.
+- Generated Robot Framework wrappers and future Robot execution.
 - Future simulator/adapter configuration.
 - Coverage, traceability, and execution reports.
 - Evidence-grounded answers as a supporting chatbot workflow.
@@ -47,11 +47,12 @@ Verified current behavior:
 - Version lifecycle with active/superseded evidence.
 - Conservative evidence-grounded query behavior.
 - Coverage planning that requires requirement evidence.
-- Service-backed LangGraph workflow wrappers for task routing.
+- Fine-grained service-backed LangGraph nodes for task routing, generation,
+  execution, sidecar checks, DB updates, reporting, and final validation.
 - Generated pytest artifacts under `generated/<system>/<brd_version>/`.
-- Generated `pytest.ini`, `conftest.py`, class-based pytest file, and JSON
-  sidecar.
-- Sidecar schema `test-automation-tracking.v2`.
+- Generated `pytest.ini`, `conftest.py`, class-based pytest file, Robot wrapper,
+  and JSON sidecar.
+- Sidecar schema `test-automation-tracking.v4`.
 - Dependency-aware generated tests:
   - protocol scenarios require mock, simulator, or real endpoint readiness;
   - missing dependencies are SKIP/BLOCKED;
@@ -125,8 +126,8 @@ Managed embeddings must not be described as the primary architecture.
 1. User asks to generate tests for a system/version.
 2. LangGraph workflow wrapper routes the task.
 3. Coverage planner selects requirement-linked scenarios.
-4. Test generator writes `pytest.ini`, `conftest.py`, pytest class file, and
-   sidecar JSON.
+4. Test generator writes `pytest.ini`, `conftest.py`, pytest class file, Robot
+   wrapper, and sidecar JSON.
 5. Dependency audit marks each protocol scenario as ready, blocked, mock,
    simulator, real, or document-contract.
 6. SQLite stores the generated test file record.
@@ -150,7 +151,7 @@ Minimum current fields:
 
 ```json
 {
-  "schema_version": "test-automation-tracking.v2",
+  "schema_version": "test-automation-tracking.v4",
   "project": "",
   "system_name": "",
   "document_id": "",
@@ -159,6 +160,15 @@ Minimum current fields:
   "source_document_path": "",
   "source_documents": [],
   "generated_test_file": "",
+  "generated_robot_file": "",
+  "mock_mode": false,
+  "mock_warning": "",
+  "domain_profile_ref": "",
+  "protocol_adapters": [],
+  "simulator_config": {},
+  "device_config_required": false,
+  "robot_keyword_mapping": [],
+  "handoff_summaries": [],
   "scenario_group": "",
   "selected_scenarios": [],
   "requirements": [],
@@ -196,19 +206,19 @@ Minimum current fields:
 }
 ```
 
-Future additions should cover Robot keyword mappings, simulator config, adapter
-requirements, fact IDs, and promotion metadata.
+Future additions should cover adapter versions, promotion metadata, and richer
+domain pack references.
 
 ## 7. Gap Analysis After Current Update
 
 | Gap | Current State | Severity | Next Action |
 | --- | --- | --- | --- |
-| Fine-grained LangGraph agent graph | Coarse service-backed wrapper exists | High | Split generation/execution into named node functions |
+| Fine-grained LangGraph agent graph | Fine-grained service-backed nodes exist | Medium | Add durable checkpoints and richer conditional edges |
 | Evidence verifier | Coverage/query gates exist, but no full claim verifier | High | Add `EvidenceVerifierAgent` over answers and generated tests |
 | Domain plugin contract | Protocol detection exists, no plugin packs | High | Add `DomainProfile` and adapter contract |
 | Real protocol adapters | Not implemented | High | Add mock/simulator adapters before real endpoints |
 | Protocol test pattern library | Generic dependency-aware pytest only | High | Add Modbus/REST/MQTT/CAN patterns |
-| Robot Framework | Not generated | Medium | Add after pytest mock path stabilizes |
+| Robot Framework execution | Wrapper generated; execution future | Medium | Add after pytest mock path stabilizes |
 | Structured LLM extraction | Placeholder/future | Medium | Add guarded Pydantic extraction fallback |
 | Reranking | Interface placeholder | Medium | Integrate optional reranker into hybrid retrieval |
 | Table-to-fact enrichment | Parser support exists, richer mapping needed | Medium | Add threshold/register/signal table fact extraction |

@@ -17,6 +17,7 @@ def handle_task(
     system_name: str | None = None,
     version: str | None = None,
     scenario_count: int = DEFAULT_SCENARIO_COUNT,
+    execution_mode: str | None = None,
     output_dir: str | Path | None = None,
     settings: Settings | None = None,
 ) -> TaskResult:
@@ -34,6 +35,7 @@ def handle_task(
         system_name=system_name,
         version=version,
         scenario_count=scenario_count,
+        execution_mode=execution_mode,
         output_dir=str(output_dir or DEFAULT_OUTPUT_DIR),
         settings=settings,
     )

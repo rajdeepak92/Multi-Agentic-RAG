@@ -32,13 +32,18 @@ Built today:
 - Version lifecycle where newer documents supersede older active documents
   without deleting old evidence.
 - Evidence-based query, delta, and coverage commands.
-- Coverage planning that requires requirement-linked evidence and stores a
-  reusable `coverage_run`.
+- Graph-backed coverage planning that uses Neo4j requirement facts when
+  available, falls back to SQLite evidence in local mode, and stores a reusable
+  `coverage_run`.
 - Dependency-aware pytest automation generation under `generated/<system>/<brd_version>/`.
 - Sidecar testcase JSON that tracks scenarios, source chunks, expected values,
   dependency audit, workflow handoff, retry policy, and run history.
+- Robot Framework wrapper generation beside every generated pytest file.
 - Test execution through pytest with generated `pytest.ini`, `conftest.py`,
-  fixtures, markers, hooks, logging, syntax validation, and stored results.
+  fixtures, markers, hooks, logging, syntax validation, JUnit XML reports, and
+  stored results.
+- Explicit `--mock` execution mode for generated mock-device flows when no real
+  device, simulator, or protocol endpoint is configured.
 - CLI and FastAPI routes for ingestion, query, coverage, task routing, test
   generation, test execution, and last-result lookup.
 
@@ -49,8 +54,8 @@ Not built yet:
 - PostgreSQL/OpenSearch/MinIO production backends.
 - Real device/protocol interface automation.
 - Fully compiled LangGraph subgraphs for every agent handoff.
-- LLM-backed extraction and final answer generation beyond conservative
-  evidence assembly.
+- Mandatory LLM-backed operation. OpenAI/Azure routing, fallback extraction, and
+  answer synthesis are optional and gated by configuration.
 
 ## Strategic Roadmap
 
@@ -59,6 +64,13 @@ See these planning artifacts for the forward-looking roadmap:
 - `UPDATED_GOAL.md`: updated project definition and supported task types.
 - `STRATEGIC_UPDATE_PLAN.md`: gap analysis, conflicts, roadmap, risks, and
   acceptance criteria.
+- `TARGET_ARCHITECTURE.md`: target framework identity and layer architecture.
+- `VERSION_AWARE_TEST_STRATEGY.md`: active/superseded lifecycle, deltas, reuse,
+  and selective execution.
+- `TEST_AUTOMATION_STRATEGY.md`: pytest, sidecar, reports, Robot mapping, and
+  adapter strategy.
+- `LANGGRAPH_ORCHESTRATION_PLAN.md`: target agent nodes and final validation.
+- `DOMAIN_PLUGIN_STRATEGY.md`: domain packs and protocol adapter roadmap.
 - `EXECUTION_FLOW.md`: document-to-test execution lifecycle and failure model.
 - `TEST_GENERATION_STRATEGY.md`: generated pytest strategy, sidecar schema, and
   future Robot Framework mapping.
@@ -147,7 +159,10 @@ generated/
   project_1/
     brd_v1/
       test_project_1_brd_v1.py
+      test_project_1_brd_v1.robot
       test_project_1_brd_v1.json
+      reports/
+        coverage.json
       conftest.py
       pytest.ini
 ```
@@ -164,6 +179,7 @@ Minimum local values:
 ```env
 MULTI_AGENTIC_RAG_HOME=.multi_agentic_rag
 MULTI_AGENTIC_RAG_PROFILE=local
+MARAG_TARGET_MODE=local
 SQLITE_DB_PATH=.multi_agentic_rag/registry.db
 OBJECT_STORE_PATH=.multi_agentic_rag/objects
 
@@ -175,22 +191,34 @@ WEAVIATE_HYBRID_ALPHA=0.65
 CHROMA_PATH=.multi_agentic_rag/chroma
 KEYWORD_INDEX_ENABLED=true
 
-EMBEDDING_PROVIDER=huggingface
+EMBEDDING_PROVIDER=hash
 DEFAULT_EMBEDDING_MODEL=BAAI/bge-m3
+RERANKER_PROVIDER=none
 DEFAULT_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 HASH_EMBEDDING_DIMENSIONS=384
 HF_TOKEN=
 HF_HOME=.cache/huggingface
 HF_HUB_CACHE=.cache/huggingface/hub
 
-GRAPHRAG_REQUIRED=true
+GRAPHRAG_REQUIRED=false
 
 LLM_PROVIDER=none
-DEFAULT_LLM_MODEL=gpt-5.5
+DEFAULT_LLM_MODEL=gpt-4.1-mini
 OPENAI_API_KEY=
 AZURE_OPENAI_ENDPOINT=
 AZURE_OPENAI_API_KEY=
 AZURE_OPENAI_DEPLOYMENT=
+AZURE_OPENAI_API_VERSION=2025-04-01-preview
+
+GENERATED_TEST_EXECUTION_MODE=auto
+SIMULATOR_CONFIG_PATH=
+REST_SIMULATOR_ENABLED=false
+MQTT_SIMULATOR_ENABLED=false
+MODBUS_HOST=
+MQTT_BROKER_URL=
+CAN_INTERFACE=
+REST_API_BASE_URL=
+ROBOT_GENERATION_ENABLED=false
 
 ENABLE_PDF_OCR=false
 TESSERACT_CMD=
@@ -201,19 +229,34 @@ MCP_ENABLED=false
 MCP_TRANSPORT=stdio
 ```
 
-Use `EMBEDDING_PROVIDER=huggingface` with `DEFAULT_EMBEDDING_MODEL=BAAI/bge-m3`
-for real BRD/SRS/design-document retrieval. Use `EMBEDDING_PROVIDER=hash` only
-for deterministic unit tests, smoke tests, and offline validation where
-retrieval quality is not being evaluated.
+Local-first mode intentionally uses hash embeddings, SQLite, Chroma, and
+deterministic routing/extraction so a developer can run without external model
+or graph services.
 
-Use `GRAPHRAG_REQUIRED=true` for the target GraphRAG workflow. Set it to
-`false` only for transitional local runs where Neo4j is intentionally
-unavailable.
+Use target GraphRAG mode only for stricter Option-4 validation:
+
+```env
+MARAG_TARGET_MODE=target-graphrag
+GRAPHRAG_REQUIRED=true
+EMBEDDING_PROVIDER=huggingface
+RERANKER_PROVIDER=huggingface
+LLM_PROVIDER=openai
+REST_SIMULATOR_ENABLED=true
+MQTT_SIMULATOR_ENABLED=true
+```
+
+Then validate:
+
+```powershell
+uv run multi-agentic-rag doctor --target-graphrag --system PROJECT_1 --version v1
+```
 
 ## Neo4j Desktop Setup
 
-Neo4j is optional for local testcase generation, but required for graph-check and
-graph retrieval.
+Neo4j is optional for local testcase generation, but when it is reachable the
+coverage planner uses Neo4j requirement facts as the scenario-selection
+backbone. Neo4j is required for graph-check, graph retrieval, and target
+GraphRAG mode.
 
 1. Install Neo4j Desktop.
 2. Create a local DBMS.
@@ -280,6 +323,8 @@ uv run multi-agentic-rag coverage-plan --system PROJECT_1 --version v1 --count 1
 uv run multi-agentic-rag generate-tests --system PROJECT_1 --version v1 --count 10
 uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v1 --count 10
 uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v1 --count 5
+uv run multi-agentic-rag generate-tests --system PROJECT_1 --version v1 --count 10 --mock
+uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v1 --count 10 --mock
 ```
 
 Expected shape after ingestion:

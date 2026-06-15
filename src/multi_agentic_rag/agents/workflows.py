@@ -22,6 +22,7 @@ def run_task_workflow(
     system_name: str | None = None,
     version: str | None = None,
     scenario_count: int = DEFAULT_SCENARIO_COUNT,
+    execution_mode: str | None = None,
     output_dir: str | None = None,
     settings: Settings | None = None,
 ) -> TaskResult:
@@ -33,6 +34,7 @@ def run_task_workflow(
         "system_name": system_name,
         "version": version,
         "scenario_count": scenario_count,
+        "execution_mode": execution_mode,
         "output_dir": output_dir,
         "_settings": settings,
     }

@@ -77,7 +77,7 @@ def compute_fact_deltas(
 
 
 def _latest_by_key(facts: list[FactRecord]) -> dict[str, FactRecord]:
-    return {fact.fact_key: fact for fact in facts}
+    return {fact.semantic_key or fact.fact_key: fact for fact in facts}
 
 
 def _same_fact_value(old_fact: FactRecord, new_fact: FactRecord) -> bool:

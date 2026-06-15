@@ -4,26 +4,33 @@ This guide explains how Multi-Agentic-RAG (MARAG) currently works for document
 ingestion, document-grounded chat, coverage planning, dependency-aware pytest automation
 generation, testcase execution, and result tracking.
 
-MARAG is local-first. It does not use Docker. Neo4j, Weaviate, OpenAI, and
-HuggingFace-backed models can be enabled, but the current automation
-execution path can run with local Python, pytest, SQLite, and ingested evidence.
+MARAG is local-first in deployment. It does not use Docker. Neo4j, Weaviate,
+OpenAI, and HuggingFace-backed models can be enabled. When Neo4j is reachable
+and contains ingested requirement facts, coverage/scenario selection uses the
+Neo4j graph as the planning backbone. SQLite remains the durable registry and
+fallback evidence store; pytest execution can still run locally with Python,
+pytest, SQLite, and generated artifacts.
 
 For the forward-looking roadmap toward GraphRAG-backed QA automation,
-LangGraph workflows, domain adapters, mock/simulator-backed pytest generation,
-and future Robot Framework mapping, see `STRATEGIC_UPDATE_PLAN.md`,
-`UPDATED_GOAL.md`, `EXECUTION_FLOW.md`, and `TEST_GENERATION_STRATEGY.md`.
+domain adapters, protocol simulators, and future Robot Framework execution, see
+`STRATEGIC_UPDATE_PLAN.md`, `UPDATED_GOAL.md`, `EXECUTION_FLOW.md`, and
+`TEST_GENERATION_STRATEGY.md`.
 
 ## 1. Supported Task Types
 
 MARAG currently routes work into three practical task types:
 
 1. Ingest documents and keep local stores up to date.
-2. Generate dependency-aware automation-style pytest tests from an instructed document.
+2. Generate and run dependency-aware pytest/Robot/JSON automation artifacts from
+   an instructed document.
 3. Answer informative chatbot questions from ingested document evidence.
 
-The current task router uses service-backed LangGraph workflow wrappers and
-delegates generation/execution to deterministic Python services. The generated
-JSON records the agent-style handoff for deeper node decomposition later.
+The task router now uses fine-grained LangGraph nodes for routing, document
+resolution, version context, retrieval, evidence verification, domain analysis,
+dependency audit, harness selection, test writing, Robot mapping, syntax
+validation, execution, failure classification, JSON sidecar checks, database
+status, reporting, and final validation. Python services still perform every
+file, database, graph, and pytest mutation.
 
 ## 2. Fresh Windows Setup
 
@@ -56,6 +63,8 @@ Minimum local `.env`:
 
 ```env
 MULTI_AGENTIC_RAG_HOME=.multi_agentic_rag
+MULTI_AGENTIC_RAG_PROFILE=local
+MARAG_TARGET_MODE=local
 SQLITE_DB_PATH=.multi_agentic_rag/registry.db
 OBJECT_STORE_PATH=.multi_agentic_rag/objects
 
@@ -67,16 +76,27 @@ KEYWORD_INDEX_ENABLED=true
 NEO4J_URI=bolt://127.0.0.1:7687
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=<your_neo4j_password>
-GRAPHRAG_REQUIRED=true
+GRAPHRAG_REQUIRED=false
 
-EMBEDDING_PROVIDER=huggingface
+EMBEDDING_PROVIDER=hash
 DEFAULT_EMBEDDING_MODEL=BAAI/bge-m3
+RERANKER_PROVIDER=none
+DEFAULT_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 
 LLM_PROVIDER=none
+DEFAULT_LLM_MODEL=gpt-4.1-mini
 OPENAI_API_KEY=
 AZURE_OPENAI_ENDPOINT=
 AZURE_OPENAI_API_KEY=
 AZURE_OPENAI_DEPLOYMENT=
+
+GENERATED_TEST_EXECUTION_MODE=auto
+REST_SIMULATOR_ENABLED=false
+MQTT_SIMULATOR_ENABLED=false
+MODBUS_HOST=
+MQTT_BROKER_URL=
+CAN_INTERFACE=
+REST_API_BASE_URL=
 ```
 
 Initialize and validate:
@@ -90,9 +110,27 @@ uv run pytest -c pyproject.toml tests
 Neo4j and Weaviate may warn if they are not running. That is a setup signal,
 not a local test-generation blocker.
 
-For real GraphRAG runs, keep `GRAPHRAG_REQUIRED=true` and start Neo4j before
-ingestion. For deterministic tests or offline smoke runs only, use
-`EMBEDDING_PROVIDER=hash` and `GRAPHRAG_REQUIRED=false`.
+For target GraphRAG runs, start Neo4j before ingestion and set:
+
+```env
+MARAG_TARGET_MODE=target-graphrag
+GRAPHRAG_REQUIRED=true
+EMBEDDING_PROVIDER=huggingface
+RERANKER_PROVIDER=huggingface
+LLM_PROVIDER=openai
+REST_SIMULATOR_ENABLED=true
+MQTT_SIMULATOR_ENABLED=true
+```
+
+Then validate:
+
+```powershell
+uv run multi-agentic-rag doctor --target-graphrag --system PROJECT_1 --version v1
+```
+
+Target-mode natural-language tasks require structured LLM routing. Explicit CLI
+commands such as `generate-tests` and `run-testcases` can still select the
+entry workflow directly.
 
 ## 3. Document Inbox Convention
 
@@ -169,20 +207,37 @@ What happens:
 
 - MARAG checks stored document evidence for the requested system/version.
 - Requirement-linked evidence is mandatory.
+- If Neo4j is reachable and contains requirement facts, `ScenarioSelectionAgent`
+  selects requirements from Neo4j graph evidence first.
+- SQLite registry facts are then used to attach durable evidence text, chunk IDs,
+  document IDs, versions, and source hashes to those graph-selected requirements.
+- If Neo4j is unavailable in local mode, MARAG falls back to SQLite registry
+  evidence and reports that graph-backed selection was unavailable.
+- In target GraphRAG mode, missing Neo4j graph evidence blocks coverage
+  planning instead of silently falling back.
 - Each scenario is linked to a requirement ID, document ID, version, chunk ID,
   evidence text, and source hash.
 - A `coverage_run` row is stored in SQLite.
 - If the same document scope is already covered, MARAG reuses the prior run
-  unless forced.
+  unless forced. The reuse scope includes the planning source, so a previous
+  SQLite-only run is not silently reused after Neo4j graph-backed selection is
+  available.
 
 No evidence means no coverage claim.
 
 ## 7. Test-Automation Generation Flow
 
-Generate pytest automation artifacts:
+Generate pytest, Robot, and JSON trace artifacts:
 
 ```powershell
 uv run multi-agentic-rag generate-tests --system PROJECT_1 --version v1 --count 5
+```
+
+Generate explicit mock-device artifacts when no real device, simulator, or
+protocol endpoint is configured:
+
+```powershell
+uv run multi-agentic-rag generate-tests --system PROJECT_1 --version v1 --count 5 --mock
 ```
 
 Current generated layout:
@@ -192,9 +247,12 @@ generated/
   project_1/
     brd_v1/
       test_project_1_brd_v1.py
+      test_project_1_brd_v1.robot
       test_project_1_brd_v1.json
       conftest.py
       pytest.ini
+      reports/
+        coverage.json
 ```
 
 The generated directory is ignored by normal project pytest discovery and by
@@ -203,30 +261,34 @@ git. MARAG executes generated tests explicitly through its runner.
 The generation handoff recorded in JSON is:
 
 ```text
-IntentRouter
-DocumentResolver
-EvidenceCollector
-ScenarioSelector
-TestPlanAgent
+IntentRouterAgent
+DocumentResolverAgent
+VersionDeltaAgent
+GraphRetrievalAgent
+ScenarioSelectionAgent
 DependencyAuditAgent
-HarnessAgent
-TestCodeWriterAgent
-PytestValidationAgent
-ExecutionAgent
-FailureDebuggerAgent
-TrackingJsonAgent
-DbUpdateAgent
+TestHarnessAgent
+TestWriterAgent
+RobotMappingAgent
+SyntaxValidationAgent
+TestExecutionAgent
+FailureClassifierAgent
+JsonSidecarAgent
+DatabaseUpdateAgent
+FinalRouterValidationAgent
 ```
 
-The task router runs through LangGraph workflow wrappers. The individual
-test-generation substeps are still implemented as deterministic services.
+LangGraph owns the handoff boundaries and validation checkpoints. Python
+services write the generated files and update SQLite/Neo4j.
 
 ## 8. Generated Pytest Behavior
 
-Generated tests are class-based pytest scripts.
+Generated tests are class-based pytest scripts with a generated
+`ThreePTest.define_test()` method.
 
 Each test function:
 
+- Calls `define_test(...)`, which collects `results: List[bool]`.
 - Checks that `coverage_id` exists.
 - Checks that `requirement_id` exists.
 - Checks that evidence is present.
@@ -234,7 +296,9 @@ Each test function:
 - Checks that expected values were derived from evidence.
 - Calls a dependency-aware validation helper.
 - Blocks/skips when protocol, simulator, or device configuration is missing.
-- In explicit mock mode, asserts deterministic evidence-derived checks.
+- In explicit mock mode, builds generated mock device context, logs that no
+  actual connection was established, and asserts deterministic evidence-derived
+  checks.
 
 The helper logs with precise levels:
 
@@ -268,6 +332,15 @@ The JSON stores:
 - `coverage_run_id`
 - `scope_hash`
 - `generated_test_file`
+- `generated_robot_file`
+- `mock_mode`
+- `mock_warning`
+- `domain_profile_ref`
+- `protocol_adapters`
+- `simulator_config`
+- `device_config_required`
+- `robot_keyword_mapping`
+- `handoff_summaries`
 - `generated_file`
 - `selected_scenarios`
 - `requirements`
@@ -292,6 +365,9 @@ Each scenario stores:
 - `generated_file`
 - `test_function`
 - `evidence`
+- `execution_mode`
+- `mock_mode`
+- `mock_device_config`
 - `last_run_status` after execution
 
 After execution, the runner adds `run_1`, `run_2`, and so on:
@@ -306,9 +382,10 @@ After execution, the runner adds `run_1`, `run_2`, and so on:
 }
 ```
 
-For now, the JSON is the detailed trace artifact. SQLite also stores generated
-test file records and test run result records. Later, the JSON schema can be
-moved into a database trace table and kept only as an export artifact.
+The current schema version is `test-automation-tracking.v4`. For now, the JSON
+is the detailed trace artifact. SQLite also stores generated test file records
+and test run result records. Later, the JSON schema can be moved into a
+database trace table and kept only as an export artifact.
 
 ## 10. Dependency Audit Behavior
 
@@ -327,12 +404,22 @@ MARAG records the missing endpoint, simulator, or client configuration in the
 dependency audit and run result. Project dependency changes still require an
 approved implementation step.
 
+Explicit `--mock` mode is the supported bypass for absent device connectivity.
+Mock mode creates generated mock device context, records `mock_mode=true`, and
+must not be interpreted as a real device PASS.
+
 ## 11. Execute Generated Testcases
 
 Run generated testcases:
 
 ```powershell
 uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v1 --count 5
+```
+
+Run generated testcases in mock mode:
+
+```powershell
+uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v1 --count 5 --mock
 ```
 
 What happens:
@@ -346,11 +433,14 @@ What happens:
 7. SQLite receives the execution result.
 8. The sidecar JSON receives `run_1` or the next run key.
 
-Current successful example:
+Successful mock example:
 
 ```text
 executed: Test run passed: 5 passed, 0 failed, 0 skipped.
 ```
+
+If the scenario needs a real protocol/device path and no simulator or endpoint
+is configured, the expected result is blocked/skipped rather than PASS.
 
 ## 12. Failure And Retry Behavior
 
@@ -392,6 +482,12 @@ Generate testcases:
 
 ```powershell
 uv run multi-agentic-rag task "Generate 5 testcases for BRD V1" --system PROJECT_1 --version v1 --count 5
+```
+
+Generate mock-mode testcases:
+
+```powershell
+uv run multi-agentic-rag task "Generate 5 testcases for BRD V1" --system PROJECT_1 --version v1 --count 5 --mock
 ```
 
 Run testcases:
@@ -437,6 +533,9 @@ uv run multi-agentic-rag generate-tests --system PROJECT_1 --version v2 --count 
 uv run multi-agentic-rag run-testcases --system PROJECT_1 --version v2 --count 5
 ```
 
+Use `--mock` on generation/execution when the V2 task should build and run
+mock-device flows instead of requiring real device or simulator config.
+
 V2 artifacts are written under:
 
 ```text
@@ -471,9 +570,13 @@ Example task request:
   "request": "Generate 5 testcases for BRD V1",
   "system": "PROJECT_1",
   "version": "v1",
-  "scenario_count": 5
+  "scenario_count": 5,
+  "mock": true
 }
 ```
+
+API callers can also set `"execution_mode": "mock"`, `"simulator"`, `"real"`,
+or `"auto"`.
 
 ## 17. What MARAG Does Not Do Silently
 
@@ -486,3 +589,4 @@ Example task request:
 - It does not treat superseded evidence as current truth unless a version is requested.
 - It does not call real external interfaces unless the required dependency
   configuration is present.
+- It does not treat mock execution as real device validation.

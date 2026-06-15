@@ -11,8 +11,11 @@ from multi_agentic_rag.models.delta import DeltaRecord
 from multi_agentic_rag.models.document import DocumentRecord, DocumentStatus
 from multi_agentic_rag.models.graph import EntityRecord, FactRecord, RequirementRecord
 from multi_agentic_rag.models.output import (
+    AutomationTaskResult,
     CoveragePlanResult,
     EvidenceRecord,
+    ExecutionSummary,
+    GeneratedArtifacts,
     IngestResult,
     QueryResult,
     TaskResult,
@@ -25,12 +28,15 @@ __all__ = [
     "CoverageRecord",
     "CoverageRunRecord",
     "CoveragePlanResult",
+    "AutomationTaskResult",
     "DeltaRecord",
     "DocumentRecord",
     "DocumentStatus",
     "EntityRecord",
     "EvidenceRecord",
+    "ExecutionSummary",
     "FactRecord",
+    "GeneratedArtifacts",
     "GeneratedTestFileRecord",
     "IngestResult",
     "QueryResult",

@@ -6,11 +6,13 @@ import re
 
 from multi_agentic_rag.config import Settings, get_settings
 from multi_agentic_rag.extraction.rule_extractors import extract_facts_from_text
+from multi_agentic_rag.llm import AnswerDraft, select_llm_client
 from multi_agentic_rag.models import ChunkRecord, DocumentStatus, EvidenceRecord, QueryResult
 from multi_agentic_rag.models.graph import FactRecord
 from multi_agentic_rag.retrieval.graph_retriever import GraphRetriever
 from multi_agentic_rag.retrieval.intent import QueryIntent, detect_intent
 from multi_agentic_rag.retrieval.keyword_retriever import KeywordRetriever
+from multi_agentic_rag.retrieval.reranker import select_reranker
 from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
 from multi_agentic_rag.storage.vector_factory import select_vector_store
 
@@ -90,6 +92,7 @@ def answer_query(
         registry=registry,
         settings=settings,
         system_name=system_name,
+        version=version,
         status=status,
         document_scope=document_scope,
     )
@@ -97,12 +100,32 @@ def answer_query(
         warnings.append(f"Neo4j graph facts unavailable: {graph_warning}")
     if graph_facts:
         retrieval_sources.append("graph")
+    elif _target_graphrag_required(settings):
+        return _unsupported(
+            query=query,
+            intent=intent,
+            system_name=system_name,
+            version=version,
+            reason=(
+                "Target GraphRAG mode requires Neo4j graph evidence for the requested "
+                "system/version."
+            ),
+        )
     facts = _dedupe_facts(facts + graph_facts)
     retrieved_chunks = _dedupe_chunks(vector_chunks + keyword_chunks)
     if _is_scope_query(query):
         retrieved_chunks = _dedupe_chunks(
             retrieved_chunks + _scope_context_chunks(registry, retrieved_chunks)
         )
+    retrieved_chunks, reranker_warning = _rerank_chunks(
+        query=query,
+        chunks=retrieved_chunks,
+        settings=settings,
+    )
+    if reranker_warning:
+        warnings.append(reranker_warning)
+    elif retrieved_chunks and settings.reranker_provider != "none":
+        retrieval_sources.append("reranker")
     if not facts and not retrieved_chunks:
         return _unsupported(
             query=query,
@@ -120,6 +143,13 @@ def answer_query(
             _chunks_for_facts(registry, selected) + retrieved_chunks
         )
         answer = _render_fact_answer(selected, status=status)
+        answer, synthesis_warnings = _maybe_synthesize_answer(
+            query=query,
+            deterministic_answer=answer,
+            chunks=chunks,
+            settings=settings,
+        )
+        warnings.extend(synthesis_warnings)
         return QueryResult(
             query=query,
             intent=intent.value,
@@ -134,6 +164,12 @@ def answer_query(
             warnings=warnings,
         )
     answer, answer_chunks = _render_chunk_answer(query, retrieved_chunks)
+    answer, synthesis_warnings = _maybe_synthesize_answer(
+        query=query,
+        deterministic_answer=answer,
+        chunks=answer_chunks,
+        settings=settings,
+    )
     return QueryResult(
         query=query,
         intent=intent.value,
@@ -147,6 +183,7 @@ def answer_query(
             source for source in retrieval_sources if source in {"vector", "keyword"}
         ],
         warnings=warnings
+        + synthesis_warnings
         + ["Answer is extractive from retrieved chunks; no exact extracted fact matched."],
     )
 
@@ -760,22 +797,26 @@ def _query_graph_facts(
     registry: SQLiteRegistry,
     settings: Settings,
     system_name: str | None,
+    version: str | None,
     status: DocumentStatus | None,
     document_scope: set[str] | None,
 ) -> tuple[list[FactRecord], str | None]:
-    if not system_name or status is None:
+    if not system_name:
         return [], None
     retriever = GraphRetriever(settings)
-    result = (
-        retriever.get_current_facts(system_name)
-        if status == DocumentStatus.ACTIVE
-        else retriever.get_historical_facts(system_name)
-    )
+    if version:
+        result = retriever.get_facts_by_version(system_name, version)
+    elif status == DocumentStatus.ACTIVE:
+        result = retriever.get_current_facts(system_name)
+    elif status == DocumentStatus.SUPERSEDED:
+        result = retriever.get_historical_facts(system_name)
+    else:
+        return [], None
     if result.warning:
         return [], result.warning
     chunks = {
         chunk.chunk_id: chunk
-        for chunk in registry.list_chunks(system_name=system_name, status=status)
+        for chunk in registry.list_chunks(system_name=system_name, version=version, status=status)
         if not document_scope or chunk.document_id in document_scope
     }
     facts: list[FactRecord] = []
@@ -799,8 +840,9 @@ def _query_graph_facts(
                 chunk_id=chunk.chunk_id,
                 system_name=chunk.system_name,
                 version=chunk.version,
-                status=status,
+                status=status or chunk.status,
                 evidence=chunk.text,
+                semantic_key=record.get("semantic_key"),
             )
         )
     return facts, None
@@ -820,6 +862,31 @@ def _dedupe_chunks(chunks: list[ChunkRecord]) -> list[ChunkRecord]:
     return list(by_id.values())
 
 
+def _rerank_chunks(
+    *,
+    query: str,
+    chunks: list[ChunkRecord],
+    settings: Settings,
+) -> tuple[list[ChunkRecord], str | None]:
+    if not chunks or settings.reranker_provider == "none":
+        return chunks, None
+    try:
+        selection = select_reranker(settings)
+        candidates = [
+            {
+                "chunk_id": chunk.chunk_id,
+                "text": chunk.text,
+                "chunk": chunk,
+            }
+            for chunk in chunks
+        ]
+        ranked = selection.reranker.rerank(query, candidates)
+    except Exception as exc:
+        return chunks, f"Reranking unavailable: {exc}"
+    reranked_chunks = [item["chunk"] for item in ranked if item.get("chunk")]
+    return reranked_chunks or chunks, None
+
+
 def _evidence_records(chunks: list[ChunkRecord]) -> list[EvidenceRecord]:
     return [
         EvidenceRecord(
@@ -833,6 +900,58 @@ def _evidence_records(chunks: list[ChunkRecord]) -> list[EvidenceRecord]:
         )
         for chunk in chunks
     ]
+
+
+def _maybe_synthesize_answer(
+    *,
+    query: str,
+    deterministic_answer: str,
+    chunks: list[ChunkRecord],
+    settings: Settings,
+) -> tuple[str, list[str]]:
+    if settings.llm_provider == "none" or not chunks:
+        return deterministic_answer, []
+    client = select_llm_client(settings)
+    ready, message = client.check_ready()
+    if not ready:
+        return deterministic_answer, [f"LLM answer synthesis disabled: {message}"]
+    evidence_by_id = {
+        chunk.chunk_id: {
+            "source": chunk.source_name,
+            "page": chunk.page,
+            "version": chunk.version,
+            "text": chunk.text[:1200],
+        }
+        for chunk in chunks[:8]
+    }
+    instructions = (
+        "Rewrite the deterministic MARAG answer only using the provided evidence. "
+        "Do not add facts, recommendations, or assumptions. "
+        "Return used_evidence_ids that are present in the provided evidence map."
+    )
+    user_input = str(
+        {
+            "question": query,
+            "deterministic_answer": deterministic_answer,
+            "evidence": evidence_by_id,
+        }
+    )
+    try:
+        draft = client.parse(
+            instructions=instructions,
+            user_input=user_input,
+            schema=AnswerDraft,
+        )
+    except Exception as exc:
+        return deterministic_answer, [f"LLM answer synthesis fallback used: {exc}"]
+    used_ids = set(draft.used_evidence_ids)
+    if not draft.answer.strip() or not used_ids or not used_ids <= set(evidence_by_id):
+        return deterministic_answer, ["LLM answer synthesis rejected: missing valid evidence ids."]
+    return draft.answer.strip(), [f"LLM answer synthesis used via {client.provider}."]
+
+
+def _target_graphrag_required(settings: Settings) -> bool:
+    return settings.marag_target_mode == "target-graphrag" or settings.graphrag_required
 
 
 def _unsupported(

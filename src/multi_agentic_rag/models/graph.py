@@ -49,4 +49,5 @@ class FactRecord(BaseModel):
     evidence: str
     unit: str | None = None
     requirement_id: str | None = None
+    semantic_key: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)

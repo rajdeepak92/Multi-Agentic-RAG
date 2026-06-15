@@ -4,14 +4,16 @@
 
 MARAG test generation converts requirement-linked evidence into generated QA
 automation assets. Pytest is the current execution foundation. Robot Framework
-and reusable keyword mappings are future layers.
+mapping generation is optional; Robot execution and reusable keyword libraries
+remain future layers.
 
 Current state:
 
-- Generated tests are placeholder-based.
-- Generated tests validate traceability fields.
+- Generated tests are dependency-aware and evidence-bound.
+- Generated tests validate traceability fields and version impact.
 - The runner validates syntax and executes pytest.
-- Results are written to JSON sidecar and SQLite.
+- Results are written to JSON sidecar, JUnit XML, coverage report JSON, SQLite,
+  and optional Neo4j.
 
 Target state:
 
@@ -32,6 +34,9 @@ generated/
       conftest.py
       test_<scenario_group>.py
       test_<scenario_group>.json
+      reports/
+        coverage.json
+        run_<timestamp>.xml
 ```
 
 Example:
@@ -147,16 +152,33 @@ Minimum proposed schema:
 
 ```json
 {
-  "schema_version": "test-automation-tracking.v2",
+  "schema_version": "test-automation-tracking.v4",
   "project": "",
   "document_id": "",
   "document_version": "",
+  "active_version": "",
+  "previous_version": "",
+  "supersedes": [],
+  "superseded_by": "",
   "source_document_path": "",
   "generated_test_file": "",
+  "generated_robot_file": "",
+  "generated_xml_report": "",
+  "coverage_report": "",
+  "mock_mode": false,
+  "mock_warning": "",
+  "domain_profile_ref": "",
+  "protocol_adapters": [],
+  "simulator_config": {},
+  "device_config_required": false,
+  "robot_keyword_mapping": [],
+  "handoff_summaries": [],
   "scenario_group": "",
   "selected_scenarios": [],
   "requirements": [],
-  "extracted_facts_used": [],
+  "facts_used": [],
+  "changed_facts": [],
+  "unchanged_facts": [],
   "evidence_refs": [],
   "domain": "",
   "protocols": [],
@@ -170,7 +192,16 @@ Minimum proposed schema:
   "coverage": {
     "coverage_intent": "",
     "covered_requirements": [],
+    "reused_coverage": [],
+    "updated_coverage": [],
     "coverage_gaps": []
+  },
+  "version_impact": {
+    "is_reused_from_previous_version": false,
+    "requires_regeneration": false,
+    "requires_data_update": false,
+    "requires_execution": false,
+    "reason": ""
   },
   "run_history": [
     {
@@ -227,9 +258,11 @@ No evidence -> no generated scenario.
 No requirement link -> no coverage claim.
 ```
 
-## 9. Future Robot Framework Mapping
+## 9. Robot Framework Mapping
 
-Robot Framework should be added after pytest mock/simulator execution is stable.
+Robot mapping files can be generated today with `ROBOT_GENERATION_ENABLED=true`.
+Robot execution and reusable keyword libraries should be added after pytest
+mock/simulator execution is stable.
 
 Future mapping:
 

@@ -17,6 +17,7 @@ from multi_agentic_rag.ingestion import ingest_document
 from multi_agentic_rag.models import DocumentStatus, TaskResult, TestExecutionResult
 from multi_agentic_rag.retrieval import answer_query
 from multi_agentic_rag.storage.neo4j_store import Neo4jGraphStore
+from multi_agentic_rag.storage.cleanup import clean_system_state
 from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
 from multi_agentic_rag.storage.vector_factory import select_vector_store
 from multi_agentic_rag.tasks import handle_task
@@ -74,10 +75,29 @@ def doctor(
         bool,
         typer.Option("--strict", help="Treat WARN checks as command failures."),
     ] = False,
+    target_graphrag: Annotated[
+        bool,
+        typer.Option(
+            "--target-graphrag",
+            help="Run strict Option-4 GraphRAG target checks.",
+        ),
+    ] = False,
+    system: Annotated[
+        str | None,
+        typer.Option("--system", help="System name for target graph-population checks."),
+    ] = None,
+    version: Annotated[
+        str | None,
+        typer.Option("--version", help="Version for target graph-population checks."),
+    ] = None,
 ) -> None:
     """Validate local environment and optional services."""
 
-    checks = run_diagnostics()
+    checks = run_diagnostics(
+        target_graphrag=target_graphrag,
+        system_name=system,
+        version=version,
+    )
     _print_checks(checks)
     failure_statuses = {"FAIL", "WARN"} if strict else {"FAIL"}
     if any(check.status in failure_statuses for check in checks):
@@ -358,6 +378,14 @@ def generate_tests(
     version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
     count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
     force: Annotated[bool, typer.Option("--force", help="Rewrite generated file.")] = False,
+    mock: Annotated[
+        bool,
+        typer.Option("--mock", help="Generate explicit mock-device tests with no real connection."),
+    ] = False,
+    execution_mode: Annotated[
+        str | None,
+        typer.Option("--execution-mode", help="Execution mode: mock, simulator, real, or auto."),
+    ] = None,
 ) -> None:
     """Generate or reuse a pytest testcase file from coverage evidence."""
 
@@ -366,6 +394,7 @@ def generate_tests(
         version=version,
         scenario_count=count,
         force=force,
+        execution_mode=_resolve_execution_mode(mock=mock, execution_mode=execution_mode),
     )
     console.print(f"{result.action}: {result.message}")
     if result.test_file:
@@ -379,6 +408,18 @@ def run_testcases_command(
     system: Annotated[str, typer.Option("--system", help="System name.")],
     version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
     count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
+    force_run_all: Annotated[
+        bool,
+        typer.Option("--force-run-all", help="Execute unchanged scenarios instead of skipping them."),
+    ] = False,
+    mock: Annotated[
+        bool,
+        typer.Option("--mock", help="Run generated testcases in explicit mock-device mode."),
+    ] = False,
+    execution_mode: Annotated[
+        str | None,
+        typer.Option("--execution-mode", help="Execution mode: mock, simulator, real, or auto."),
+    ] = None,
 ) -> None:
     """Run the generated pytest testcase file and store results."""
 
@@ -386,6 +427,8 @@ def run_testcases_command(
         system_name=system,
         version=version,
         scenario_count=count,
+        force_run_all=force_run_all,
+        execution_mode=_resolve_execution_mode(mock=mock, execution_mode=execution_mode),
     )
     _print_test_execution(result)
     if not result.supported:
@@ -405,12 +448,67 @@ def last_results(
         raise typer.Exit(code=1)
 
 
+@app.command("clean-system-state")
+def clean_system_state_command(
+    system: Annotated[str, typer.Option("--system", help="System name to remove.")],
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Confirm deletion of this system's local runtime state."),
+    ] = False,
+    include_neo4j: Annotated[
+        bool,
+        typer.Option("--include-neo4j/--skip-neo4j", help="Delete matching Neo4j graph nodes."),
+    ] = True,
+    include_generated: Annotated[
+        bool,
+        typer.Option(
+            "--include-generated/--keep-generated",
+            help="Delete generated/<system>/ automation artifacts.",
+        ),
+    ] = True,
+) -> None:
+    """Remove one system from SQLite, Chroma, optional Neo4j, and generated artifacts."""
+
+    if not yes:
+        console.print(
+            "[yellow]Refusing to delete without --yes.[/yellow] "
+            "This command removes local runtime state for exactly one system."
+        )
+        raise typer.Exit(code=1)
+    result = clean_system_state(
+        system,
+        include_neo4j=include_neo4j,
+        include_generated=include_generated,
+    )
+    table = Table(title=f"Cleaned System State: {result.system_name}")
+    table.add_column("Store")
+    table.add_column("Deleted")
+    for table_name, count in result.sqlite_deleted.items():
+        table.add_row(f"sqlite:{table_name}", str(count))
+    table.add_row("chroma", "" if result.chroma_deleted is None else str(result.chroma_deleted))
+    table.add_row("neo4j", "" if result.neo4j_deleted is None else str(result.neo4j_deleted))
+    table.add_row("files", str(len(result.files_deleted)))
+    console.print(table)
+    for path in result.files_deleted:
+        console.print(f"Deleted: {path}")
+    for warning in result.warnings:
+        console.print(f"[yellow]WARN[/yellow] {warning}")
+
+
 @app.command("task")
 def task(
     user_request: Annotated[str, typer.Argument(help="Natural-language MARAG task.")],
     system: Annotated[str, typer.Option("--system", help="System name.")],
     version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
     count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
+    mock: Annotated[
+        bool,
+        typer.Option("--mock", help="Route the task with explicit mock-device execution mode."),
+    ] = False,
+    execution_mode: Annotated[
+        str | None,
+        typer.Option("--execution-mode", help="Execution mode: mock, simulator, real, or auto."),
+    ] = None,
 ) -> None:
     """Route a natural-language request to query, coverage, writer, or runner agents."""
 
@@ -419,6 +517,7 @@ def task(
         system_name=system,
         version=version,
         scenario_count=count,
+        execution_mode=_resolve_execution_mode(mock=mock, execution_mode=execution_mode),
     )
     _print_task_result(result)
     if not result.supported:
@@ -532,6 +631,9 @@ def _print_test_execution(result: TestExecutionResult) -> None:
         table.add_row("passed", str(result.result.passed))
         table.add_row("failed", str(result.result.failed))
         table.add_row("skipped", str(result.result.skipped))
+        table.add_row("blocked", str(result.result.blocked))
+        table.add_row("xml_report_path", result.result.xml_report_path or "")
+        table.add_row("duration_seconds", f"{result.result.duration_seconds:.3f}")
         table.add_row("created_at", result.result.created_at)
         console.print(table)
     for warning in result.warnings:
@@ -555,8 +657,54 @@ def _print_task_result(result: TaskResult) -> None:
         console.print(f"Test file: {result.test_generation.test_file.file_path}")
     if result.test_execution:
         _print_test_execution(result.test_execution)
+    if result.automation:
+        artifacts = result.automation.generated_artifacts
+        if artifacts.pytest_files or artifacts.robot_files or artifacts.json_sidecars:
+            console.print("\nArtifacts:")
+        for path in artifacts.pytest_files:
+            console.print(f"- pytest file: {path}")
+        for path in artifacts.robot_files:
+            console.print(f"- robot file: {path}")
+        for path in artifacts.json_sidecars:
+            console.print(f"- json sidecar: {path}")
+        for path in artifacts.xml_reports:
+            console.print(f"- pytest xml: {path}")
+        for path in artifacts.coverage_reports:
+            console.print(f"- coverage report: {path}")
+        summary = result.automation.execution_summary
+        if any(
+            [
+                summary.executed,
+                summary.passed,
+                summary.failed,
+                summary.skipped,
+                summary.blocked,
+                summary.skipped_unchanged,
+                summary.reused_from_previous_version,
+            ]
+        ):
+            console.print("\nExecution:")
+            console.print(f"- executed: {summary.executed}")
+            console.print(f"- reused from previous version: {summary.reused_from_previous_version}")
+            console.print(f"- skipped unchanged: {summary.skipped_unchanged}")
+            console.print(f"- blocked: {summary.blocked}")
+            console.print(f"- failed: {summary.failed}")
+            console.print(f"- passed: {summary.passed}")
+        console.print(f"\nDatabase: {result.automation.db_update_status}")
     for warning in result.warnings:
         console.print(f"[yellow]WARN[/yellow] {warning}")
+
+
+def _resolve_execution_mode(*, mock: bool, execution_mode: str | None) -> str | None:
+    if mock:
+        return "mock"
+    if execution_mode is None:
+        return None
+    mode = execution_mode.strip().lower()
+    if mode not in {"mock", "simulator", "real", "auto"}:
+        console.print("[red]Invalid execution mode.[/red] Use mock, simulator, real, or auto.")
+        raise typer.Exit(code=1)
+    return mode
 
 
 if __name__ == "__main__":

@@ -111,6 +111,7 @@ class SQLiteRegistry:
                     status TEXT NOT NULL,
                     evidence TEXT NOT NULL,
                     requirement_id TEXT,
+                    semantic_key TEXT,
                     metadata_json TEXT NOT NULL
                 );
 
@@ -153,6 +154,12 @@ class SQLiteRegistry:
                     document_id TEXT,
                     version TEXT,
                     chunk_id TEXT,
+                    fact_id TEXT,
+                    semantic_key TEXT,
+                    impact_status TEXT DEFAULT 'new_required',
+                    lifecycle_status TEXT DEFAULT 'active',
+                    previous_coverage_id TEXT,
+                    superseded_by TEXT,
                     scenario_index INTEGER,
                     source_hash TEXT
                 );
@@ -185,6 +192,9 @@ class SQLiteRegistry:
                     scope_hash TEXT NOT NULL,
                     file_path TEXT NOT NULL,
                     tracking_file_path TEXT,
+                    robot_file_path TEXT,
+                    coverage_report_path TEXT,
+                    report_file_paths_json TEXT NOT NULL DEFAULT '[]',
                     harness_file_paths_json TEXT NOT NULL DEFAULT '[]',
                     status TEXT NOT NULL,
                     coverage_ids_json TEXT NOT NULL,
@@ -207,9 +217,13 @@ class SQLiteRegistry:
                     passed INTEGER NOT NULL,
                     failed INTEGER NOT NULL,
                     skipped INTEGER NOT NULL,
+                    blocked INTEGER NOT NULL DEFAULT 0,
                     failure_category TEXT,
                     failure_reason TEXT,
                     dependency_blockers_json TEXT NOT NULL,
+                    execution_scope TEXT NOT NULL DEFAULT 'all',
+                    xml_report_path TEXT,
+                    duration_seconds REAL NOT NULL DEFAULT 0,
                     output TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
@@ -219,16 +233,31 @@ class SQLiteRegistry:
                 """
             )
             self._create_keyword_index(connection)
+            self._ensure_column(connection, "facts", "semantic_key", "TEXT")
             self._ensure_column(connection, "deltas", "fact_key", "TEXT")
             for column_name, column_type in (
                 ("document_id", "TEXT"),
                 ("version", "TEXT"),
                 ("chunk_id", "TEXT"),
+                ("fact_id", "TEXT"),
+                ("semantic_key", "TEXT"),
+                ("impact_status", "TEXT DEFAULT 'new_required'"),
+                ("lifecycle_status", "TEXT DEFAULT 'active'"),
+                ("previous_coverage_id", "TEXT"),
+                ("superseded_by", "TEXT"),
                 ("scenario_index", "INTEGER"),
                 ("source_hash", "TEXT"),
             ):
                 self._ensure_column(connection, "coverage", column_name, column_type)
             self._ensure_column(connection, "generated_test_files", "tracking_file_path", "TEXT")
+            self._ensure_column(connection, "generated_test_files", "robot_file_path", "TEXT")
+            self._ensure_column(connection, "generated_test_files", "coverage_report_path", "TEXT")
+            self._ensure_column(
+                connection,
+                "generated_test_files",
+                "report_file_paths_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
             self._ensure_column(
                 connection,
                 "generated_test_files",
@@ -237,6 +266,25 @@ class SQLiteRegistry:
             )
             self._ensure_column(connection, "test_run_results", "failure_category", "TEXT")
             self._ensure_column(connection, "test_run_results", "failure_reason", "TEXT")
+            self._ensure_column(
+                connection,
+                "test_run_results",
+                "blocked",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                connection,
+                "test_run_results",
+                "execution_scope",
+                "TEXT NOT NULL DEFAULT 'all'",
+            )
+            self._ensure_column(connection, "test_run_results", "xml_report_path", "TEXT")
+            self._ensure_column(
+                connection,
+                "test_run_results",
+                "duration_seconds",
+                "REAL NOT NULL DEFAULT 0",
+            )
 
     def upsert_document(self, document: DocumentRecord) -> None:
         payload = document.model_dump(mode="json")
@@ -472,11 +520,13 @@ class SQLiteRegistry:
                 """
                 INSERT INTO facts (
                     fact_id, fact_key, fact_type, value, unit, document_id, chunk_id,
-                    system_name, version, status, evidence, requirement_id, metadata_json
+                    system_name, version, status, evidence, requirement_id, semantic_key,
+                    metadata_json
                 )
                 VALUES (
                     :fact_id, :fact_key, :fact_type, :value, :unit, :document_id, :chunk_id,
-                    :system_name, :version, :status, :evidence, :requirement_id, :metadata_json
+                    :system_name, :version, :status, :evidence, :requirement_id, :semantic_key,
+                    :metadata_json
                 )
                 ON CONFLICT(fact_id) DO UPDATE SET
                     fact_key=excluded.fact_key,
@@ -490,6 +540,7 @@ class SQLiteRegistry:
                     status=excluded.status,
                     evidence=excluded.evidence,
                     requirement_id=excluded.requirement_id,
+                    semantic_key=excluded.semantic_key,
                     metadata_json=excluded.metadata_json
                 """,
                 rows,
@@ -606,12 +657,16 @@ class SQLiteRegistry:
                 INSERT INTO coverage (
                     coverage_id, requirement_id, use_case, test_scenario,
                     automation_feasibility, priority, coverage_status, evidence_json,
-                    document_id, version, chunk_id, scenario_index, source_hash
+                    document_id, version, chunk_id, fact_id, semantic_key, impact_status,
+                    lifecycle_status, previous_coverage_id, superseded_by, scenario_index,
+                    source_hash
                 )
                 VALUES (
                     :coverage_id, :requirement_id, :use_case, :test_scenario,
                     :automation_feasibility, :priority, :coverage_status, :evidence_json,
-                    :document_id, :version, :chunk_id, :scenario_index, :source_hash
+                    :document_id, :version, :chunk_id, :fact_id, :semantic_key, :impact_status,
+                    :lifecycle_status, :previous_coverage_id, :superseded_by, :scenario_index,
+                    :source_hash
                 )
                 ON CONFLICT(coverage_id) DO UPDATE SET
                     requirement_id=excluded.requirement_id,
@@ -624,6 +679,12 @@ class SQLiteRegistry:
                     document_id=excluded.document_id,
                     version=excluded.version,
                     chunk_id=excluded.chunk_id,
+                    fact_id=excluded.fact_id,
+                    semantic_key=excluded.semantic_key,
+                    impact_status=excluded.impact_status,
+                    lifecycle_status=excluded.lifecycle_status,
+                    previous_coverage_id=excluded.previous_coverage_id,
+                    superseded_by=excluded.superseded_by,
                     scenario_index=excluded.scenario_index,
                     source_hash=excluded.source_hash
                 """,
@@ -711,6 +772,10 @@ class SQLiteRegistry:
     def upsert_generated_test_file(self, record: GeneratedTestFileRecord) -> None:
         payload = record.model_dump(mode="json")
         payload["coverage_ids_json"] = json.dumps(payload.pop("coverage_ids"), sort_keys=True)
+        payload["report_file_paths_json"] = json.dumps(
+            payload.pop("report_file_paths"),
+            sort_keys=True,
+        )
         payload["harness_file_paths_json"] = json.dumps(
             payload.pop("harness_file_paths"),
             sort_keys=True,
@@ -720,12 +785,14 @@ class SQLiteRegistry:
                 """
                 INSERT INTO generated_test_files (
                     test_file_id, run_id, system_name, version, scope_hash, file_path,
-                    tracking_file_path, harness_file_paths_json, status, coverage_ids_json,
+                    tracking_file_path, robot_file_path, coverage_report_path,
+                    report_file_paths_json, harness_file_paths_json, status, coverage_ids_json,
                     created_at, updated_at
                 )
                 VALUES (
                     :test_file_id, :run_id, :system_name, :version, :scope_hash, :file_path,
-                    :tracking_file_path, :harness_file_paths_json, :status,
+                    :tracking_file_path, :robot_file_path, :coverage_report_path,
+                    :report_file_paths_json, :harness_file_paths_json, :status,
                     :coverage_ids_json, :created_at, :updated_at
                 )
                 ON CONFLICT(test_file_id) DO UPDATE SET
@@ -735,6 +802,9 @@ class SQLiteRegistry:
                     scope_hash=excluded.scope_hash,
                     file_path=excluded.file_path,
                     tracking_file_path=excluded.tracking_file_path,
+                    robot_file_path=excluded.robot_file_path,
+                    coverage_report_path=excluded.coverage_report_path,
+                    report_file_paths_json=excluded.report_file_paths_json,
                     harness_file_paths_json=excluded.harness_file_paths_json,
                     status=excluded.status,
                     coverage_ids_json=excluded.coverage_ids_json,
@@ -785,13 +855,15 @@ class SQLiteRegistry:
                 INSERT INTO test_run_results (
                     result_id, test_file_id, run_id, system_name, version, file_path,
                     status, exit_code, passed, failed, skipped,
-                    failure_category, failure_reason, dependency_blockers_json,
+                    blocked, failure_category, failure_reason, dependency_blockers_json,
+                    execution_scope, xml_report_path, duration_seconds,
                     output, created_at
                 )
                 VALUES (
                     :result_id, :test_file_id, :run_id, :system_name, :version, :file_path,
                     :status, :exit_code, :passed, :failed, :skipped,
-                    :failure_category, :failure_reason, :dependency_blockers_json,
+                    :blocked, :failure_category, :failure_reason, :dependency_blockers_json,
+                    :execution_scope, :xml_report_path, :duration_seconds,
                     :output, :created_at
                 )
                 ON CONFLICT(result_id) DO UPDATE SET
@@ -800,9 +872,13 @@ class SQLiteRegistry:
                     passed=excluded.passed,
                     failed=excluded.failed,
                     skipped=excluded.skipped,
+                    blocked=excluded.blocked,
                     failure_category=excluded.failure_category,
                     failure_reason=excluded.failure_reason,
                     dependency_blockers_json=excluded.dependency_blockers_json,
+                    execution_scope=excluded.execution_scope,
+                    xml_report_path=excluded.xml_report_path,
+                    duration_seconds=excluded.duration_seconds,
                     output=excluded.output
                 """,
                 payload,
@@ -939,6 +1015,8 @@ class SQLiteRegistry:
     def _coverage_from_row(row: sqlite3.Row) -> CoverageRecord:
         payload = dict(row)
         payload["evidence"] = json.loads(payload.pop("evidence_json") or "[]")
+        payload["impact_status"] = payload.get("impact_status") or "new_required"
+        payload["lifecycle_status"] = payload.get("lifecycle_status") or "active"
         return CoverageRecord(**payload)
 
     @staticmethod
@@ -951,6 +1029,9 @@ class SQLiteRegistry:
     def _generated_test_file_from_row(row: sqlite3.Row) -> GeneratedTestFileRecord:
         payload = dict(row)
         payload["coverage_ids"] = json.loads(payload.pop("coverage_ids_json") or "[]")
+        payload["report_file_paths"] = json.loads(
+            payload.pop("report_file_paths_json", "[]") or "[]"
+        )
         payload["harness_file_paths"] = json.loads(
             payload.pop("harness_file_paths_json", "[]") or "[]"
         )
@@ -962,4 +1043,7 @@ class SQLiteRegistry:
         payload["dependency_blockers"] = json.loads(
             payload.pop("dependency_blockers_json") or "[]"
         )
+        payload["blocked"] = payload.get("blocked") or 0
+        payload["execution_scope"] = payload.get("execution_scope") or "all"
+        payload["duration_seconds"] = payload.get("duration_seconds") or 0.0
         return TestRunResultRecord(**payload)

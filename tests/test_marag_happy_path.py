@@ -1,10 +1,13 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from docx import Document
 
+from multi_agentic_rag.agents.workflows import compile_basic_workflow
 from multi_agentic_rag.config import Settings
 from multi_agentic_rag.coverage import plan_requirement_coverage
+import multi_agentic_rag.coverage.planner as coverage_planner
 from multi_agentic_rag.exceptions import IngestionError
 from multi_agentic_rag.ingestion import ingest_document
 from multi_agentic_rag.ingestion.parser import load_docx_pages
@@ -108,6 +111,51 @@ def test_coverage_plan_supports_brd_area_requirement_ids(tmp_path: Path) -> None
     assert all(record.evidence for record in result.records)
 
 
+def test_coverage_plan_prefers_neo4j_graph_requirement_selection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = _settings(tmp_path)
+    source = _write_brd_style_docx(tmp_path / "PROJECT_1_BRD_STYLE.docx")
+    ingest_document(source, system_name="PROJECT_1", version="v1", settings=settings)
+
+    registry = SQLiteRegistry(settings.sqlite_db_path)
+    registry.initialize()
+    requirement_facts = registry.list_facts(system_name="PROJECT_1", version="v1")
+    selected_fact = next(
+        fact for fact in requirement_facts if fact.fact_key == "requirement:BR-SEN-001"
+    )
+
+    class FakeGraphRetriever:
+        def __init__(self, settings: Settings) -> None:
+            self.settings = settings
+
+        def get_facts_by_version(self, system_name: str, version: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                records=[
+                    {
+                        "fact_id": selected_fact.fact_id,
+                        "fact_type": "requirement",
+                    }
+                ],
+                warning=None,
+            )
+
+    monkeypatch.setattr(coverage_planner, "GraphRetriever", FakeGraphRetriever)
+
+    result = coverage_planner.plan_requirement_coverage(
+        system_name="PROJECT_1",
+        version="v1",
+        scenario_count=3,
+        settings=settings,
+    )
+
+    assert result.supported
+    assert "Neo4j graph-backed requirement evidence" in result.message
+    assert {record.requirement_id for record in result.records} == {"BR-SEN-001"}
+    assert {record.fact_id for record in result.records} == {selected_fact.fact_id}
+
+
 def test_coverage_plan_blocks_when_documents_have_no_requirement_links(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     source = _write_unlinked_docx(tmp_path / "PROJECT_1_NOT_REQUIREMENTS.docx")
@@ -155,6 +203,9 @@ def test_generated_pytest_file_executes_and_last_result_is_stored(tmp_path: Path
     assert generated_file.parent.parent.name == "project_1"
     assert tracking_file.exists()
     assert "class TestProject1V1Automation" in generated_file.read_text(encoding="utf-8")
+    assert "def define_test(self" in generated_file.read_text(encoding="utf-8")
+    assert generation.test_file.robot_file_path is not None
+    assert Path(generation.test_file.robot_file_path).exists()
     assert execution.supported
     assert execution.result is not None
     assert execution.result.status == "blocked"
@@ -163,8 +214,17 @@ def test_generated_pytest_file_executes_and_last_result_is_stored(tmp_path: Path
     assert execution.result.failure_category == "PROTOCOL_UNAVAILABLE"
     assert execution.result.dependency_blockers
     tracking = json.loads(tracking_file.read_text(encoding="utf-8"))
-    assert tracking["schema_version"] == "test-automation-tracking.v2"
+    assert tracking["schema_version"] == "test-automation-tracking.v4"
     assert tracking["mode"] == "dependency_aware_generation"
+    assert tracking["generated_robot_file"]
+    assert tracking["mock_mode"] is False
+    assert tracking["protocol_adapters"]
+    assert tracking["robot_keyword_mapping"]
+    assert tracking["handoff_summaries"]
+    assert tracking["generated_xml_report"]
+    assert tracking["coverage_report"]
+    assert tracking["facts_used"]
+    assert tracking["coverage"]["updated_coverage"]
     assert tracking["dependency_audit"]["status"] == "blocked"
     assert tracking["dependency_audit"]["missing_dependencies"]
     assert tracking["protocols"] == ["REST"]
@@ -197,12 +257,40 @@ def test_generated_pytest_file_can_execute_in_explicit_mock_mode(tmp_path: Path)
     assert execution.result.status == "passed"
     assert execution.result.passed == 2
     tracking = json.loads(Path(execution.tracking_file_path or "").read_text(encoding="utf-8"))
+    assert tracking["schema_version"] == "test-automation-tracking.v4"
     assert tracking["dependency_audit"]["status"] == "ready"
+    assert tracking["dependency_audit"]["mock_mode"] is True
+    assert tracking["mock_mode"] is True
+    assert tracking["mock_warning"]
+    assert tracking["generated_robot_file"]
     assert all(
         scenario["execution_mode"] == "mock"
         for scenario in tracking["selected_scenarios"]
-        if scenario["protocols"]
     )
+    assert all(scenario["mock_device_config"] for scenario in tracking["selected_scenarios"])
+
+
+def test_generated_pytest_execution_mode_override_enables_mock_flow(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    source = _write_docx(tmp_path / "PROJECT_1_BRD_V1.docx")
+    output_dir = tmp_path / "generated"
+    ingest_document(source, system_name="PROJECT_1", version="v1", settings=settings)
+
+    execution = run_testcases(
+        system_name="PROJECT_1",
+        version="v1",
+        scenario_count=2,
+        output_dir=output_dir,
+        settings=settings,
+        execution_mode="mock",
+    )
+
+    assert execution.supported
+    assert execution.result is not None
+    assert execution.result.status == "passed"
+    tracking = json.loads(Path(execution.tracking_file_path or "").read_text(encoding="utf-8"))
+    assert tracking["mock_mode"] is True
+    assert {scenario["execution_mode"] for scenario in tracking["selected_scenarios"]} == {"mock"}
 
 
 def test_generate_testcases_rewrites_when_requested_count_changes(tmp_path: Path) -> None:
@@ -300,6 +388,44 @@ def test_task_router_uses_writer_runner_and_last_result_paths(tmp_path: Path) ->
     assert run_result.supported
     assert last_result.intent == "last_result"
     assert last_result.last_result is not None
+
+
+def test_fine_grained_langgraph_workflow_records_agent_handoffs(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    source = _write_docx(tmp_path / "PROJECT_1_BRD_V1.docx")
+    output_dir = tmp_path / "generated"
+    ingest_document(source, system_name="PROJECT_1", version="v1", settings=settings)
+
+    result_state = compile_basic_workflow().invoke(
+        {
+            "user_query": "Generate 2 testcases in mock mode",
+            "system_name": "PROJECT_1",
+            "version": "v1",
+            "scenario_count": 2,
+            "output_dir": str(output_dir),
+            "_settings": settings,
+        }
+    )
+
+    nodes = {entry["node"] for entry in result_state["workflow_trace"]}
+    assert {
+        "IntentRouterAgent",
+        "DocumentResolverAgent",
+        "VersionDeltaAgent",
+        "ScenarioSelectionAgent",
+        "DependencyAuditAgent",
+        "TestHarnessAgent",
+        "TestWriterAgent",
+        "RobotMappingAgent",
+        "SyntaxValidationAgent",
+        "JsonSidecarAgent",
+        "DatabaseUpdateAgent",
+        "ReportGeneratorAgent",
+        "FinalRouterValidationAgent",
+    } <= nodes
+    assert result_state["final_validation"]["status"] == "passed"
+    assert result_state["handoff_summaries"]
+    assert result_state["task_result"]["supported"] is True
 
 
 def _write_docx(path: Path) -> Path:

@@ -9,6 +9,7 @@ from multi_agentic_rag.config import Settings, get_settings
 from multi_agentic_rag.delta import compute_fact_deltas
 from multi_agentic_rag.exceptions import IngestionError
 from multi_agentic_rag.extraction import extract_facts_from_chunk
+from multi_agentic_rag.llm import ExtractionFallbackResult, LLMClient, select_llm_client
 from multi_agentic_rag.graph.builder import build_basic_graph
 from multi_agentic_rag.ingestion.chunker import chunk_pages
 from multi_agentic_rag.ingestion.metadata import create_document_record
@@ -25,7 +26,7 @@ from multi_agentic_rag.storage.neo4j_store import Neo4jGraphStore
 from multi_agentic_rag.storage.object_store import LocalObjectStore
 from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
 from multi_agentic_rag.storage.vector_factory import select_vector_store
-from multi_agentic_rag.utils.hashing import sha256_file
+from multi_agentic_rag.utils.hashing import sha256_file, stable_id
 from multi_agentic_rag.utils.paths import ensure_runtime_dirs, resolve_path
 
 
@@ -100,7 +101,8 @@ def ingest_document(
     )
     chunks = chunk_pages(pages, document=document)
     chunk_manifest_path = object_store.store_chunks(document, chunks)
-    facts = _extract_facts(chunks)
+    warnings: list[str] = []
+    facts = _extract_facts(chunks, settings=settings, warnings=warnings)
 
     old_facts: list[FactRecord] = []
     deltas: list[DeltaRecord] = []
@@ -165,7 +167,6 @@ def ingest_document(
                 superseded_chunks.extend(registry.list_chunks(document_id=active.document_id))
                 superseded_facts.extend(registry.list_facts(document_id=active.document_id))
 
-    warnings: list[str] = []
     vector_provider = _index_vectors(settings, chunks + superseded_chunks, warnings)
     neo4j_available = _build_graph_if_available(
         settings=settings,
@@ -225,11 +226,86 @@ def _normalize_version_label(version: str) -> str:
     return version.lower()
 
 
-def _extract_facts(chunks: list[ChunkRecord]) -> list[FactRecord]:
+def _extract_facts(
+    chunks: list[ChunkRecord],
+    *,
+    settings: Settings,
+    warnings: list[str],
+) -> list[FactRecord]:
     facts: list[FactRecord] = []
+    llm_client: LLMClient | None = None
+    if settings.llm_provider != "none":
+        candidate = select_llm_client(settings)
+        ready, message = candidate.check_ready()
+        if ready:
+            llm_client = candidate
+        else:
+            warnings.append(f"LLM fallback extraction disabled: {message}")
     for chunk in chunks:
-        facts.extend(extract_facts_from_chunk(chunk))
+        deterministic_facts = extract_facts_from_chunk(chunk)
+        facts.extend(deterministic_facts)
+        if not deterministic_facts and llm_client:
+            facts.extend(_extract_facts_with_llm_fallback(chunk, llm_client, warnings))
     return facts
+
+
+def _extract_facts_with_llm_fallback(
+    chunk: ChunkRecord,
+    llm_client: LLMClient,
+    warnings: list[str],
+) -> list[FactRecord]:
+    instructions = (
+        "Extract only explicit engineering facts from the provided BRD/SRS chunk. "
+        "Every fact evidence field must be a verbatim substring from the chunk. "
+        "Return no fact when evidence is ambiguous."
+    )
+    try:
+        result = llm_client.parse(
+            instructions=instructions,
+            user_input=chunk.text[:6000],
+            schema=ExtractionFallbackResult,
+        )
+    except Exception as exc:
+        warnings.append(f"LLM fallback extraction skipped for {chunk.chunk_id}: {exc}")
+        return []
+    normalized_chunk = " ".join(chunk.text.split())
+    records: list[FactRecord] = []
+    for extracted in result.facts[:10]:
+        evidence = " ".join(extracted.evidence.split())
+        if not evidence or evidence not in normalized_chunk:
+            warnings.append(
+                f"LLM fallback fact rejected for {chunk.chunk_id}: evidence not in source chunk."
+            )
+            continue
+        fact_id = stable_id(
+            "fact",
+            chunk.document_id,
+            chunk.chunk_id,
+            extracted.fact_key,
+            extracted.value,
+            extracted.unit,
+        )
+        records.append(
+            FactRecord(
+                fact_id=fact_id,
+                fact_key=extracted.fact_key,
+                fact_type=extracted.fact_type,
+                value=extracted.value,
+                unit=extracted.unit,
+                document_id=chunk.document_id,
+                chunk_id=chunk.chunk_id,
+                system_name=chunk.system_name,
+                version=chunk.version,
+                status=chunk.status,
+                evidence=evidence,
+                requirement_id=extracted.requirement_id,
+                semantic_key=extracted.fact_key,
+                metadata={"extractor": "llm_fallback"},
+            )
+        )
+    for warning in result.warnings:
+        warnings.append(f"LLM fallback extraction warning for {chunk.chunk_id}: {warning}")
+    return records
 
 
 def _index_vectors(settings: Settings, chunks: list[ChunkRecord], warnings: list[str]) -> str:

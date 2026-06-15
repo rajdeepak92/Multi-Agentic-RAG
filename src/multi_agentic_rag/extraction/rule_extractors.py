@@ -112,6 +112,7 @@ def extract_facts_from_chunk(chunk: ChunkRecord) -> list[FactRecord]:
                 status=chunk.status,
                 evidence=extracted.evidence,
                 requirement_id=extracted.requirement_id,
+                semantic_key=extracted.fact_key,
                 metadata=extracted.metadata,
             )
         )

@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from time import perf_counter
 
 from multi_agentic_rag.config import Settings, get_settings
 from multi_agentic_rag.coverage import DEFAULT_SCENARIO_COUNT
@@ -33,6 +34,8 @@ def run_testcases(
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
     settings: Settings | None = None,
     max_attempts: int = MAX_DEBUG_RETRIES,
+    force_run_all: bool = False,
+    execution_mode: str | None = None,
 ) -> TestExecutionResult:
     """Run tracked generated pytest artifacts, creating them first if needed."""
 
@@ -43,9 +46,11 @@ def run_testcases(
         system_name=system_name,
         version=version,
         scenario_count=scenario_count,
-        force=False,
+        force=force_run_all,
+        force_run_all=force_run_all,
         output_dir=output_dir,
         settings=settings,
+        execution_mode=execution_mode,
     )
     if not generation.supported or not generation.test_file:
         return TestExecutionResult(
@@ -131,13 +136,20 @@ def run_testcases(
                     version=version,
                     scenario_count=scenario_count,
                     force=True,
+                    force_run_all=force_run_all,
                     output_dir=output_dir,
                     settings=settings,
+                    execution_mode=execution_mode,
                 )
                 continue
             break
 
-        process = _run_pytest_file(file_path)
+        reports_dir = file_path.parent / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        xml_report_path = reports_dir / f"run_{_timestamp_slug()}.xml"
+        started = perf_counter()
+        process = _run_pytest_file(file_path, xml_report_path=xml_report_path)
+        duration_seconds = perf_counter() - started
         output = "\n".join(part for part in [process.stdout, process.stderr] if part).strip()
         blockers = _dependency_blockers(output)
         passed, failed, skipped = _parse_pytest_counts(output)
@@ -167,12 +179,20 @@ def run_testcases(
             passed=passed,
             failed=failed,
             skipped=skipped,
+            blocked=len(blockers) or (skipped if status == "blocked" else 0),
             failure_category=failure_category,
             failure_reason=failure_reason,
             dependency_blockers=blockers,
+            xml_report_path=str(xml_report_path) if xml_report_path.exists() else None,
+            duration_seconds=duration_seconds,
             output=output[-8000:],
             created_at=_utc_now(),
         )
+        if final_result.xml_report_path and final_result.xml_report_path not in (
+            generation.test_file.report_file_paths
+        ):
+            generation.test_file.report_file_paths.append(final_result.xml_report_path)
+            registry.upsert_generated_test_file(generation.test_file)
         registry.insert_test_run_result(final_result)
         graph_warning = index_test_run_graph(
             settings=settings,
@@ -200,8 +220,10 @@ def run_testcases(
             version=version,
             scenario_count=scenario_count,
             force=True,
+            force_run_all=force_run_all,
             output_dir=output_dir,
             settings=settings,
+            execution_mode=execution_mode,
         )
 
     if final_result is None:
@@ -265,9 +287,15 @@ def get_last_test_result(
     )
 
 
-def _run_pytest_file(file_path: Path) -> subprocess.CompletedProcess[str]:
+def _run_pytest_file(file_path: Path, *, xml_report_path: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "pytest", file_path.name],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            file_path.name,
+            f"--junitxml={xml_report_path}",
+        ],
         cwd=str(file_path.parent),
         capture_output=True,
         text=True,
@@ -304,6 +332,7 @@ def _blocked_result(
         passed=0,
         failed=0,
         skipped=0,
+        blocked=1,
         failure_category="DEPENDENCY_MISSING",
         failure_reason=blocker,
         dependency_blockers=[blocker],
@@ -334,6 +363,7 @@ def _failed_result(
         passed=0,
         failed=1,
         skipped=0,
+        blocked=0,
         failure_category=failure_category,
         failure_reason=output,
         dependency_blockers=[],
@@ -450,7 +480,10 @@ def _record_tracking_run(
         "state": "executed",
         "timestamp": timestamp,
         "run_id": result.result_id,
-        "command": f"{sys.executable} -m pytest {Path(result.file_path).name}",
+        "command": (
+            f"{sys.executable} -m pytest {Path(result.file_path).name}"
+            + (f" --junitxml={result.xml_report_path}" if result.xml_report_path else "")
+        ),
         "status": status,
         "result_id": result.result_id,
         "attempt": attempt,
@@ -458,15 +491,20 @@ def _record_tracking_run(
         "passed": result.passed,
         "failed": result.failed,
         "skipped": result.skipped,
+        "blocked": result.blocked,
         "failure_category": result.failure_category,
         "dependency_blockers": result.dependency_blockers,
         "failure_reason": failure_reason,
         "fix_attempted": fix_attempted,
         "stdout_path": "",
         "stderr_path": "",
+        "xml_report_path": result.xml_report_path or "",
+        "duration_seconds": result.duration_seconds,
     }
     payload[f"run_{attempt}"] = run_payload
     payload.setdefault("run_history", []).append(run_payload)
+    if result.xml_report_path:
+        payload["generated_xml_report"] = result.xml_report_path
     payload["updated_at"] = timestamp
     payload["db_update_status"] = "test_run_result_record_written"
     for scenario in payload.get("scenarios", []):
@@ -484,9 +522,13 @@ def _record_tracking_run(
 def _execution_message(result: TestRunResultRecord) -> str:
     return (
         f"Test run {result.status}: {result.passed} passed, "
-        f"{result.failed} failed, {result.skipped} skipped."
+        f"{result.failed} failed, {result.skipped} skipped, {result.blocked} blocked."
     )
 
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _timestamp_slug() -> str:
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")

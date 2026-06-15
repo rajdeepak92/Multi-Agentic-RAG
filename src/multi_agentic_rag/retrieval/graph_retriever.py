@@ -45,6 +45,7 @@ class GraphRetriever:
                 c.page AS page,
                 f.fact_id AS fact_id,
                 f.fact_key AS fact_key,
+                f.semantic_key AS semantic_key,
                 f.fact_type AS fact_type,
                 f.value AS value,
                 f.unit AS unit,
@@ -70,6 +71,7 @@ class GraphRetriever:
                 c.page AS page,
                 f.fact_id AS fact_id,
                 f.fact_key AS fact_key,
+                f.semantic_key AS semantic_key,
                 f.fact_type AS fact_type,
                 f.value AS value,
                 f.unit AS unit,
@@ -77,6 +79,33 @@ class GraphRetriever:
             ORDER BY d.version, f.fact_key, f.fact_id
             """,
             system_name=system_name,
+        )
+
+    def get_facts_by_version(self, system_name: str, version: str) -> GraphRetrievalResult:
+        """Return graph facts for one explicit document version."""
+
+        return self._run(
+            """
+            MATCH (:System {system_name: $system_name})-[:HAS_DOCUMENT]->(d:Document {version: $version})
+            MATCH (d)-[:HAS_CHUNK]->(c:Chunk)-[:SUPPORTS_FACT]->(f:Fact)
+            RETURN
+                d.document_id AS document_id,
+                d.source_name AS source_name,
+                d.version AS version,
+                d.status AS status,
+                c.chunk_id AS chunk_id,
+                c.page AS page,
+                f.fact_id AS fact_id,
+                f.fact_key AS fact_key,
+                f.semantic_key AS semantic_key,
+                f.fact_type AS fact_type,
+                f.value AS value,
+                f.unit AS unit,
+                f.status AS fact_status
+            ORDER BY f.fact_key, f.fact_id
+            """,
+            system_name=system_name,
+            version=version,
         )
 
     def get_deltas(self, system_name: str) -> GraphRetrievalResult:
@@ -136,6 +165,9 @@ class GraphRetriever:
                 t.status AS generated_test_status,
                 c.coverage_id AS coverage_id,
                 c.requirement_id AS coverage_requirement_id,
+                c.semantic_key AS semantic_key,
+                c.impact_status AS impact_status,
+                c.lifecycle_status AS lifecycle_status,
                 r.requirement_id AS requirement_id,
                 chunk.chunk_id AS chunk_id,
                 run.result_id AS result_id,

@@ -25,6 +25,7 @@ class Settings(BaseSettings):
 
     multi_agentic_rag_home: Path = Field(default=Path(".multi_agentic_rag"))
     multi_agentic_rag_profile: str = Field(default="local")
+    marag_target_mode: Literal["local", "target-graphrag"] = Field(default="local")
 
     neo4j_uri: str | None = Field(default="bolt://localhost:7687")
     neo4j_username: str = Field(default="neo4j")
@@ -53,15 +54,17 @@ class Settings(BaseSettings):
 
     default_embedding_model: str = Field(default="BAAI/bge-m3")
     default_reranker_model: str = Field(default="BAAI/bge-reranker-v2-m3")
-    embedding_provider: Literal["hash", "huggingface"] = Field(default="huggingface")
+    embedding_provider: Literal["hash", "huggingface"] = Field(default="hash")
+    reranker_provider: Literal["none", "huggingface"] = Field(default="none")
     hash_embedding_dimensions: int = Field(default=384)
     graphrag_required: bool = Field(default=False)
 
     llm_provider: Literal["none", "openai", "azure_openai"] = Field(default="none")
-    default_llm_model: str = Field(default="gpt-5.5")
+    default_llm_model: str = Field(default="gpt-4.1-mini")
     azure_openai_endpoint: str | None = Field(default=None)
     azure_openai_api_key: str | None = Field(default=None)
     azure_openai_deployment: str | None = Field(default=None)
+    azure_openai_api_version: str = Field(default="2025-04-01-preview")
 
     enable_pdf_ocr: bool = Field(default=False)
     tesseract_cmd: str | None = Field(default=None)
@@ -70,10 +73,13 @@ class Settings(BaseSettings):
         default="auto"
     )
     simulator_config_path: Path | None = Field(default=None)
+    rest_simulator_enabled: bool = Field(default=False)
+    mqtt_simulator_enabled: bool = Field(default=False)
     modbus_host: str | None = Field(default=None)
     mqtt_broker_url: str | None = Field(default=None)
     can_interface: str | None = Field(default=None)
     rest_api_base_url: str | None = Field(default=None)
+    robot_generation_enabled: bool = Field(default=False)
 
     api_host: str = Field(default="127.0.0.1")
     api_port: int = Field(default=8000)

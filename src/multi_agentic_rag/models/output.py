@@ -96,6 +96,51 @@ class TestExecutionResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class GeneratedArtifacts(BaseModel):
+    """Artifact paths produced by an automation task."""
+
+    pytest_files: list[str] = Field(default_factory=list)
+    robot_files: list[str] = Field(default_factory=list)
+    json_sidecars: list[str] = Field(default_factory=list)
+    xml_reports: list[str] = Field(default_factory=list)
+    coverage_reports: list[str] = Field(default_factory=list)
+    reports: list[str] = Field(default_factory=list)
+
+
+class ExecutionSummary(BaseModel):
+    """Aggregated execution and reuse counts."""
+
+    executed: int = 0
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    blocked: int = 0
+    skipped_unchanged: int = 0
+    reused_from_previous_version: int = 0
+
+
+class AutomationTaskResult(BaseModel):
+    """Final router validation result for end-to-end QA automation requests."""
+
+    request_status: str = "unknown"
+    interpreted_intent: str = "unknown"
+    document_path: str | None = None
+    document_id: str | None = None
+    document_version: str | None = None
+    active_version: str | None = None
+    superseded_versions: list[str] = Field(default_factory=list)
+    generated_artifacts: GeneratedArtifacts = Field(default_factory=GeneratedArtifacts)
+    affected_tests: list[str] = Field(default_factory=list)
+    reused_tests: list[str] = Field(default_factory=list)
+    skipped_unchanged_tests: list[str] = Field(default_factory=list)
+    blocked_tests: list[str] = Field(default_factory=list)
+    failed_tests: list[str] = Field(default_factory=list)
+    execution_summary: ExecutionSummary = Field(default_factory=ExecutionSummary)
+    db_update_status: str = "unknown"
+    final_validation_status: str = "unknown"
+    failure_reason: str | None = None
+
+
 class TaskResult(BaseModel):
     """Natural-language task router result."""
 
@@ -107,4 +152,5 @@ class TaskResult(BaseModel):
     test_generation: TestGenerationResult | None = None
     test_execution: TestExecutionResult | None = None
     last_result: TestRunResultRecord | None = None
+    automation: AutomationTaskResult | None = None
     warnings: list[str] = Field(default_factory=list)

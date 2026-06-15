@@ -163,6 +163,19 @@ class ChromaVectorStore:
             )
         ]
 
+    def delete_system(self, system_name: str) -> int | None:
+        """Delete all vectors for one MARAG system from the local collection."""
+
+        collection = self._get_collection()
+        try:
+            existing = collection.get(where={"system_name": system_name}, include=[])
+            ids = existing.get("ids", [])
+            collection.delete(where={"system_name": system_name})
+            return len(ids)
+        except Exception:
+            collection.delete(where={"system_name": system_name})
+            return None
+
     def _metadata(self, chunk: ChunkRecord) -> dict[str, Any]:
         return {
             "document_id": chunk.document_id,

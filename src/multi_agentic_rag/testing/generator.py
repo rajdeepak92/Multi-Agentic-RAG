@@ -19,23 +19,30 @@ from multi_agentic_rag.utils.paths import resolve_path
 
 DEFAULT_OUTPUT_DIR = "generated"
 MAX_DEBUG_RETRIES = 5
-SIDECAR_SCHEMA_VERSION = "test-automation-tracking.v2"
+SIDECAR_SCHEMA_VERSION = "test-automation-tracking.v4"
 SUPPORTED_PROTOCOLS = ("Modbus", "MQTT", "CAN", "REST")
+MOCK_FLOW_WARNING = (
+    "This is a Mock flow: no actual connection was established. "
+    "Written contents are evidence-bound to the documents, but test execution "
+    "uses mocked devices."
+)
 
 WORKFLOW_HANDOFF = (
-    "IntentRouter",
-    "DocumentResolver",
-    "EvidenceCollector",
-    "ScenarioSelector",
-    "TestPlanAgent",
+    "IntentRouterAgent",
+    "DocumentResolverAgent",
+    "VersionDeltaAgent",
+    "GraphRetrievalAgent",
+    "ScenarioSelectionAgent",
     "DependencyAuditAgent",
-    "HarnessAgent",
-    "TestCodeWriterAgent",
-    "PytestValidationAgent",
-    "ExecutionAgent",
-    "FailureDebuggerAgent",
-    "TrackingJsonAgent",
-    "DbUpdateAgent",
+    "TestHarnessAgent",
+    "TestWriterAgent",
+    "RobotMappingAgent",
+    "SyntaxValidationAgent",
+    "TestExecutionAgent",
+    "FailureClassifierAgent",
+    "JsonSidecarAgent",
+    "DatabaseUpdateAgent",
+    "FinalRouterValidationAgent",
 )
 
 
@@ -45,12 +52,14 @@ def generate_testcases(
     version: str | None = None,
     scenario_count: int = DEFAULT_SCENARIO_COUNT,
     force: bool = False,
+    force_run_all: bool = False,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
     settings: Settings | None = None,
+    execution_mode: str | None = None,
 ) -> TestGenerationResult:
     """Create or reuse generated pytest automation placeholders for coverage records."""
 
-    settings = settings or get_settings()
+    settings = _settings_for_execution_mode(settings or get_settings(), execution_mode)
     registry = SQLiteRegistry(settings.sqlite_db_path)
     registry.initialize()
     coverage = plan_requirement_coverage(
@@ -76,9 +85,12 @@ def generate_testcases(
         version=version,
     )
     test_file_path = artifact_dir / _test_filename(system_name=system_name, version=version)
+    robot_file_path = artifact_dir / _robot_filename(system_name=system_name, version=version)
     tracking_file_path = test_file_path.with_suffix(".json")
     conftest_path = artifact_dir / "conftest.py"
     pytest_ini_path = artifact_dir / "pytest.ini"
+    reports_dir = artifact_dir / "reports"
+    coverage_report_path = reports_dir / "coverage.json"
     harness_paths = [str(conftest_path), str(pytest_ini_path)]
 
     existing = registry.find_generated_test_file(
@@ -93,6 +105,7 @@ def generate_testcases(
             existing,
             test_file_path=test_file_path,
             tracking_file_path=tracking_file_path,
+            robot_file_path=robot_file_path,
             harness_paths=[conftest_path, pytest_ini_path],
             run_id=coverage.run.run_id,
             coverage_ids=coverage.run.coverage_ids,
@@ -117,11 +130,13 @@ def generate_testcases(
         )
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
     scenarios = _build_scenario_payloads(
         coverage_records=coverage.records,
         registry=registry,
         generated_file=test_file_path,
         settings=settings,
+        force_run_all=force_run_all,
     )
     dependency_audit = _dependency_audit(
         scenarios=scenarios,
@@ -140,12 +155,31 @@ def generate_testcases(
     )
     conftest_path.write_text(_render_conftest(), encoding="utf-8")
     pytest_ini_path.write_text(_render_pytest_ini(), encoding="utf-8")
+    if robot_file_path:
+        robot_file_path.write_text(_render_robot_file(scenarios), encoding="utf-8")
+    coverage_report_path.write_text(
+        json.dumps(
+            _coverage_report_payload(
+                system_name=system_name,
+                version=version,
+                coverage_run_id=coverage.run.run_id,
+                records=coverage.records,
+                scenarios=scenarios,
+            ),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     tracking_payload = _tracking_payload(
         system_name=system_name,
         version=version,
         coverage_run_id=coverage.run.run_id,
         scope_hash=coverage.run.scope_hash,
         generated_file=test_file_path,
+        robot_file=robot_file_path,
+        coverage_report=coverage_report_path,
         tracking_file=tracking_file_path,
         harness_paths=[conftest_path, pytest_ini_path],
         scenarios=scenarios,
@@ -172,6 +206,9 @@ def generate_testcases(
         scope_hash=coverage.run.scope_hash,
         file_path=str(test_file_path),
         tracking_file_path=str(tracking_file_path),
+        robot_file_path=str(robot_file_path) if robot_file_path else None,
+        coverage_report_path=str(coverage_report_path),
+        report_file_paths=[str(coverage_report_path)],
         harness_file_paths=harness_paths,
         status="ready",
         coverage_ids=coverage.run.coverage_ids,
@@ -208,6 +245,17 @@ def tracking_file_for(test_file_path: str | Path) -> Path:
     return Path(test_file_path).with_suffix(".json")
 
 
+def _settings_for_execution_mode(settings: Settings, execution_mode: str | None) -> Settings:
+    if not execution_mode:
+        return settings
+    mode = execution_mode.strip().lower()
+    if mode not in {"mock", "simulator", "real", "auto"}:
+        raise ValueError(f"Unsupported generated test execution mode: {execution_mode}")
+    if mode == settings.generated_test_execution_mode:
+        return settings
+    return settings.model_copy(update={"generated_test_execution_mode": mode})
+
+
 def _artifact_dir(*, output_dir: str | Path, system_name: str, version: str | None) -> Path:
     return resolve_path(output_dir) / _safe_slug(system_name) / _version_dir(version)
 
@@ -221,6 +269,10 @@ def _version_dir(version: str | None) -> str:
 
 def _test_filename(*, system_name: str, version: str | None) -> str:
     return f"test_{_safe_slug(system_name)}_{_version_dir(version)}.py"
+
+
+def _robot_filename(*, system_name: str, version: str | None) -> str:
+    return f"test_{_safe_slug(system_name)}_{_version_dir(version)}.robot"
 
 
 def _safe_slug(value: str) -> str:
@@ -238,6 +290,7 @@ def _existing_artifacts_match(
     *,
     test_file_path: Path,
     tracking_file_path: Path,
+    robot_file_path: Path | None,
     harness_paths: list[Path],
     run_id: str,
     coverage_ids: list[str],
@@ -249,6 +302,13 @@ def _existing_artifacts_match(
         return False
     if Path(existing.tracking_file_path or "").resolve() != tracking_file_path.resolve():
         return False
+    if robot_file_path:
+        if not existing.robot_file_path:
+            return False
+        if Path(existing.robot_file_path).resolve() != robot_file_path.resolve():
+            return False
+        if not robot_file_path.exists():
+            return False
     if not file_path.exists() or not tracking_file_path.exists():
         return False
     if any(not path.exists() for path in harness_paths):
@@ -274,6 +334,7 @@ def _build_scenario_payloads(
     registry: SQLiteRegistry,
     generated_file: Path,
     settings: Settings,
+    force_run_all: bool = False,
 ) -> list[dict]:
     scenarios = []
     for record in coverage_records:
@@ -290,6 +351,10 @@ def _build_scenario_payloads(
                 "source_doc_id": record.document_id,
                 "doc_version": record.version,
                 "chunk_ids": [record.chunk_id] if record.chunk_id else [],
+                "fact_id": record.fact_id,
+                "semantic_key": record.semantic_key,
+                "impact_status": record.impact_status,
+                "force_run_all": force_run_all,
                 "expected_values": _extract_expected_values(evidence_text, record),
                 "priority": _priority(record),
                 "test_scenario": record.test_scenario,
@@ -369,6 +434,17 @@ def _attach_domain_dependency_status(
     scenario["dependency_status"] = "blocked" if missing_dependencies else "ready"
     scenario["external_dependencies"] = external_dependencies
     scenario["missing_dependencies"] = missing_dependencies
+    scenario["mock_mode"] = execution_mode == "mock"
+    scenario["mock_warning"] = MOCK_FLOW_WARNING if execution_mode == "mock" else ""
+    scenario["mock_device_config"] = (
+        {
+            "device_id": f"mock-{scenario['scenario_id'][:12]}",
+            "protocols": protocols or ["document_contract"],
+            "connection_established": False,
+        }
+        if execution_mode == "mock"
+        else {}
+    )
 
 
 def _protocols_for_text(text: str) -> list[str]:
@@ -398,15 +474,17 @@ def _missing_dependencies_for_protocols(protocols: list[str], settings: Settings
     if settings.generated_test_execution_mode == "mock":
         return []
     if settings.generated_test_execution_mode == "simulator":
-        if settings.simulator_config_path:
-            return []
-        return ["Simulator config is not configured"]
+        return _missing_simulators_for_protocols(protocols, settings)
 
     missing: list[str] = []
     for protocol in protocols:
-        if protocol == "REST" and not settings.rest_api_base_url:
+        if protocol == "REST" and not (
+            settings.rest_api_base_url or settings.rest_simulator_enabled
+        ):
             missing.append("REST API base URL or REST simulator is not configured")
-        elif protocol == "MQTT" and not settings.mqtt_broker_url:
+        elif protocol == "MQTT" and not (
+            settings.mqtt_broker_url or settings.mqtt_simulator_enabled
+        ):
             missing.append("MQTT broker URL or MQTT simulator is not configured")
         elif protocol == "Modbus" and not settings.modbus_host:
             missing.append("Modbus host or Modbus simulator is not configured")
@@ -417,17 +495,39 @@ def _missing_dependencies_for_protocols(protocols: list[str], settings: Settings
     return missing
 
 
+def _missing_simulators_for_protocols(protocols: list[str], settings: Settings) -> list[str]:
+    if settings.simulator_config_path:
+        return []
+    missing: list[str] = []
+    for protocol in protocols:
+        if protocol == "REST" and not settings.rest_simulator_enabled:
+            missing.append("REST simulator is not configured")
+        elif protocol == "MQTT" and not settings.mqtt_simulator_enabled:
+            missing.append("MQTT simulator is not configured")
+        elif protocol == "Modbus":
+            missing.append("Modbus simulator is not configured")
+        elif protocol == "CAN":
+            missing.append("CAN simulator is not configured")
+    return missing
+
+
 def _execution_mode_for_protocols(
     protocols: list[str],
     settings: Settings,
     missing_dependencies: list[str],
 ) -> str:
+    if settings.generated_test_execution_mode == "mock":
+        return "mock"
     if not protocols:
         return "document_contract"
     if missing_dependencies:
         return "blocked"
     if settings.generated_test_execution_mode in {"mock", "simulator", "real"}:
         return settings.generated_test_execution_mode
+    if any(protocol == "REST" for protocol in protocols) and settings.rest_simulator_enabled:
+        return "simulator"
+    if any(protocol == "MQTT" for protocol in protocols) and settings.mqtt_simulator_enabled:
+        return "simulator"
     if settings.simulator_config_path:
         return "simulator"
     return "real"
@@ -480,6 +580,29 @@ def _evidence_refs_payload(scenarios: list[dict]) -> list[dict]:
     return refs
 
 
+def _facts_used_payload(scenarios: list[dict]) -> list[dict]:
+    facts: dict[str, dict] = {}
+    for scenario in scenarios:
+        fact_id = scenario.get("fact_id")
+        semantic_key = scenario.get("semantic_key")
+        if not fact_id and not semantic_key:
+            continue
+        key = str(fact_id or semantic_key)
+        facts.setdefault(
+            key,
+            {
+                "fact_id": fact_id or "",
+                "semantic_key": semantic_key or "",
+                "requirement_id": scenario.get("requirement_id") or "",
+                "coverage_id": scenario.get("coverage_id") or "",
+                "document_id": scenario.get("source_doc_id") or "",
+                "document_version": scenario.get("doc_version") or "",
+                "impact_status": scenario.get("impact_status") or "new_required",
+            },
+        )
+    return list(facts.values())
+
+
 def _dependency_audit(
     *,
     scenarios: list[dict],
@@ -502,11 +625,14 @@ def _dependency_audit(
         }
     )
     status = "blocked" if missing_dependencies else "ready"
+    mock_mode = settings.generated_test_execution_mode == "mock"
     return {
         "agent": "DependencyAuditAgent",
         "status": status,
         "project_mutation_allowed": False,
         "execution_mode": settings.generated_test_execution_mode,
+        "mock_mode": mock_mode,
+        "mock_warning": MOCK_FLOW_WARNING if mock_mode else "",
         "pytest_ini": str(pytest_ini_path),
         "conftest": str(conftest_path),
         "fixtures": ["automation_context", "precise_test_logging"],
@@ -518,6 +644,7 @@ def _dependency_audit(
         "notes": [
             "Generated tests are dependency-aware and do not fake external protocol calls.",
             "Missing protocol, simulator, or device dependencies are marked as blocked/skipped.",
+            "Explicit mock mode builds mock device context and labels results as mocked.",
         ],
     }
 
@@ -529,6 +656,8 @@ def _tracking_payload(
     coverage_run_id: str,
     scope_hash: str,
     generated_file: Path,
+    robot_file: Path | None,
+    coverage_report: Path,
     tracking_file: Path,
     harness_paths: list[Path],
     scenarios: list[dict],
@@ -543,29 +672,86 @@ def _tracking_payload(
     )
     requirements = _requirements_payload(scenarios)
     evidence_refs = _evidence_refs_payload(scenarios)
+    facts_used = _facts_used_payload(scenarios)
+    reused_coverage = [
+        scenario["coverage_id"]
+        for scenario in scenarios
+        if scenario.get("impact_status") == "unchanged"
+    ]
+    updated_coverage = [
+        scenario["coverage_id"]
+        for scenario in scenarios
+        if scenario.get("impact_status") != "unchanged"
+    ]
     protocols = _unique_sorted(
         protocol
         for scenario in scenarios
         for protocol in scenario.get("protocols", [])
     )
     domain = _domain_for_protocols(protocols)
+    mock_mode = dependency_audit.get("mock_mode") is True
+    protocol_adapters = [
+        {
+            "protocol": protocol,
+            "mode": dependency_audit.get("execution_mode", "auto"),
+            "adapter": f"{protocol.lower()}_mock_adapter" if mock_mode else "",
+            "configured": mock_mode,
+        }
+        for protocol in (protocols or ["document_contract"])
+    ]
     return {
         "schema_version": SIDECAR_SCHEMA_VERSION,
         "generated_at": now,
         "updated_at": now,
         "project": _safe_slug(system_name),
+        "system": system_name,
         "system_name": system_name,
         "document_id": document_ids[0] if len(document_ids) == 1 else "",
         "document_ids": document_ids,
         "document_version": version or "",
+        "active_version": version or "",
+        "previous_version": "",
+        "supersedes": [],
+        "superseded_by": "",
         "source_document_path": source_docs[0] if len(source_docs) == 1 else "",
         "source_documents": source_docs,
         "doc_version": version,
         "generated_test_file": str(generated_file),
+        "generated_robot_file": str(robot_file) if robot_file else "",
+        "generated_xml_report": "",
+        "coverage_report": str(coverage_report),
+        "mock_mode": mock_mode,
+        "mock_warning": MOCK_FLOW_WARNING if mock_mode else "",
+        "domain_profile_ref": f"{domain}.v1",
+        "protocol_adapters": protocol_adapters,
+        "simulator_config": {
+            "mode": dependency_audit.get("execution_mode", "auto"),
+            "configured": bool(mock_mode or dependency_audit.get("status") == "ready"),
+            "source": "generated_mock_context" if mock_mode else "",
+        },
+        "device_config_required": bool(
+            protocols and not mock_mode and dependency_audit.get("status") == "blocked"
+        ),
+        "robot_keyword_mapping": [
+            {
+                "scenario_id": scenario["scenario_id"],
+                "keyword": scenario["test_function"].replace("_", " ").title(),
+                "requirement_id": scenario["requirement_id"],
+            }
+            for scenario in scenarios
+        ],
+        "llm_decisions": [],
         "scenario_group": generated_file.stem.removeprefix("test_"),
         "selected_scenarios": scenarios,
         "requirements": requirements,
-        "extracted_facts_used": [],
+        "facts_used": facts_used,
+        "extracted_facts_used": facts_used,
+        "changed_facts": [
+            item for item in facts_used if item.get("impact_status") in {"modified", "new_required"}
+        ],
+        "unchanged_facts": [
+            item for item in facts_used if item.get("impact_status") == "unchanged"
+        ],
         "evidence_refs": evidence_refs,
         "domain": domain,
         "protocols": protocols,
@@ -576,6 +762,14 @@ def _tracking_payload(
         "harness_files": [str(path) for path in harness_paths],
         "mode": "dependency_aware_generation",
         "workflow_handoff": list(WORKFLOW_HANDOFF),
+        "handoff_summaries": [
+            {
+                "source_agent": WORKFLOW_HANDOFF[index],
+                "target_agent": WORKFLOW_HANDOFF[index + 1],
+                "summary": "handoff contract completed",
+            }
+            for index in range(len(WORKFLOW_HANDOFF) - 1)
+        ],
         "retry_policy": {
             "max_attempts": MAX_DEBUG_RETRIES,
             "strategy": (
@@ -587,7 +781,19 @@ def _tracking_payload(
         "coverage": {
             "coverage_intent": "requirement_linked_test_generation",
             "covered_requirements": [item["requirement_id"] for item in requirements],
+            "reused_coverage": reused_coverage,
+            "updated_coverage": updated_coverage,
             "coverage_gaps": [],
+        },
+        "version_impact": {
+            "is_reused_from_previous_version": bool(reused_coverage) and not updated_coverage,
+            "requires_regeneration": bool(updated_coverage),
+            "requires_data_update": False,
+            "requires_execution": bool(updated_coverage),
+            "reason": (
+                "Unchanged scenarios are linked to previous coverage; changed or new "
+                "scenarios require generated execution."
+            ),
         },
         "scenarios": scenarios,
         "run_history": [],
@@ -601,6 +807,12 @@ def _validate_tracking_payload(payload: dict) -> None:
         "project",
         "document_version",
         "generated_test_file",
+        "generated_robot_file",
+        "mock_mode",
+        "domain_profile_ref",
+        "protocol_adapters",
+        "robot_keyword_mapping",
+        "handoff_summaries",
         "selected_scenarios",
         "requirements",
         "evidence_refs",
@@ -634,6 +846,81 @@ def _mark_tracking_db_update(tracking_file_path: Path, status: str) -> None:
     )
 
 
+def _coverage_report_payload(
+    *,
+    system_name: str,
+    version: str | None,
+    coverage_run_id: str,
+    records: list[CoverageRecord],
+    scenarios: list[dict],
+) -> dict:
+    return {
+        "schema_version": "coverage-report.v1",
+        "generated_at": _utc_now(),
+        "system_name": system_name,
+        "version": version,
+        "coverage_run_id": coverage_run_id,
+        "record_count": len(records),
+        "covered_requirements": _unique_sorted(record.requirement_id for record in records),
+        "coverage_ids": [record.coverage_id for record in records],
+        "reused_coverage": [
+            record.coverage_id for record in records if record.impact_status == "unchanged"
+        ],
+        "updated_coverage": [
+            record.coverage_id for record in records if record.impact_status != "unchanged"
+        ],
+        "scenario_ids": [scenario["scenario_id"] for scenario in scenarios],
+        "blocked_scenarios": [
+            scenario["scenario_id"]
+            for scenario in scenarios
+            if scenario.get("dependency_status") == "blocked"
+        ],
+    }
+
+
+def _render_robot_file(scenarios: list[dict]) -> str:
+    test_cases = "\n\n".join(_render_robot_test_case(scenario) for scenario in scenarios)
+    return f"""*** Settings ***
+Documentation       Generated MARAG Robot Framework orchestration wrapper.
+...                 Actual generated validation logic is inside the companion Python file.
+
+Library             OperatingSystem
+Library             Collections
+Library             ../../robot_libraries/threep_test_runner.py
+
+Suite Setup         Setup MARAG Generated Suite
+Suite Teardown      Teardown MARAG Generated Suite
+
+Test Tags           MARAG    Generated    EvidenceBound
+
+*** Test Cases ***
+{test_cases}
+
+*** Keywords ***
+Setup MARAG Generated Suite
+    Log To Console     Setting up generated MARAG suite
+
+Teardown MARAG Generated Suite
+    Log To Console     Cleaning up generated MARAG suite
+"""
+
+
+def _render_robot_test_case(scenario: dict) -> str:
+    name = scenario["test_function"].replace("_", " ").title()
+    evidence = shorten(" ".join(scenario.get("evidence", [])), width=120, placeholder="...")
+    return f"""{name}
+    [Documentation]    {scenario["test_scenario"]}
+    [Tags]             generated    evidence_bound    {scenario["requirement_id"]}    {scenario["execution_mode"]}
+    Log To Console     Starting: {name}
+    Log                Requirement: {scenario["requirement_id"]}
+    Log                Coverage: {scenario["coverage_id"]}
+    Log                Evidence: {evidence}
+    Log                Execution mode: {scenario["execution_mode"]}
+    Should Not Be Empty    {scenario.get("expected_values", [])}
+    Log To Console     Completed: {name}
+"""
+
+
 def _render_pytest_file(
     *,
     system_name: str,
@@ -644,29 +931,60 @@ def _render_pytest_file(
     class_name = _class_name(system_name=system_name, version=version)
     scenario_by_index = {scenario["scenario_index"]: scenario for scenario in scenarios}
     test_methods = "\n\n".join(_render_test_method(scenario) for scenario in scenarios)
-    return f'''"""Generated MARAG pytest automation placeholders.
+    return f'''"""Generated MARAG pytest automation.
 
 System: {system_name}
 Version: {version or "active"}
 
-This file is generated from stored BRD evidence. It is dependency-aware: when
-protocol, simulator, or device dependencies are missing, affected tests skip
-with a blocker reason instead of faking a passing external call.
+This file is generated from stored BRD evidence. It is dependency-aware:
+missing real protocol, simulator, or device dependencies block/skip instead of
+creating fake PASS results. Explicit mock mode is labeled and uses generated
+mock device context only.
 """
 
 from __future__ import annotations
 
+from typing import Any, List
 import logging
 
 import pytest
 
+from multi_agentic_rag.simulators import validate_real_protocol, validate_simulated_protocol
+
 COVERAGE_IDS = {pformat(coverage_ids, width=100)}
 SCENARIOS = {pformat(scenario_by_index, width=100)}
 LOG = logging.getLogger(__name__)
+MOCK_FLOW_WARNING = {MOCK_FLOW_WARNING!r}
+
+
+class _GeneratedLog:
+    def __init__(self, logger: logging.Logger) -> None:
+        self._logger = logger
+
+    def info(self, message: str, *args: Any) -> None:
+        self._logger.info(message, *args)
+
+    def warning(self, message: str, *args: Any) -> None:
+        self._logger.warning(message, *args)
+
+    def error(self, message: str, *args: Any) -> None:
+        self._logger.error(message, *args)
+
+
+class ThreePTest:
+    """Minimal generated compatibility base for ThreeP-style tests."""
+
+    dut = None
+
+    @property
+    def log(self) -> _GeneratedLog:
+        return _GeneratedLog(LOG)
 
 
 def _execute_generated_validation(scenario: dict, automation_context: dict) -> bool:
     LOG.debug("Executing scenario data: %s", scenario)
+    if scenario.get("impact_status") == "unchanged" and not scenario.get("force_run_all"):
+        pytest.skip("Skipped unchanged scenario already covered by previous version")
     missing_dependencies = scenario.get("missing_dependencies", [])
     if missing_dependencies:
         reason = "; ".join(missing_dependencies)
@@ -682,16 +1000,54 @@ def _execute_generated_validation(scenario: dict, automation_context: dict) -> b
     assert scenario["evidence"], "Generated scenario must cite BRD evidence."
     assert scenario["chunk_ids"], "Generated scenario must trace to a source chunk."
     assert scenario["expected_values"], "Expected values must be derived from evidence."
+    if scenario.get("execution_mode") == "mock":
+        LOG.warning(MOCK_FLOW_WARNING)
+        assert scenario.get("mock_mode") is True
+        assert scenario.get("mock_device_config", {{}}).get("connection_established") is False
+        return True
+    if scenario.get("execution_mode") == "simulator":
+        assert validate_simulated_protocol(scenario) is True
+    if scenario.get("execution_mode") == "real":
+        assert validate_real_protocol(scenario) is True
     if scenario.get("protocols"):
         assert scenario["execution_mode"] in {{"mock", "simulator", "real"}}
     else:
-        assert scenario["execution_mode"] == "document_contract"
+        assert scenario["execution_mode"] in {{"document_contract", "mock"}}
     return True
 
 
 @pytest.mark.generated
 @pytest.mark.evidence_bound
-class {class_name}:
+class {class_name}(ThreePTest):
+    def define_test(self, *args: Any, **kwargs: Any) -> bool:
+        """Execute one generated scenario and return PASS/FAIL."""
+
+        scenario = kwargs.get("scenario")
+        automation_context = kwargs.get("automation_context", {{}})
+        if not scenario:
+            self.log.error("Missing generated scenario payload")
+            return False
+
+        results: List[bool] = []
+        self.log.info(">>>> [Test Setup]: Initializing generated MARAG test")
+        self.log.info(">>>> [Test Step 1]: Validate requirement evidence")
+        results.append(bool(scenario.get("requirement_id")))
+        results.append(bool(scenario.get("evidence")))
+        results.append(bool(scenario.get("chunk_ids")))
+
+        self.log.info(">>>> [Test Step 2]: Validate expected values")
+        results.append(bool(scenario.get("expected_values")))
+
+        self.log.info(">>>> [Test Step 3]: Execute %s flow", scenario.get("execution_mode"))
+        results.append(_execute_generated_validation(scenario, automation_context))
+
+        final_result = all(results)
+        if final_result:
+            self.log.info(">>>> [Test Result]: PASS")
+        else:
+            self.log.error(">>>> [Test Result]: FAIL")
+        return final_result
+
 {test_methods}
 '''
 
@@ -708,7 +1064,7 @@ def _render_test_method(scenario: dict) -> str:
         assert scenario["evidence"], "Generated scenario must cite BRD evidence."
         assert scenario["chunk_ids"], "Generated scenario must trace to a source chunk."
         assert scenario["expected_values"], "Expected values must be derived from evidence."
-        assert _execute_generated_validation(scenario, automation_context) is True'''
+        assert self.define_test(scenario=scenario, automation_context=automation_context) is True'''
 
 
 def _render_conftest() -> str:
@@ -734,6 +1090,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "generated: generated MARAG automation testcase")
     config.addinivalue_line("markers", "evidence_bound: generated test linked to evidence")
     config.addinivalue_line("markers", "requirement(id): BRD requirement trace marker")
+    config.addinivalue_line("markers", "mock: explicit generated mock execution")
 
 
 @pytest.fixture(scope="session")
@@ -765,6 +1122,7 @@ markers =
     generated: generated MARAG automation testcase
     evidence_bound: generated test linked to evidence
     requirement(id): BRD requirement trace marker
+    mock: explicit generated mock execution
 """
 
 

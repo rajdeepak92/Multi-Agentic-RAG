@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from dotenv import find_dotenv, load_dotenv
 
 from multi_agentic_rag.config import Settings, get_settings
+from multi_agentic_rag.llm import select_llm_client
+from multi_agentic_rag.retrieval.reranker import BGEReranker, select_reranker
+from multi_agentic_rag.simulators import check_rest_mqtt_simulators
 from multi_agentic_rag.storage.embedding_factory import select_embedding_function
 from multi_agentic_rag.storage.neo4j_store import Neo4jGraphStore
 from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
@@ -27,7 +30,13 @@ class DiagnosticCheck:
     detail: str
 
 
-def run_diagnostics(settings: Settings | None = None) -> list[DiagnosticCheck]:
+def run_diagnostics(
+    settings: Settings | None = None,
+    *,
+    target_graphrag: bool = False,
+    system_name: str | None = None,
+    version: str | None = None,
+) -> list[DiagnosticCheck]:
     """Run local environment checks without requiring external services."""
 
     settings = settings or get_settings()
@@ -49,6 +58,8 @@ def run_diagnostics(settings: Settings | None = None) -> list[DiagnosticCheck]:
         _check_neo4j(settings),
         _check_fastapi_app_import(),
     ]
+    if target_graphrag:
+        checks.extend(_target_graphrag_checks(settings, system_name=system_name, version=version))
     return checks
 
 
@@ -282,3 +293,99 @@ def _check_fastapi_app_import() -> DiagnosticCheck:
     except Exception as exc:
         return DiagnosticCheck("FastAPI app", "FAIL", str(exc))
     return DiagnosticCheck("FastAPI app", "PASS", "multi_agentic_rag.api.main imports.")
+
+
+def _target_graphrag_checks(
+    settings: Settings,
+    *,
+    system_name: str | None,
+    version: str | None,
+) -> list[DiagnosticCheck]:
+    checks = [
+        _require_target_setting(
+            "Target mode",
+            settings.marag_target_mode == "target-graphrag" or settings.graphrag_required,
+            "Set MARAG_TARGET_MODE=target-graphrag or GRAPHRAG_REQUIRED=true.",
+        ),
+        _require_target_setting(
+            "Target embeddings",
+            settings.embedding_provider == "huggingface"
+            and settings.default_embedding_model == "BAAI/bge-m3",
+            "Target mode requires EMBEDDING_PROVIDER=huggingface and DEFAULT_EMBEDDING_MODEL=BAAI/bge-m3.",
+        ),
+        _check_target_reranker(settings),
+        _check_target_llm(settings),
+        _check_target_simulators(settings),
+    ]
+    checks.append(_check_target_graph_population(settings, system_name=system_name, version=version))
+    return checks
+
+
+def _require_target_setting(name: str, ok: bool, detail: str) -> DiagnosticCheck:
+    return DiagnosticCheck(name, "PASS" if ok else "FAIL", "Configured." if ok else detail)
+
+
+def _check_target_reranker(settings: Settings) -> DiagnosticCheck:
+    try:
+        selection = select_reranker(settings)
+    except Exception as exc:
+        return DiagnosticCheck("Target reranker", "FAIL", str(exc))
+    if selection.provider != "huggingface" or selection.model_name != "BAAI/bge-reranker-v2-m3":
+        return DiagnosticCheck(
+            "Target reranker",
+            "FAIL",
+            "Target mode requires RERANKER_PROVIDER=huggingface and DEFAULT_RERANKER_MODEL=BAAI/bge-reranker-v2-m3.",
+        )
+    reranker = selection.reranker
+    if isinstance(reranker, BGEReranker):
+        ready, message = reranker.check_ready(load_model=False)
+        return DiagnosticCheck("Target reranker", "PASS" if ready else "FAIL", message)
+    return DiagnosticCheck("Target reranker", "FAIL", "BGE reranker was not selected.")
+
+
+def _check_target_llm(settings: Settings) -> DiagnosticCheck:
+    if settings.llm_provider != "openai":
+        return DiagnosticCheck("Target LLM", "FAIL", "Target mode requires LLM_PROVIDER=openai.")
+    ready, message = select_llm_client(settings).check_ready()
+    return DiagnosticCheck("Target LLM", "PASS" if ready else "FAIL", message)
+
+
+def _check_target_simulators(settings: Settings) -> DiagnosticCheck:
+    readiness = check_rest_mqtt_simulators(settings)
+    if readiness.ready:
+        return DiagnosticCheck("Target REST/MQTT simulators", "PASS", "Configured.")
+    return DiagnosticCheck("Target REST/MQTT simulators", "FAIL", "; ".join(readiness.missing))
+
+
+def _check_target_graph_population(
+    settings: Settings,
+    *,
+    system_name: str | None,
+    version: str | None,
+) -> DiagnosticCheck:
+    _ = version
+    if not system_name:
+        return DiagnosticCheck(
+            "Target graph population",
+            "FAIL",
+            "Pass --system to validate graph population for a specific system.",
+        )
+    try:
+        from multi_agentic_rag.retrieval.graph_retriever import GraphRetriever
+
+        result = GraphRetriever(settings).get_lineage(system_name)
+    except Exception as exc:
+        return DiagnosticCheck("Target graph population", "FAIL", str(exc))
+    if result.warning:
+        return DiagnosticCheck("Target graph population", "FAIL", result.warning)
+    if not result.records:
+        return DiagnosticCheck(
+            "Target graph population",
+            "FAIL",
+            f"No graph lineage records found for {system_name}.",
+        )
+    return DiagnosticCheck(
+        "Target graph population",
+        "PASS",
+        f"{len(result.records)} lineage record(s) found for {system_name}.",
+    )

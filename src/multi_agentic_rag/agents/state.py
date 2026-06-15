@@ -16,6 +16,8 @@ class AgentState(BaseModel):
     system_name: str | None = None
     version: str | None = None
     scenario_count: int | None = None
+    force_run_all: bool = False
+    execution_mode: str | None = None
     output_dir: str | None = None
     internal_settings: Any | None = Field(default=None, alias="_settings")
     documents: list[dict[str, Any]] = Field(default_factory=list)
@@ -29,9 +31,16 @@ class AgentState(BaseModel):
     coverage_result: dict[str, Any] | None = None
     test_generation: dict[str, Any] | None = None
     test_execution: dict[str, Any] | None = None
+    syntax_validation: dict[str, Any] | None = None
+    sidecar_status: dict[str, Any] | None = None
+    db_update_status: str | None = None
+    final_validation: dict[str, Any] | None = None
+    intent_decision: dict[str, Any] | None = None
+    handoff_summaries: list[dict[str, Any]] = Field(default_factory=list)
     task_result: dict[str, Any] | None = None
     final_output: dict[str, Any] | None = None
     workflow_trace: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
 
@@ -44,6 +53,8 @@ class AgentStateDict(TypedDict, total=False):
     system_name: str | None
     version: str | None
     scenario_count: int | None
+    force_run_all: bool
+    execution_mode: str | None
     output_dir: str | None
     _settings: Any | None
     documents: list[dict[str, Any]]
@@ -57,7 +68,14 @@ class AgentStateDict(TypedDict, total=False):
     coverage_result: dict[str, Any] | None
     test_generation: dict[str, Any] | None
     test_execution: dict[str, Any] | None
+    syntax_validation: dict[str, Any] | None
+    sidecar_status: dict[str, Any] | None
+    db_update_status: str | None
+    final_validation: dict[str, Any] | None
+    intent_decision: dict[str, Any] | None
+    handoff_summaries: list[dict[str, Any]]
     task_result: dict[str, Any] | None
     final_output: dict[str, Any] | None
     workflow_trace: list[dict[str, Any]]
+    warnings: list[str]
     errors: list[str]

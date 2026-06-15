@@ -19,6 +19,12 @@ class CoverageRecord(BaseModel):
     document_id: str | None = None
     version: str | None = None
     chunk_id: str | None = None
+    fact_id: str | None = None
+    semantic_key: str | None = None
+    impact_status: str = "new_required"
+    lifecycle_status: str = "active"
+    previous_coverage_id: str | None = None
+    superseded_by: str | None = None
     scenario_index: int | None = None
     source_hash: str | None = None
 
@@ -49,6 +55,9 @@ class GeneratedTestFileRecord(BaseModel):
     scope_hash: str
     file_path: str
     tracking_file_path: str | None = None
+    robot_file_path: str | None = None
+    coverage_report_path: str | None = None
+    report_file_paths: list[str] = Field(default_factory=list)
     harness_file_paths: list[str] = Field(default_factory=list)
     status: str
     coverage_ids: list[str] = Field(default_factory=list)
@@ -70,8 +79,12 @@ class TestRunResultRecord(BaseModel):
     passed: int = 0
     failed: int = 0
     skipped: int = 0
+    blocked: int = 0
     failure_category: str | None = None
     failure_reason: str | None = None
     dependency_blockers: list[str] = Field(default_factory=list)
+    execution_scope: str = "all"
+    xml_report_path: str | None = None
+    duration_seconds: float = 0.0
     output: str = ""
     created_at: str

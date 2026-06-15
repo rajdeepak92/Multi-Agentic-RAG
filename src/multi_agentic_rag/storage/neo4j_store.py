@@ -118,6 +118,27 @@ class Neo4jGraphStore:
             return False, str(exc)
         return True, "Neo4j graph-check PASS."
 
+    def delete_system(self, system_name: str) -> int:
+        """Delete graph nodes owned by one MARAG system."""
+
+        available, message = self.check_connection()
+        if not available:
+            raise RuntimeError(message)
+        with self.session() as session:
+            record = session.run(
+                """
+                MATCH (n)
+                WHERE n.system_name = $system_name
+                   OR (n:System AND n.system_name = $system_name)
+                WITH collect(n) AS nodes, count(n) AS deleted
+                UNWIND nodes AS node
+                DETACH DELETE node
+                RETURN deleted
+                """,
+                {"system_name": system_name},
+            ).single()
+        return int(record["deleted"] if record else 0)
+
     def upsert_ingestion_graph(
         self,
         *,
@@ -238,6 +259,9 @@ class Neo4jGraphStore:
                     t.scope_hash = $scope_hash,
                     t.file_path = $file_path,
                     t.tracking_file_path = $tracking_file_path,
+                    t.robot_file_path = $robot_file_path,
+                    t.coverage_report_path = $coverage_report_path,
+                    t.report_file_paths = $report_file_paths,
                     t.status = $status,
                     t.coverage_ids = $coverage_ids,
                     t.created_at = $created_at,
@@ -268,6 +292,9 @@ class Neo4jGraphStore:
                         t.scope_hash = $scope_hash,
                         t.file_path = $file_path,
                         t.tracking_file_path = $tracking_file_path,
+                        t.robot_file_path = $robot_file_path,
+                        t.coverage_report_path = $coverage_report_path,
+                        t.report_file_paths = $report_file_paths,
                         t.status = $status,
                         t.coverage_ids = $coverage_ids,
                         t.created_at = $created_at,
@@ -292,9 +319,13 @@ class Neo4jGraphStore:
                     r.passed = $passed,
                     r.failed = $failed,
                     r.skipped = $skipped,
+                    r.blocked = $blocked,
                     r.failure_category = $failure_category,
                     r.failure_reason = $failure_reason,
                     r.dependency_blockers = $dependency_blockers,
+                    r.execution_scope = $execution_scope,
+                    r.xml_report_path = $xml_report_path,
+                    r.duration_seconds = $duration_seconds,
                     r.created_at = $created_at
                 MERGE (s)-[:HAS_GENERATED_TEST]->(t)
                 MERGE (t)-[:HAS_TEST_RUN]->(r)
@@ -314,6 +345,7 @@ class Neo4jGraphStore:
             MATCH (t:GeneratedTest {test_file_id: $test_file_id})
             MERGE (c:Coverage {coverage_id: $coverage_id})
             SET c.requirement_id = $requirement_id,
+                c.system_name = $system_name,
                 c.use_case = $use_case,
                 c.test_scenario = $test_scenario,
                 c.automation_feasibility = $automation_feasibility,
@@ -322,12 +354,19 @@ class Neo4jGraphStore:
                 c.document_id = $document_id,
                 c.version = $version,
                 c.chunk_id = $chunk_id,
+                c.fact_id = $fact_id,
+                c.semantic_key = $semantic_key,
+                c.impact_status = $impact_status,
+                c.lifecycle_status = $lifecycle_status,
+                c.previous_coverage_id = $previous_coverage_id,
+                c.superseded_by = $superseded_by,
                 c.scenario_index = $scenario_index,
                 c.source_hash = $source_hash
             MERGE (t)-[:IMPLEMENTS_COVERAGE]->(c)
             """,
             {
                 "test_file_id": test_file.test_file_id,
+                "system_name": test_file.system_name,
                 **coverage.model_dump(mode="json"),
             },
         )
@@ -368,6 +407,7 @@ class Neo4jGraphStore:
                 f.unit = $unit,
                 f.status = $status,
                 f.version = $version,
+                f.semantic_key = $semantic_key,
                 f.system_name = $system_name,
                 f.document_id = $document_id,
                 f.chunk_id = $chunk_id
