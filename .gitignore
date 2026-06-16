@@ -23,7 +23,6 @@ documents/inbox/
 # MARAG runtime state
 .multi_agentic_rag/
 .cache/
-generated/
 tests/generated/
 
 # Local Neo4j Desktop/runtime data

@@ -1,0 +1,44 @@
+D:\Multi-Agentic-RAG\.venv\Lib\site-packages\neo4j\_sync\work\result.py:636: UserWarning: Expected a result with a single record, but found multiple.
+  warn(
+     Cleaned System State: PROJECT_1     
++---------------------------------------+
+| Store                       | Deleted |
+|-----------------------------+---------|
+| sqlite:test_run_results     | 16      |
+| sqlite:generated_test_files | 5       |
+| sqlite:coverage_runs        | 8       |
+| sqlite:coverage             | 65      |
+| sqlite:deltas               | 1       |
+| sqlite:facts                | 370     |
+| sqlite:chunk_fts            | 61      |
+| sqlite:chunks               | 61      |
+| sqlite:documents            | 4       |
+| chroma                      | 61      |
+| neo4j                       | 534     |
+| files                       | 9       |
++---------------------------------------+
+Deleted: 
+D:\Multi-Agentic-RAG\.multi_agentic_rag\documents\PROJECT_1_v1_cef8335037dc_SII
+MCS_BRD_V1.pdf
+Deleted: 
+D:\Multi-Agentic-RAG\.multi_agentic_rag\objects\parsed\doc_d0998e25c4e8aea05767
+92322c5c7029.chunks.jsonl
+Deleted: 
+D:\Multi-Agentic-RAG\.multi_agentic_rag\documents\PROJECT_1_v1_1979ec8ca46d_SII
+MCS_BRD_V2.pdf
+Deleted: 
+D:\Multi-Agentic-RAG\.multi_agentic_rag\objects\parsed\doc_f99eeb45f302d11e9be8
+9f3886b20bd5.chunks.jsonl
+Deleted: 
+D:\Multi-Agentic-RAG\.multi_agentic_rag\documents\PROJECT_1_v2_1979ec8ca46d_SII
+MCS_BRD_V2.pdf
+Deleted: 
+D:\Multi-Agentic-RAG\.multi_agentic_rag\objects\parsed\doc_1cde5605c8a0d8033878
+8363ce1935ac.chunks.jsonl
+Deleted: 
+D:\Multi-Agentic-RAG\.multi_agentic_rag\documents\PROJECT_1_v1_5450eb2d5159_SII
+MCS_BRD_V1.pdf
+Deleted: 
+D:\Multi-Agentic-RAG\.multi_agentic_rag\objects\parsed\doc_093db9299a2c794e94b1
+f92d67750b8d.chunks.jsonl
+Deleted: D:\Multi-Agentic-RAG\generated\project_1
