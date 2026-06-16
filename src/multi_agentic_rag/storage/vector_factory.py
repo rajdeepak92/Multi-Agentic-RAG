@@ -22,7 +22,7 @@ class VectorStoreSelection:
 
 
 def select_vector_store(settings: Settings) -> VectorStoreSelection:
-    """Select the configured vector store with strict local fallback guards."""
+    """Select the configured vector store with explicit local and managed options."""
 
     provider = settings.vector_store_provider.lower()
     if provider not in {"auto", "weaviate", "chroma"}:
@@ -44,7 +44,7 @@ def select_vector_store(settings: Settings) -> VectorStoreSelection:
         )
     if provider == "weaviate":
         raise RuntimeError("VECTOR_STORE_PROVIDER=weaviate requires WEAVIATE_URL.")
-    require_local_dev_mode(settings, "VECTOR_STORE_PROVIDER=chroma or auto Chroma fallback")
+    require_local_dev_mode(settings, "VECTOR_STORE_PROVIDER=chroma")
     return VectorStoreSelection(
         provider="chroma",
         store=ChromaVectorStore(
@@ -53,5 +53,5 @@ def select_vector_store(settings: Settings) -> VectorStoreSelection:
             embedding_provider=embedding.provider,
             embedding_model=embedding.model_name,
         ),
-        reason=f"Using local Chroma fallback; embeddings={embedding.provider}:{embedding.model_name}.",
+        reason=f"Configured local Chroma store selected; embeddings={embedding.provider}:{embedding.model_name}.",
     )

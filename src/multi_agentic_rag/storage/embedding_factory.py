@@ -141,7 +141,7 @@ def select_embedding_function(settings: Settings) -> EmbeddingSelection:
             embedding_function=HashEmbeddingFunction(
                 dimensions=settings.hash_embedding_dimensions
             ),
-            reason="Deterministic test/offline embedding fallback selected.",
+            reason="Deterministic test/offline embedding function selected.",
         )
     if provider == "huggingface":
         return EmbeddingSelection(

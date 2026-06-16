@@ -37,7 +37,7 @@ def run_diagnostics(
     system_name: str | None = None,
     version: str | None = None,
 ) -> list[DiagnosticCheck]:
-    """Run local environment checks without requiring external services."""
+    """Run local environment checks and optional target-mode checks."""
 
     settings = settings or get_settings()
     checks = [
@@ -179,7 +179,7 @@ def _check_chroma(settings: Settings) -> DiagnosticCheck:
         return DiagnosticCheck("ChromaDB", "WARN", "chromadb is not installed.")
     except Exception as exc:
         return DiagnosticCheck("ChromaDB", "FAIL", str(exc))
-    return DiagnosticCheck("ChromaDB", "PASS", str(path))
+    return DiagnosticCheck("ChromaDB", "PASS", f"Configured local Chroma store at {path}")
 
 
 def _check_weaviate(settings: Settings) -> DiagnosticCheck:
@@ -193,7 +193,7 @@ def _check_weaviate(settings: Settings) -> DiagnosticCheck:
         return DiagnosticCheck(
             "Weaviate",
             "PASS",
-            "Chroma provider selected; Weaviate is not required.",
+            "Chroma provider selected; Weaviate is not required for local ingestion.",
         )
     if not settings.weaviate_url:
         status = "WARN" if settings.allow_local_dev_mode else "FAIL"
@@ -336,8 +336,8 @@ def _target_graphrag_checks(
     checks = [
         _require_target_setting(
             "Target mode",
-            settings.marag_target_mode == "target-graphrag" or settings.graphrag_required,
-            "Set MARAG_TARGET_MODE=target-graphrag or GRAPHRAG_REQUIRED=true.",
+            settings.marag_target_mode == "target-graphrag",
+            "Set MARAG_TARGET_MODE=target-graphrag.",
         ),
         _require_target_setting(
             "Target registry",

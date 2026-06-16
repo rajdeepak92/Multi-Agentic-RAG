@@ -12,7 +12,7 @@ from multi_agentic_rag.utils.paths import resolve_path
 
 
 class HashEmbeddingFunction:
-    """Deterministic embedding fallback that avoids model downloads during Phase 1 tests."""
+    """Deterministic embedding function for offline tests and local fixtures."""
 
     def __init__(self, dimensions: int = 384) -> None:
         self.dimensions = dimensions
@@ -81,9 +81,9 @@ class HashEmbeddingFunction:
 class ChromaVectorStore:
     """Persistent ChromaDB adapter.
 
-    The adapter uses a deterministic local embedding fallback by default. The
-    interface is intentionally narrow so a sentence-transformers embedding
-    function or an enterprise vector store can replace it later.
+    The adapter uses the configured embedding function and persists vectors
+    locally. The interface is intentionally narrow so a sentence-transformers
+    embedding function or an enterprise vector store can replace it later.
     """
 
     name = "chroma"

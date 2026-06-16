@@ -27,6 +27,7 @@ tests/generated/
 
 # Local Neo4j Desktop/runtime data
 neo4j/desktop-data/
+neo4j/cleanup-backup-*/
 neo4j/runtime/
 neo4j/dumps/
 neo4j/import/

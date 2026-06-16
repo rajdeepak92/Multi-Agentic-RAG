@@ -54,6 +54,23 @@ function Get-ConfigValue {
     return $DefaultValue
 }
 
+function Resolve-ConfiguredPath {
+    param(
+        [string]$Value,
+        [string]$BasePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $null
+    }
+
+    if ([System.IO.Path]::IsPathRooted($Value)) {
+        return (Resolve-Path $Value).Path
+    }
+
+    return (Resolve-Path (Join-Path $BasePath $Value)).Path
+}
+
 function Test-Port {
     param(
         [string]$HostName,
@@ -133,10 +150,27 @@ function Invoke-FrameworkGraphCheck {
     return $true
 }
 
+function Show-RunnerLog {
+    param([string]$RunnerLog)
+
+    Write-Host "------------------------------------------------------------"
+    if (Test-Path $RunnerLog) {
+        Get-Content $RunnerLog -Tail 100
+    }
+    else {
+        Write-Host "Runner log not found: $RunnerLog"
+    }
+    Write-Host "------------------------------------------------------------"
+}
+
 $Config = Read-DotEnv -Path $EnvFile
 
-$Neo4jDbmsHome = Get-ConfigValue -Config $Config -Name "NEO4J_DBMS_HOME"
-$Neo4jJavaHome = Get-ConfigValue -Config $Config -Name "NEO4J_JAVA_HOME"
+$Neo4jDbmsHome = Resolve-ConfiguredPath `
+    -Value (Get-ConfigValue -Config $Config -Name "NEO4J_DBMS_HOME") `
+    -BasePath $ProjectRoot
+$Neo4jJavaHome = Resolve-ConfiguredPath `
+    -Value (Get-ConfigValue -Config $Config -Name "NEO4J_JAVA_HOME") `
+    -BasePath $ProjectRoot
 
 $Neo4jHost = Get-ConfigValue -Config $Config -Name "NEO4J_HOST" -DefaultValue "127.0.0.1" -Required $false
 $BoltPort = [int](Get-ConfigValue -Config $Config -Name "NEO4J_BOLT_PORT" -DefaultValue "7687" -Required $false)
@@ -200,13 +234,14 @@ Write-Host "Log:    $RunnerLog"
 Start-Process `
     -FilePath "powershell.exe" `
     -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$RunnerScript`"" `
-    -WindowStyle Minimized
+    -WindowStyle Hidden
 
 $BoltReady = Wait-ForPort -HostName $Neo4jHost -Port $BoltPort -TimeoutSeconds 120
 $BrowserReady = Wait-ForPort -HostName $Neo4jHost -Port $BrowserPort -TimeoutSeconds 120
 
 if ($BoltReady -and $BrowserReady) {
     if (!(Invoke-FrameworkGraphCheck)) {
+        Show-RunnerLog -RunnerLog $RunnerLog
         exit 1
     }
 
@@ -215,22 +250,17 @@ if ($BoltReady -and $BrowserReady) {
     Write-Host "Browser: http://$Neo4jHost`:$BrowserPort"
     Write-Host "Bolt:    bolt://$Neo4jHost`:$BoltPort"
     Write-Host ""
-    Write-Host "Keep the minimized Neo4j PowerShell window running."
+    Write-Host "Keep the hidden Neo4j PowerShell window running."
     exit 0
 }
 
 Write-Host ""
 Write-Host "Neo4j did not open required ports."
+Write-Host "DBMS Home: $Neo4jDbmsHome"
+Write-Host "JAVA_HOME: $Neo4jJavaHome"
+Write-Host "Browser:   http://$Neo4jHost`:$BrowserPort"
+Write-Host "Bolt:      bolt://$Neo4jHost`:$BoltPort"
 Write-Host ""
 Write-Host "Last log lines:"
-Write-Host "------------------------------------------------------------"
-
-if (Test-Path $RunnerLog) {
-    Get-Content $RunnerLog -Tail 100
-}
-else {
-    Write-Host "Runner log not found: $RunnerLog"
-}
-
-Write-Host "------------------------------------------------------------"
+Show-RunnerLog -RunnerLog $RunnerLog
 exit 1

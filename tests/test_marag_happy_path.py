@@ -290,7 +290,9 @@ def test_generated_pytest_file_executes_and_last_result_is_stored(tmp_path: Path
     assert generated_file.parent.name == "brd_v1"
     assert generated_file.parent.parent.name == "project_1"
     assert tracking_file.exists()
-    assert "class TestProject1V1Automation" in generated_file.read_text(encoding="utf-8")
+    assert "class TestProject1V1Automation(AutomateTests)" in generated_file.read_text(
+        encoding="utf-8"
+    )
     assert "def define_test(self" in generated_file.read_text(encoding="utf-8")
     assert generation.test_file.robot_file_path is not None
     assert Path(generation.test_file.robot_file_path).exists()

@@ -6,6 +6,16 @@ from multi_agentic_rag.storage.registry import select_registry
 from multi_agentic_rag.storage.sqlite_registry import SQLiteRegistry
 
 
+def test_registry_factory_defaults_to_local_sqlite_registry() -> None:
+    settings = Settings(_env_file=None)
+
+    selection = select_registry(settings)
+
+    assert selection.provider == "sqlite"
+    assert isinstance(selection.registry, SQLiteRegistry)
+    assert "local document-ingestion registry" in selection.reason
+
+
 def test_registry_factory_selects_postgresql_without_connecting() -> None:
     settings = Settings(
         registry_provider="postgresql",

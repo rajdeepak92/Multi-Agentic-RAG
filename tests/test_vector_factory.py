@@ -7,6 +7,30 @@ from multi_agentic_rag.storage.vector_factory import select_vector_store
 from multi_agentic_rag.storage.weaviate_store import WeaviateVectorStore
 
 
+def test_chroma_provider_selects_local_store_when_explicit(tmp_path: Path) -> None:
+    settings = Settings(
+        multi_agentic_rag_home=tmp_path / ".runtime",
+        sqlite_db_path=tmp_path / ".runtime" / "registry.db",
+        chroma_path=tmp_path / ".runtime" / "chroma",
+        registry_provider="sqlite",
+        allow_local_dev_mode=True,
+        marag_target_mode="local",
+        graphrag_required=True,
+        neo4j_uri="bolt://127.0.0.1:7687",
+        embedding_provider="hash",
+        reranker_provider="none",
+        llm_provider="none",
+        vector_store_provider="chroma",
+        weaviate_url=None,
+    )
+
+    selection = select_vector_store(settings)
+
+    assert selection.provider == "chroma"
+    assert isinstance(selection.store, ChromaVectorStore)
+    assert "Configured local Chroma store" in selection.reason
+
+
 def test_auto_vector_provider_uses_chroma_without_weaviate_url(tmp_path: Path) -> None:
     settings = Settings(
         multi_agentic_rag_home=tmp_path / ".runtime",

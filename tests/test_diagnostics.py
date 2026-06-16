@@ -5,6 +5,7 @@ from multi_agentic_rag.utils.diagnostics import (
     _check_neo4j,
     _check_openai_key,
     _check_weaviate,
+    run_diagnostics,
 )
 
 
@@ -48,3 +49,11 @@ def test_graphrag_required_makes_missing_neo4j_a_failure() -> None:
 
     assert check.status == "FAIL"
     assert "NEO4J_URI" in check.detail
+
+
+def test_local_doctor_does_not_force_target_checks_when_graphrag_required_is_true() -> None:
+    settings = Settings()
+
+    checks = run_diagnostics(settings=settings, target_graphrag=False)
+
+    assert all(not check.name.startswith("Target ") for check in checks)

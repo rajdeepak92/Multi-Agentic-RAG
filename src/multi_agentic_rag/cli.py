@@ -66,9 +66,10 @@ def init() -> None:
     except Exception as exc:
         console.print(f"[yellow]WARN[/yellow] Vector provider not ready: {exc}")
     console.print("\nNext steps:")
-    console.print("1. Create or edit .env with target service settings.")
-    console.print("2. Ensure PostgreSQL, Neo4j, Weaviate, OpenAI, and Hugging Face are ready.")
+    console.print("1. Create or edit .env with local ingestion settings.")
+    console.print("2. Start local Neo4j and make sure Hugging Face models can be loaded.")
     console.print("3. Run: multi-agentic-rag doctor")
+    console.print("4. Ingest V1 and V2 documents for the target system.")
 
 
 @app.command("doctor")
@@ -96,11 +97,7 @@ def doctor(
     """Validate local environment and optional services."""
 
     settings = get_settings()
-    target_mode = (
-        target_graphrag
-        or settings.marag_target_mode == "target-graphrag"
-        or settings.graphrag_required
-    )
+    target_mode = target_graphrag or settings.marag_target_mode == "target-graphrag"
     checks = run_diagnostics(
         settings=settings,
         target_graphrag=target_mode,

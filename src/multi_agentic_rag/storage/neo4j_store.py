@@ -69,8 +69,8 @@ class Neo4jGraphStore:
         if _neo4j_uri_is_local(self.settings.neo4j_uri) and not self.settings.allow_local_dev_mode:
             return (
                 False,
-                "Localhost Neo4j requires ALLOW_LOCAL_DEV_MODE=true. Strict mode expects "
-                "a managed or remote Neo4j URI.",
+                "Localhost Neo4j requires ALLOW_LOCAL_DEV_MODE=true. Managed target mode does not "
+                "allow localhost-only Neo4j.",
             )
         try:
             self._get_driver().verify_connectivity()

@@ -145,19 +145,19 @@ class RegistrySelection:
 
 
 def local_dev_mode_enabled(settings: Settings) -> bool:
-    """Return whether local/offline development fallbacks are explicitly allowed."""
+    """Return whether local/offline development is explicitly allowed."""
 
     return bool(settings.allow_local_dev_mode)
 
 
 def require_local_dev_mode(settings: Settings, capability: str) -> None:
-    """Reject local fallbacks unless ALLOW_LOCAL_DEV_MODE=true is set."""
+    """Reject local-only providers unless ALLOW_LOCAL_DEV_MODE=true is set."""
 
     if local_dev_mode_enabled(settings):
         return
     raise RuntimeError(
-        f"{capability} requires ALLOW_LOCAL_DEV_MODE=true. Strict mode does not "
-        "allow SQLite, Chroma, localhost-only Neo4j fallbacks, or hash embeddings."
+        f"{capability} requires ALLOW_LOCAL_DEV_MODE=true. Managed target mode does not "
+        "allow SQLite, Chroma, localhost-only Neo4j, or hash embeddings."
     )
 
 
@@ -182,6 +182,6 @@ def select_registry(settings: Settings) -> RegistrySelection:
         return RegistrySelection(
             provider="sqlite",
             registry=SQLiteRegistry(settings.sqlite_db_path),
-            reason="SQLite registry selected for explicit local development.",
+            reason="SQLite local document-ingestion registry selected.",
         )
     raise ValueError(f"Unsupported registry provider: {settings.registry_provider}")

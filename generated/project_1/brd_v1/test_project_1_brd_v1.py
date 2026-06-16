@@ -983,8 +983,8 @@ class _GeneratedLog:
         self._logger.error(message, *args)
 
 
-class ThreePTest:
-    """Minimal generated compatibility base for ThreeP-style tests."""
+class AutomateTests:
+    """Minimal generated compatibility base for generated automation tests."""
 
     dut = None
 
@@ -1030,7 +1030,7 @@ def _execute_generated_validation(scenario: dict, automation_context: dict) -> b
 
 @pytest.mark.generated
 @pytest.mark.evidence_bound
-class TestProject1V1Automation(ThreePTest):
+class TestProject1V1Automation(AutomateTests):
     def define_test(self, *args: Any, **kwargs: Any) -> bool:
         """Execute one generated scenario and return PASS/FAIL."""
 
