@@ -16,6 +16,8 @@ htmlcov/
 
 # Local secrets and machine-specific settings
 .env
+.codex/
+.agents/
 
 # MARAG runtime state
 .multi_agentic_rag/
