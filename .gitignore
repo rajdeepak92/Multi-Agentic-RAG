@@ -18,6 +18,7 @@ htmlcov/
 .env
 .codex/
 .agents/
+documents/inbox/
 
 # MARAG runtime state
 .multi_agentic_rag/
