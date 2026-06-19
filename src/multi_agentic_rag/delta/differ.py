@@ -2,20 +2,39 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from multi_agentic_rag.delta.classifier import classify_change_magnitude, classify_risk
-from multi_agentic_rag.models import DeltaRecord, FactRecord
+from multi_agentic_rag.domain import DeltaRecord, FactRecord
 from multi_agentic_rag.utils.hashing import stable_id
 
 
 def compute_fact_deltas(
     *,
     system_name: str,
+    kb_name: str,
+    from_document_version_id: str,
+    to_document_version_id: str,
     from_version: str,
     to_version: str,
     old_facts: list[FactRecord],
     new_facts: list[FactRecord],
 ) -> list[DeltaRecord]:
-    """Compare old and new facts by stable fact keys."""
+    """Compare old and new facts by semantic key and include unchanged records.
+
+    Args:
+        system_name: Owning system namespace.
+        kb_name: Knowledge-base context.
+        from_document_version_id: Previous version ID.
+        to_document_version_id: New version ID.
+        from_version: Previous version label.
+        to_version: New version label.
+        old_facts: Facts from the previous active version.
+        new_facts: Facts from the new version.
+
+    Returns:
+        Deterministic delta records for added, removed, modified, and unchanged facts.
+    """
 
     old_by_key = _latest_by_key(old_facts)
     new_by_key = _latest_by_key(new_facts)
@@ -23,9 +42,14 @@ def compute_fact_deltas(
     for fact_key in sorted(set(old_by_key) | set(new_by_key)):
         old_fact = old_by_key.get(fact_key)
         new_fact = new_by_key.get(fact_key)
+        change_type: Literal["added", "removed", "modified", "unchanged"]
         if old_fact and new_fact and _same_fact_value(old_fact, new_fact):
-            continue
-        if old_fact and new_fact:
+            change_type = "unchanged"
+            old_value = _value_with_unit(old_fact)
+            new_value = _value_with_unit(new_fact)
+            requirement_id = new_fact.requirement_id or old_fact.requirement_id
+            evidence = [old_fact.evidence, new_fact.evidence]
+        elif old_fact and new_fact:
             change_type = "modified"
             old_value = _value_with_unit(old_fact)
             new_value = _value_with_unit(new_fact)
@@ -54,13 +78,17 @@ def compute_fact_deltas(
                 delta_id=stable_id(
                     "delta",
                     system_name,
-                    from_version,
-                    to_version,
+                    kb_name,
+                    from_document_version_id,
+                    to_document_version_id,
                     fact_key,
                     old_value,
                     new_value,
                 ),
                 system_name=system_name,
+                kb_name=kb_name,
+                from_document_version_id=from_document_version_id,
+                to_document_version_id=to_document_version_id,
                 from_version=from_version,
                 to_version=to_version,
                 fact_key=fact_key,

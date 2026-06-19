@@ -1,5 +1,0 @@
-generated: Generated 25 coverage scenario(s). Scenario selection used Neo4j 
-graph-backed requirement evidence.
-Run ID: coverage_run_91fef28475f05cd176a0781b9848a637
-Scope hash: scope_8e715b8a007ed2094cbe6829669ecd1e
-Generated count: 25

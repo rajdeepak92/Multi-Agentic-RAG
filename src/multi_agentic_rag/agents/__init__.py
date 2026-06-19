@@ -1,5 +1,5 @@
-"""LangGraph workflow skeleton."""
+"""Agents."""
 
-from multi_agentic_rag.agents.workflows import compile_basic_workflow
+from multi_agentic_rag.agents.knowledge_base import KnowledgeBaseStoringAgent
 
-__all__ = ["compile_basic_workflow"]
+__all__ = ["KnowledgeBaseStoringAgent"]

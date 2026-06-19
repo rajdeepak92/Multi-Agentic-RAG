@@ -1,5 +1,5 @@
-"""Information extraction interfaces and implementations."""
+"""Fact extraction."""
 
-from multi_agentic_rag.extraction.rule_extractors import extract_facts_from_chunk, extract_facts_from_text
+from multi_agentic_rag.extraction.rule_extractors import ExtractedFact, extract_facts_from_chunk
 
-__all__ = ["extract_facts_from_chunk", "extract_facts_from_text"]
+__all__ = ["ExtractedFact", "extract_facts_from_chunk"]

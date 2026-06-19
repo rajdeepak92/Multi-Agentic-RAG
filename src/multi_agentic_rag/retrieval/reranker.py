@@ -1,91 +1,110 @@
-"""Reranker interface placeholder."""
+"""Reranking service interfaces."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Protocol
+from importlib import import_module
+from typing import Any, Protocol
 
-from multi_agentic_rag.config import Settings, get_settings
-
-
-class Reranker(Protocol):
-    """Interface for future BGE reranker integration."""
-
-    def rerank(self, query: str, candidates: list[dict]) -> list[dict]: ...
+from multi_agentic_rag.config import Settings
+from multi_agentic_rag.domain import RetrievalResult
+from multi_agentic_rag.infrastructure.embeddings.provider import _configure_hf_token
 
 
-class NoopReranker:
-    """Phase 1 reranker that preserves candidate order."""
+class RerankingService(Protocol):
+    """Reranker contract."""
 
-    def rerank(self, query: str, candidates: list[dict]) -> list[dict]:
-        return candidates
+    def rerank(self, query_text: str, results: list[RetrievalResult]) -> list[RetrievalResult]:
+        """Rerank results.
+
+        Args:
+            query_text: Original user query.
+            results: Candidate retrieval results after fusion.
+
+        Returns:
+            Results in final presentation order. Implementations may update
+            scores and append source signals.
+        """
 
 
-@dataclass(frozen=True)
-class RerankerSelection:
-    """Selected reranker with provider metadata."""
+class NoOpRerankingService:
+    """Default reranker that preserves deterministic fused order."""
 
-    provider: str
-    model_name: str
-    reranker: Reranker
-    reason: str
+    def rerank(self, query_text: str, results: list[RetrievalResult]) -> list[RetrievalResult]:
+        """Return results unchanged.
+
+        Args:
+            query_text: Original user query. It is accepted for interface
+                compatibility and intentionally unused.
+            results: Candidate retrieval results after fusion.
+
+        Returns:
+            The same results in the same order.
+        """
+
+        return results
 
 
-class BGEReranker:
-    """Lazy BGE cross-encoder reranker for target GraphRAG mode."""
+class SentenceTransformerRerankingService:
+    """Optional local cross-encoder reranker."""
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, *, hf_token: str | None = None) -> None:
+        """Initialize the lazy cross-encoder reranker.
+
+        Args:
+            model_name: Local or Hugging Face cross-encoder model name loaded on
+                first rerank call.
+            hf_token: Optional Hugging Face token used for Hub downloads.
+        """
+
         self.model_name = model_name
-        self._model = None
+        self.hf_token = hf_token
+        self._model: Any | None = None
 
-    def rerank(self, query: str, candidates: list[dict]) -> list[dict]:
-        if not candidates:
-            return []
-        model = self._load_model()
-        pairs = [(query, str(candidate.get("text") or candidate.get("document") or "")) for candidate in candidates]
-        scores = model.predict(pairs)
-        scored = [
-            {**candidate, "rerank_score": float(score)}
-            for candidate, score in zip(candidates, scores, strict=False)
-        ]
-        return sorted(scored, key=lambda item: item["rerank_score"], reverse=True)
-
-    def check_ready(self, *, load_model: bool = False) -> tuple[bool, str]:
-        try:
-            from sentence_transformers import CrossEncoder  # noqa: F401
-        except ModuleNotFoundError:
-            return False, "sentence-transformers is required for BGE reranking."
-        if load_model:
-            try:
-                self._load_model()
-            except Exception as exc:  # pragma: no cover - model download/cache dependent
-                return False, str(exc)
-        return True, f"{self.model_name} is configured."
-
-    def _load_model(self):
+    def _load(self) -> Any:
         if self._model is None:
-            from sentence_transformers import CrossEncoder
-
-            self._model = CrossEncoder(self.model_name)
+            _configure_hf_token(self.hf_token)
+            module = import_module("sentence_transformers")
+            self._model = module.CrossEncoder(self.model_name, token=self.hf_token)
         return self._model
 
+    def rerank(self, query_text: str, results: list[RetrievalResult]) -> list[RetrievalResult]:
+        """Rerank using a local cross-encoder.
 
-def select_reranker(settings: Settings | None = None) -> RerankerSelection:
-    """Select the reranker requested by settings."""
+        Args:
+            query_text: Original user query.
+            results: Candidate retrieval results after fusion.
 
-    settings = settings or get_settings()
-    if settings.reranker_provider == "none":
-        return RerankerSelection(
-            provider="none",
-            model_name="noop",
-            reranker=NoopReranker(),
-            reason="No-op reranker selected for local/default mode.",
+        Returns:
+            Results sorted by cross-encoder score with ``reranker`` added to the
+            source signal list.
+        """
+
+        if not results:
+            return []
+        pairs = [(query_text, result.text) for result in results]
+        scores = [float(score) for score in self._load().predict(pairs)]
+        rescored = [
+            result.model_copy(update={"score": score, "sources": [*result.sources, "reranker"]})
+            for result, score in zip(results, scores, strict=True)
+        ]
+        return sorted(rescored, key=lambda item: (-item.score, item.chunk_id))
+
+
+def select_reranker(settings: Settings) -> RerankingService:
+    """Select the configured reranker.
+
+    Args:
+        settings: Runtime configuration containing reranker provider and model
+            values.
+
+    Returns:
+        Cross-encoder reranker when explicitly configured, otherwise the no-op
+        deterministic reranker.
+    """
+
+    if settings.reranker_provider == "sentence_transformers" and settings.reranker_model:
+        return SentenceTransformerRerankingService(
+            settings.reranker_model,
+            hf_token=settings.hf_token,
         )
-    if settings.reranker_provider == "huggingface":
-        return RerankerSelection(
-            provider="huggingface",
-            model_name=settings.default_reranker_model,
-            reranker=BGEReranker(settings.default_reranker_model),
-            reason="BGE reranker selected for target GraphRAG mode.",
-        )
-    raise ValueError(f"Unsupported reranker provider: {settings.reranker_provider}")
+    return NoOpRerankingService()

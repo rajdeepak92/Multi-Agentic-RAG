@@ -1,717 +1,473 @@
-"""Typer command-line interface."""
+"""Typer command-line interface for the GraphRAG-only runtime."""
 
 from __future__ import annotations
 
+import asyncio
+import gc
+import os
+import shutil
+import stat
+import time
+from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Annotated
 
 import typer
-import uvicorn
 from rich.console import Console
 from rich.table import Table
 
-from multi_agentic_rag.config import get_settings
-from multi_agentic_rag.coverage import DEFAULT_SCENARIO_COUNT, plan_requirement_coverage
-from multi_agentic_rag.exceptions import IngestionError
-from multi_agentic_rag.ingestion import ingest_document
-from multi_agentic_rag.models import DocumentStatus, TaskResult, TestExecutionResult
-from multi_agentic_rag.retrieval import answer_query
-from multi_agentic_rag.storage.neo4j_store import Neo4jGraphStore
-from multi_agentic_rag.storage.cleanup import clean_system_state
-from multi_agentic_rag.storage.registry import select_registry
-from multi_agentic_rag.storage.vector_factory import select_vector_store
-from multi_agentic_rag.tasks import handle_task
-from multi_agentic_rag.testing import generate_testcases, get_last_test_result, run_testcases
-from multi_agentic_rag.utils.diagnostics import DiagnosticCheck, run_diagnostics
-from multi_agentic_rag.utils.paths import ensure_runtime_dirs
-from multi_agentic_rag.workflows import (
-    BrdValidationResult,
-    DemoRunResult,
-    IngestionSummary,
-    create_demo_pdfs,
-    ingest_real_brd,
-    run_demo_workflow,
-    run_graph_check,
-    validate_real_brd,
+from multi_agentic_rag.agents import KnowledgeBaseStoringAgent
+from multi_agentic_rag.config import Settings, get_settings
+from multi_agentic_rag.exceptions import MultiAgenticRagError
+from multi_agentic_rag.infrastructure.chroma import ChromaVectorRepository
+from multi_agentic_rag.infrastructure.neo4j import Neo4jGraphRepository
+from multi_agentic_rag.infrastructure.postgres import PostgresKnowledgeRepository
+from multi_agentic_rag.retrieval import (
+    BM25Retriever,
+    GraphRetriever,
+    HybridKnowledgeRetriever,
+    VectorRetriever,
 )
+from multi_agentic_rag.retrieval.reranker import select_reranker
 
 app = typer.Typer(
     name="multi-agentic-rag",
-    help="Local-first graph-based agentic RAG for versioned engineering documents.",
+    help="GraphRAG-only knowledge base ingestion and retrieval.",
     no_args_is_help=True,
 )
 console = Console()
-
-
-@app.command("init")
-def init() -> None:
-    """Create runtime directories and initialize the configured registry."""
-
-    settings = get_settings()
-    paths = ensure_runtime_dirs(settings)
-    registry_selection = select_registry(settings)
-    registry_selection.registry.initialize()
-    console.print("[bold green]Initialized multi-agentic-rag workspace.[/bold green]")
-    console.print(f"Home: {paths['home']}")
-    console.print(f"Documents: {paths['documents']}")
-    console.print(f"Chroma: {paths['chroma']}")
-    console.print(f"Objects: {paths['objects']}")
-    console.print(f"Exports: {paths['exports']}")
-    console.print(f"Registry provider: {registry_selection.provider} ({registry_selection.reason})")
-    if registry_selection.provider == "sqlite":
-        console.print(f"SQLite registry: {paths['registry']}")
-    try:
-        selection = select_vector_store(settings)
-        console.print(f"Vector provider: {selection.provider} ({selection.reason})")
-    except Exception as exc:
-        console.print(f"[yellow]WARN[/yellow] Vector provider not ready: {exc}")
-    console.print("\nNext steps:")
-    console.print("1. Create or edit .env with local ingestion settings.")
-    console.print("2. Start local Neo4j and make sure Hugging Face models can be loaded.")
-    console.print("3. Run: multi-agentic-rag doctor")
-    console.print("4. Ingest V1 and V2 documents for the target system.")
-
-
-@app.command("doctor")
-def doctor(
-    strict: Annotated[
-        bool,
-        typer.Option("--strict", help="Treat WARN checks as command failures."),
-    ] = False,
-    target_graphrag: Annotated[
-        bool,
-        typer.Option(
-            "--target-graphrag",
-            help="Run strict Option-4 GraphRAG target checks.",
-        ),
-    ] = False,
-    system: Annotated[
-        str | None,
-        typer.Option("--system", help="System name for target graph-population checks."),
-    ] = None,
-    version: Annotated[
-        str | None,
-        typer.Option("--version", help="Version for target graph-population checks."),
-    ] = None,
-) -> None:
-    """Validate local environment and optional services."""
-
-    settings = get_settings()
-    target_mode = target_graphrag or settings.marag_target_mode == "target-graphrag"
-    checks = run_diagnostics(
-        settings=settings,
-        target_graphrag=target_mode,
-        system_name=system,
-        version=version,
-    )
-    _print_checks(checks)
-    strict = strict or target_mode
-    failure_statuses = {"FAIL", "WARN"} if strict else {"FAIL"}
-    if any(check.status in failure_statuses for check in checks):
-        raise typer.Exit(code=1)
-
-
-@app.command("graph-check")
-def graph_check() -> None:
-    """Safely verify Neo4j graph read/write/delete behavior."""
-
-    result = run_graph_check()
-    style = "green" if result.success else "red"
-    console.print(f"[{style}]{result.status}[/{style}] {result.detail}")
-    if not result.success:
-        raise typer.Exit(code=1)
-
-
-@app.command("demo-pdf")
-def demo_pdf() -> None:
-    """Generate deterministic local demo V1/V2 PDFs."""
-
-    result = create_demo_pdfs(overwrite=False)
-    if not result.success:
-        console.print(f"[red]FAIL[/red] {result.error}")
-        return
-    console.print("[green]PASS[/green] Created demo PDFs")
-    console.print(f"V1: {result.v1_path}")
-    console.print(f"V2: {result.v2_path}")
-
-
-@app.command("demo-run")
-def demo_run() -> None:
-    """Run deterministic local V1/V2 ingestion, delta, query, and coverage proof."""
-
-    try:
-        result = run_demo_workflow()
-    except IngestionError as exc:
-        console.print(f"[red]FAIL[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-    _print_demo_run(result)
-
-
-@app.command("validate-real-brd")
-def validate_real_brd_command() -> None:
-    """Validate exact real SIIMCS BRD V1/V2 PDF inputs without ingesting."""
-
-    result = validate_real_brd()
-    _print_validation(result)
-    if result.status == "FAIL":
-        raise typer.Exit(code=1)
-
-
-@app.command("ingest-real-brd")
-def ingest_real_brd_command() -> None:
-    """Ingest exact real SIIMCS BRD V1/V2 files in version order."""
-
-    try:
-        summary = ingest_real_brd()
-    except IngestionError as exc:
-        console.print(f"[red]FAIL[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-    _print_ingestion_summary(summary)
-
-
-@app.command("api")
-def api(
-    host: Annotated[str | None, typer.Option("--host", help="API bind host.")] = None,
-    port: Annotated[int | None, typer.Option("--port", help="API bind port.")] = None,
-) -> None:
-    """Start the local FastAPI service."""
-
-    settings = get_settings()
-    graph_store = Neo4jGraphStore(settings)
-    available, message = graph_store.check_connection()
-    graph_store.close()
-    if not available:
-        console.print(f"[yellow]WARN[/yellow] Neo4j unavailable: {message}")
-    uvicorn.run(
-        "multi_agentic_rag.api.main:app",
-        host=host or settings.api_host,
-        port=port or settings.api_port,
-        reload=False,
-    )
+SUPPORTED_DOCUMENT_SUFFIXES = {".pdf", ".docx", ".txt", ".md", ".markdown"}
 
 
 @app.command("ingest")
 def ingest(
-    path: Annotated[Path, typer.Argument(help="Path to PDF or DOCX document.")],
+    document_path: Annotated[Path, typer.Argument(help="Path to PDF, DOCX, TXT, or Markdown.")],
     system: Annotated[str, typer.Option("--system", help="System name.")],
     version: Annotated[str, typer.Option("--version", help="Document version.")],
+    kb: Annotated[str, typer.Option("--kb", help="Knowledge base name or context.")] = "default",
 ) -> None:
-    """Ingest a versioned PDF or DOCX document."""
+    """Ingest a versioned document into PostgreSQL, Chroma, and Neo4j.
 
-    result = ingest_document(path, system_name=system, version=version)
-    console.print(f"[green]Ingested[/green] {result.document.source_name}")
-    console.print(f"Document ID: {result.document.document_id}")
-    console.print(f"Status: {result.document.status.value}")
-    console.print(f"Chunks indexed: {result.chunks_indexed}")
-    console.print(f"Facts extracted: {result.facts_extracted}")
-    console.print(f"Deltas created: {result.deltas_created}")
-    console.print(f"Vector store: {result.vector_store}")
-    console.print(f"Keyword indexed: {result.keyword_indexed}")
-    if result.object_store_path:
-        console.print(f"Parsed artifact: {result.object_store_path}")
-    console.print(f"Neo4j available: {result.neo4j_available}")
-    for warning in result.warnings:
-        console.print(f"[yellow]WARN[/yellow] {warning}")
+    Args:
+        document_path: Local source file to ingest. Supported extensions are
+            PDF, DOCX, TXT, Markdown, and related text-like formats.
+        system: Logical system name used to scope lineage, retrieval, and graph
+            projection.
+        version: Source document version. This is validated against the file
+            name when the name exposes a version token.
+        kb: Knowledge-base name or context under the selected system.
+    """
+
+    try:
+        result = asyncio.run(
+            KnowledgeBaseStoringAgent().ingest(
+                document_path,
+                kb,
+                system=system,
+                version=version,
+            )
+        )
+    except MultiAgenticRagError as exc:
+        console.print(f"[red]FAIL[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    _print_ingest_result(result.model_dump())
 
 
-@app.command("ingest-doc")
-def ingest_doc(
-    path: Annotated[Path, typer.Argument(help="Path to PDF or DOCX document.")],
+@app.command("ingest-directory")
+def ingest_directory(
+    directory_path: Annotated[Path, typer.Argument(help="Directory containing source documents.")],
     system: Annotated[str, typer.Option("--system", help="System name.")],
     version: Annotated[str, typer.Option("--version", help="Document version.")],
+    kb: Annotated[str, typer.Option("--kb", help="Knowledge base name or context.")] = "default",
+    recursive: Annotated[
+        bool,
+        typer.Option("--recursive/--no-recursive", help="Search subdirectories."),
+    ] = True,
 ) -> None:
-    """Alias for ingesting a versioned PDF or DOCX document."""
+    """Ingest every supported document in a directory.
 
-    ingest(path=path, system=system, version=version)
+    Args:
+        directory_path: Directory containing PDF, DOCX, TXT, Markdown, or
+            `.markdown` files.
+        system: Logical system name used to scope lineage, retrieval, and graph
+            projection.
+        version: Source document version to apply to every file in the batch.
+        kb: Knowledge-base name or context under the selected system.
+        recursive: Whether to scan nested directories.
+    """
 
-
-@app.command("ingest-folder")
-def ingest_folder(
-    folder: Annotated[Path, typer.Argument(help="Folder containing PDF/DOCX documents.")],
-    system: Annotated[str, typer.Option("--system", help="System name.")],
-    version: Annotated[str, typer.Option("--version", help="Document version.")],
-) -> None:
-    """Ingest every supported document in a folder for the same system/version."""
-
-    if not folder.exists() or not folder.is_dir():
-        console.print(f"[red]Folder does not exist:[/red] {folder}")
+    files = _document_files(directory_path, recursive=recursive)
+    if not files:
+        console.print("[yellow]No supported documents found.[/yellow]")
         raise typer.Exit(code=1)
-    supported = sorted(
-        path
-        for path in folder.iterdir()
-        if path.is_file() and path.suffix.lower() in {".pdf", ".docx"}
+    results = asyncio.run(
+        _ingest_many(
+            files,
+            system=system,
+            version=version,
+            kb=kb,
+        )
     )
-    if not supported:
-        console.print("[yellow]No supported .pdf or .docx files found.[/yellow]")
-        raise typer.Exit(code=1)
-    table = Table(title="Folder Ingestion")
-    table.add_column("File")
+    table = Table(title="Directory Ingestion")
+    table.add_column("Document")
     table.add_column("Status")
+    table.add_column("Document Version ID")
     table.add_column("Chunks")
     table.add_column("Facts")
-    for path in supported:
-        result = ingest_document(path, system_name=system, version=version)
+    table.add_column("Warnings")
+    failures = 0
+    for path, result, error in results:
+        if error:
+            failures += 1
+            table.add_row(path.name, "[red]FAIL[/red]", "-", "-", "-", error)
+            continue
+        assert result is not None
         table.add_row(
             path.name,
-            result.document.status.value,
-            str(result.chunks_indexed),
-            str(result.facts_extracted),
-        )
-        for warning in result.warnings:
-            console.print(f"[yellow]WARN[/yellow] {path.name}: {warning}")
-    console.print(table)
-
-
-@app.command("query")
-def query(
-    user_query: Annotated[str, typer.Argument(help="Question to answer.")],
-    system: Annotated[str | None, typer.Option("--system", help="System name.")] = None,
-    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
-) -> None:
-    """Query current, historical, or delta-aware evidence."""
-
-    result = answer_query(user_query, system_name=system, version=version)
-    style = "green" if result.supported else "yellow"
-    console.print(f"[{style}]{result.answer}[/{style}]")
-    if result.evidence:
-        console.print("\nEvidence:")
-        for evidence in result.evidence:
-            console.print(
-                f"- {evidence.source_name} p.{evidence.page} "
-                f"({evidence.version}, {evidence.chunk_id})"
-            )
-    for warning in result.warnings:
-        console.print(f"[yellow]WARN[/yellow] {warning}")
-
-
-@app.command("delta")
-def delta(
-    system: Annotated[str, typer.Option("--system", help="System name.")],
-    from_version: Annotated[str | None, typer.Option("--from", help="Source version.")] = None,
-    to_version: Annotated[str | None, typer.Option("--to", help="Target version.")] = None,
-) -> None:
-    """Show deterministic deltas."""
-
-    registry = select_registry(get_settings()).registry
-    registry.initialize()
-    records = registry.list_deltas(
-        system_name=system,
-        from_version=from_version,
-        to_version=to_version,
-    )
-    if not records:
-        console.print("[yellow]No delta records found. No impact claim can be made.[/yellow]")
-        return
-    table = Table(title="Delta Records")
-    table.add_column("Type")
-    table.add_column("From")
-    table.add_column("To")
-    table.add_column("Old")
-    table.add_column("New")
-    table.add_column("Risk")
-    for record in records:
-        table.add_row(
-            record.change_type,
-            record.from_version,
-            record.to_version,
-            record.old_value or "",
-            record.new_value or "",
-            record.risk_level,
+            "[green]PASS[/green]",
+            str(result["document_version_id"]),
+            str(result["chunks_count"]),
+            str(result["facts_count"]),
+            "; ".join(result["warnings"]),
         )
     console.print(table)
-
-
-@app.command("coverage")
-def coverage(
-    system: Annotated[str, typer.Option("--system", help="System name.")],
-    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
-    count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
-) -> None:
-    """Generate or reuse tracked coverage records."""
-
-    result = plan_requirement_coverage(
-        system_name=system,
-        version=version,
-        scenario_count=count,
-    )
-    if not result.supported:
-        console.print(f"[yellow]{result.message}[/yellow]")
-        return
-    table = Table(title="Coverage Records")
-    table.add_column("Requirement")
-    table.add_column("Index")
-    table.add_column("Scenario")
-    table.add_column("Status")
-    table.add_column("Priority")
-    for record in result.records:
-        table.add_row(
-            record.requirement_id,
-            str(record.scenario_index or ""),
-            record.test_scenario,
-            record.coverage_status,
-            record.priority,
-        )
-    console.print(table)
-    console.print(f"{result.action}: {result.message}")
-
-
-@app.command("coverage-plan")
-def coverage_plan(
-    system: Annotated[str, typer.Option("--system", help="System name.")],
-    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
-    count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
-    force: Annotated[bool, typer.Option("--force", help="Regenerate even if covered.")] = False,
-) -> None:
-    """Generate or reuse tracked coverage scenarios."""
-
-    result = plan_requirement_coverage(
-        system_name=system,
-        version=version,
-        scenario_count=count,
-        force=force,
-    )
-    console.print(f"{result.action}: {result.message}")
-    if result.run:
-        console.print(f"Run ID: {result.run.run_id}")
-        console.print(f"Scope hash: {result.run.scope_hash}")
-        console.print(f"Generated count: {result.run.generated_count}")
-    if not result.supported:
-        raise typer.Exit(code=1)
-
-
-@app.command("generate-tests")
-def generate_tests(
-    system: Annotated[str, typer.Option("--system", help="System name.")],
-    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
-    count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
-    force: Annotated[bool, typer.Option("--force", help="Rewrite generated file.")] = False,
-    mock: Annotated[
-        bool,
-        typer.Option("--mock", help="Generate explicit mock-device tests with no real connection."),
-    ] = False,
-    execution_mode: Annotated[
-        str | None,
-        typer.Option("--execution-mode", help="Execution mode: mock, simulator, real, or auto."),
-    ] = None,
-) -> None:
-    """Generate or reuse a pytest testcase file from coverage evidence."""
-
-    result = generate_testcases(
-        system_name=system,
-        version=version,
-        scenario_count=count,
-        force=force,
-        execution_mode=_resolve_execution_mode(mock=mock, execution_mode=execution_mode),
-    )
-    console.print(f"{result.action}: {result.message}")
-    if result.test_file:
-        console.print(f"Test file: {result.test_file.file_path}")
-    if not result.supported:
-        raise typer.Exit(code=1)
-
-
-@app.command("run-testcases")
-def run_testcases_command(
-    system: Annotated[str, typer.Option("--system", help="System name.")],
-    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
-    count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
-    force_run_all: Annotated[
-        bool,
-        typer.Option("--force-run-all", help="Execute unchanged scenarios instead of skipping them."),
-    ] = False,
-    mock: Annotated[
-        bool,
-        typer.Option("--mock", help="Run generated testcases in explicit mock-device mode."),
-    ] = False,
-    execution_mode: Annotated[
-        str | None,
-        typer.Option("--execution-mode", help="Execution mode: mock, simulator, real, or auto."),
-    ] = None,
-) -> None:
-    """Run the generated pytest testcase file and store results."""
-
-    result = run_testcases(
-        system_name=system,
-        version=version,
-        scenario_count=count,
-        force_run_all=force_run_all,
-        execution_mode=_resolve_execution_mode(mock=mock, execution_mode=execution_mode),
-    )
-    _print_test_execution(result)
-    if not result.supported:
-        raise typer.Exit(code=1)
-
-
-@app.command("last-results")
-def last_results(
-    system: Annotated[str, typer.Option("--system", help="System name.")],
-    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
-) -> None:
-    """Show the last stored testcase execution result without rerunning."""
-
-    result = get_last_test_result(system_name=system, version=version)
-    _print_test_execution(result)
-    if not result.supported:
+    if failures:
         raise typer.Exit(code=1)
 
 
 @app.command("clean-system-state")
-def clean_system_state_command(
-    system: Annotated[str, typer.Option("--system", help="System name to remove.")],
-    yes: Annotated[
-        bool,
-        typer.Option("--yes", help="Confirm deletion of this system's local runtime state."),
-    ] = False,
-    include_neo4j: Annotated[
-        bool,
-        typer.Option("--include-neo4j/--skip-neo4j", help="Delete matching Neo4j graph nodes."),
-    ] = True,
-    include_generated: Annotated[
-        bool,
-        typer.Option(
-            "--include-generated/--keep-generated",
-            help="Delete generated/<system>/ automation artifacts.",
-        ),
-    ] = True,
-) -> None:
-    """Remove one system from SQLite, Chroma, optional Neo4j, and generated artifacts."""
-
-    if not yes:
-        console.print(
-            "[yellow]Refusing to delete without --yes.[/yellow] "
-            "This command removes local runtime state for exactly one system."
-        )
-        raise typer.Exit(code=1)
-    result = clean_system_state(
-        system,
-        include_neo4j=include_neo4j,
-        include_generated=include_generated,
-    )
-    table = Table(title=f"Cleaned System State: {result.system_name}")
-    table.add_column("Store")
-    table.add_column("Deleted")
-    for table_name, count in result.sqlite_deleted.items():
-        table.add_row(f"sqlite:{table_name}", str(count))
-    table.add_row("chroma", "" if result.chroma_deleted is None else str(result.chroma_deleted))
-    table.add_row("neo4j", "" if result.neo4j_deleted is None else str(result.neo4j_deleted))
-    table.add_row("files", str(len(result.files_deleted)))
-    console.print(table)
-    for path in result.files_deleted:
-        console.print(f"Deleted: {path}")
-    for warning in result.warnings:
-        console.print(f"[yellow]WARN[/yellow] {warning}")
-
-
-@app.command("task")
-def task(
-    user_request: Annotated[str, typer.Argument(help="Natural-language MARAG task.")],
-    system: Annotated[str, typer.Option("--system", help="System name.")],
-    version: Annotated[str | None, typer.Option("--version", help="Specific version.")] = None,
-    count: Annotated[int, typer.Option("--count", help="Scenario count.")] = DEFAULT_SCENARIO_COUNT,
-    mock: Annotated[
-        bool,
-        typer.Option("--mock", help="Route the task with explicit mock-device execution mode."),
-    ] = False,
-    execution_mode: Annotated[
+def clean_system_state(
+    system: Annotated[
         str | None,
-        typer.Option("--execution-mode", help="Execution mode: mock, simulator, real, or auto."),
+        typer.Option("--system", help="System name to clean. Omit only with --all."),
     ] = None,
+    kb: Annotated[
+        str | None,
+        typer.Option("--kb", help="Optional knowledge-base scope inside --system."),
+    ] = None,
+    all_data: Annotated[
+        bool,
+        typer.Option("--all", help="Delete all GraphRAG rows, vectors, and graph nodes."),
+    ] = False,
+    delete_cache: Annotated[
+        bool,
+        typer.Option("--delete-cache", help="Delete runtime/cache directories; requires --all."),
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", help="Confirm destructive cleanup.")] = False,
 ) -> None:
-    """Route a natural-language request to query, coverage, writer, or runner agents."""
+    """Clean PostgreSQL, ChromaDB, and Neo4j state.
 
-    result = handle_task(
-        user_request,
-        system_name=system,
-        version=version,
-        scenario_count=count,
-        execution_mode=_resolve_execution_mode(mock=mock, execution_mode=execution_mode),
-    )
-    _print_task_result(result)
-    if not result.supported:
+    Args:
+        system: Optional system scope. Required unless `--all` is supplied.
+        kb: Optional knowledge-base scope within the selected system.
+        all_data: Delete all GraphRAG data from every configured backend.
+        delete_cache: Delete `.multi_agentic_rag` and `.cache` after database
+            cleanup. This is intentionally all-or-nothing.
+        yes: Required confirmation flag for non-interactive runs.
+    """
+
+    if all_data and system:
+        console.print("[red]FAIL[/red] Use either --all or --system, not both.")
+        raise typer.Exit(code=1)
+    if not all_data and not system:
+        console.print("[red]FAIL[/red] Provide --system or --all.")
+        raise typer.Exit(code=1)
+    if all_data and kb:
+        console.print("[red]FAIL[/red] --kb can only be used with --system.")
+        raise typer.Exit(code=1)
+    if delete_cache and not all_data:
+        console.print("[red]FAIL[/red] --delete-cache requires --all.")
+        raise typer.Exit(code=1)
+    if not yes and not typer.confirm("Delete configured GraphRAG state?"):
         raise typer.Exit(code=1)
 
-
-@app.command("mcp-info")
-def mcp_info() -> None:
-    """Print planned MCP architecture for later phases."""
-
-    console.print("[bold]MCP Phase 1 Status[/bold]")
-    console.print("MCP is disabled in Phase 1. FastAPI is the active local service boundary.")
-    console.print("Future MCP tools/resources/prompts will call the same internal services used now.")
-    console.print("\nPlanned MCP tools:")
-    for tool_name in (
-        "ingest_document",
-        "query_current_truth",
-        "query_history",
-        "compute_delta",
-        "generate_coverage",
-        "inspect_graph",
-    ):
-        console.print(f"- {tool_name}")
-
-
-def _print_checks(checks: list[DiagnosticCheck]) -> None:
-    table = Table(title="multi-agentic-rag doctor")
-    table.add_column("Check")
-    table.add_column("Status")
-    table.add_column("Detail")
-    for check in checks:
-        style = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}.get(check.status, "white")
-        table.add_row(check.name, f"[{style}]{check.status}[/{style}]", check.detail)
-    console.print(table)
-
-
-def _print_validation(result: BrdValidationResult) -> None:
-    table = Table(title=f"Real BRD Validation: {result.status}")
-    table.add_column("Item")
-    table.add_column("Status")
-    table.add_column("Detail")
-    for row in result.rows:
-        style = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}.get(row.status, "white")
-        table.add_row(row.item, f"[{style}]{row.status}[/{style}]", row.detail)
-    console.print(table)
-
-
-def _print_ingestion_summary(summary: IngestionSummary) -> None:
-    table = Table(title="V1/V2 Ingestion Summary")
-    table.add_column("Field")
-    table.add_column("Value")
-    table.add_row("source_v1_path", str(summary.source_v1_path))
-    table.add_row("source_v2_path", str(summary.source_v2_path))
-    table.add_row(
-        "active_document",
-        f"{summary.active_document.document_id} ({summary.active_document.version})"
-        if summary.active_document
-        else "",
-    )
-    table.add_row(
-        "superseded_document",
-        f"{summary.superseded_document.document_id} ({summary.superseded_document.version})"
-        if summary.superseded_document
-        else "",
-    )
-    table.add_row("number_of_chunks", str(summary.number_of_chunks))
-    table.add_row("number_of_extracted_facts", str(summary.number_of_extracted_facts))
-    table.add_row("number_of_delta_records", str(summary.number_of_delta_records))
-    table.add_row("Neo4j write status", summary.neo4j_write_status)
-    table.add_row("Vector provider", summary.vector_provider)
-    table.add_row("Vector write status", summary.chroma_write_status)
-    table.add_row("Keyword index status", summary.keyword_index_status)
-    table.add_row("SQLite write status", summary.sqlite_write_status)
-    console.print(table)
-    for warning in summary.warnings:
-        console.print(f"[yellow]WARN[/yellow] {warning}")
-
-
-def _print_demo_run(result: DemoRunResult) -> None:
-    console.print("[green]PASS[/green] demo-run completed")
-    _print_ingestion_summary(result.summary)
-    console.print(f"Demo V1: {result.pdfs.v1_path}")
-    console.print(f"Demo V2: {result.pdfs.v2_path}")
-    console.print(f"Active threshold: {result.active_threshold}")
-    console.print(f"Superseded threshold: {result.superseded_threshold}")
-    if result.threshold_delta:
-        console.print(
-            "Threshold delta: "
-            f"{result.threshold_delta.fact_key} changed from "
-            f"{result.threshold_delta.old_value} to {result.threshold_delta.new_value}"
+    settings = get_settings()
+    scope_system = None if all_data else system
+    scope_kb = None if all_data else kb
+    postgres_counts = asyncio.run(
+        PostgresKnowledgeRepository.from_settings(settings).clear(
+            system_name=scope_system,
+            kb_name=scope_kb,
         )
-    else:
-        console.print("[yellow]WARN[/yellow] No threshold delta found.")
-    console.print(f"Current query: {result.current_query.answer}")
-    console.print(f"Historical query: {result.historical_query.answer}")
-    console.print(f"Delta query: {result.delta_query.answer}")
-    console.print(f"Coverage draft records: {len(result.coverage_records)}")
+    )
+    chroma_repo = ChromaVectorRepository.from_settings(settings)
+    try:
+        chroma_deleted = chroma_repo.clear(
+            system_name=scope_system,
+            kb_name=scope_kb,
+        )
+    finally:
+        chroma_repo.close()
+    del chroma_repo
+    gc.collect()
+    graph_repo = Neo4jGraphRepository(settings)
+    try:
+        graph_ready, graph_message = graph_repo.check_connection()
+        if not graph_ready:
+            console.print(f"[red]FAIL[/red] Neo4j cleanup unavailable: {graph_message}")
+            raise typer.Exit(code=1)
+        graph_deleted = graph_repo.clear(system_name=scope_system, kb_name=scope_kb)
+    finally:
+        graph_repo.close()
+    gc.collect()
+    deleted_paths, skipped_paths = _delete_runtime_cache(settings) if delete_cache else ([], [])
 
-
-def _print_test_execution(result: TestExecutionResult) -> None:
-    style = "green" if result.supported else "yellow"
-    console.print(f"[{style}]{result.action}: {result.message}[/{style}]")
-    if result.test_file:
-        console.print(f"Test file: {result.test_file.file_path}")
-    if result.result:
-        table = Table(title="Test Run Result")
-        table.add_column("Field")
-        table.add_column("Value")
-        table.add_row("status", result.result.status)
-        table.add_row("exit_code", "" if result.result.exit_code is None else str(result.result.exit_code))
-        table.add_row("passed", str(result.result.passed))
-        table.add_row("failed", str(result.result.failed))
-        table.add_row("skipped", str(result.result.skipped))
-        table.add_row("blocked", str(result.result.blocked))
-        table.add_row("xml_report_path", result.result.xml_report_path or "")
-        table.add_row("duration_seconds", f"{result.result.duration_seconds:.3f}")
-        table.add_row("created_at", result.result.created_at)
-        console.print(table)
-    for warning in result.warnings:
-        console.print(f"[yellow]WARN[/yellow] {warning}")
-
-
-def _print_task_result(result: TaskResult) -> None:
-    style = "green" if result.supported else "yellow"
-    console.print(f"[{style}]{result.intent}: {result.message}[/{style}]")
-    if result.query and result.query.evidence:
-        console.print("\nEvidence:")
-        for evidence in result.query.evidence[:10]:
-            console.print(
-                f"- {evidence.source_name} p.{evidence.page} "
-                f"({evidence.version}, {evidence.chunk_id})"
-            )
-    if result.coverage and result.coverage.run:
-        console.print(f"Coverage run: {result.coverage.run.run_id}")
-        console.print(f"Coverage records: {len(result.coverage.records)}")
-    if result.test_generation and result.test_generation.test_file:
-        console.print(f"Test file: {result.test_generation.test_file.file_path}")
-    if result.test_execution:
-        _print_test_execution(result.test_execution)
-    if result.automation:
-        artifacts = result.automation.generated_artifacts
-        if artifacts.pytest_files or artifacts.robot_files or artifacts.json_sidecars:
-            console.print("\nArtifacts:")
-        for path in artifacts.pytest_files:
-            console.print(f"- pytest file: {path}")
-        for path in artifacts.robot_files:
-            console.print(f"- robot file: {path}")
-        for path in artifacts.json_sidecars:
-            console.print(f"- json sidecar: {path}")
-        for path in artifacts.xml_reports:
-            console.print(f"- pytest xml: {path}")
-        for path in artifacts.coverage_reports:
-            console.print(f"- coverage report: {path}")
-        summary = result.automation.execution_summary
-        if any(
-            [
-                summary.executed,
-                summary.passed,
-                summary.failed,
-                summary.skipped,
-                summary.blocked,
-                summary.skipped_unchanged,
-                summary.reused_from_previous_version,
-            ]
-        ):
-            console.print("\nExecution:")
-            console.print(f"- executed: {summary.executed}")
-            console.print(f"- reused from previous version: {summary.reused_from_previous_version}")
-            console.print(f"- skipped unchanged: {summary.skipped_unchanged}")
-            console.print(f"- blocked: {summary.blocked}")
-            console.print(f"- failed: {summary.failed}")
-            console.print(f"- passed: {summary.passed}")
-        console.print(f"\nDatabase: {result.automation.db_update_status}")
-    for warning in result.warnings:
-        console.print(f"[yellow]WARN[/yellow] {warning}")
-
-
-def _resolve_execution_mode(*, mock: bool, execution_mode: str | None) -> str | None:
-    if mock:
-        return "mock"
-    if execution_mode is None:
-        return None
-    mode = execution_mode.strip().lower()
-    if mode not in {"mock", "simulator", "real", "auto"}:
-        console.print("[red]Invalid execution mode.[/red] Use mock, simulator, real, or auto.")
+    table = Table(title="Clean System State")
+    table.add_column("Target")
+    table.add_column("Deleted")
+    table.add_row("PostgreSQL rows", str(sum(postgres_counts.values())))
+    table.add_row("Chroma vectors", str(chroma_deleted))
+    table.add_row("Neo4j nodes", str(graph_deleted))
+    table.add_row("Runtime/cache paths", str(len(deleted_paths)))
+    console.print(table)
+    if deleted_paths:
+        for path in deleted_paths:
+            console.print(f"deleted_path: {path}")
+    if skipped_paths:
+        for path, reason in skipped_paths:
+            console.print(f"[yellow]WARN[/yellow] could_not_delete: {path} ({reason})")
         raise typer.Exit(code=1)
-    return mode
+
+
+def _print_ingest_result(rows: dict) -> None:
+    for key in (
+        "document_id",
+        "document_version_id",
+        "chunks_count",
+        "facts_count",
+        "deltas_count",
+        "postgres_status",
+        "chroma_status",
+        "neo4j_status",
+        "bm25_status",
+        "ingestion_run_id",
+    ):
+        console.print(f"{key}: {rows[key]}")
+    for warning in rows["warnings"]:
+        console.print(f"[yellow]WARN[/yellow] {warning}")
+
+
+@app.command("retrieve")
+def retrieve(
+    query: Annotated[str, typer.Argument(help="Query text.")],
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    kb: Annotated[str, typer.Option("--kb", help="Knowledge base name or context.")] = "default",
+    version: Annotated[str | None, typer.Option("--version", help="Optional version.")] = None,
+    top_k: Annotated[int, typer.Option("--top-k", help="Number of chunks to return.")] = 5,
+) -> None:
+    """Retrieve ranked evidence chunks.
+
+    Args:
+        query: Natural-language query or keyword phrase to match against the
+            knowledge base.
+        system: Logical system name that constrains the retrieval search.
+        kb: Knowledge-base name or context under the selected system.
+        version: Optional document version filter. When omitted, retrieval uses
+            active chunks for the knowledge base.
+        top_k: Maximum number of evidence chunks to print.
+    """
+
+    try:
+        results = asyncio.run(
+            _build_retriever().retrieve(
+                query,
+                system_name=system,
+                kb_name=kb,
+                version=version,
+                top_k=top_k,
+            )
+        )
+    except MultiAgenticRagError as exc:
+        console.print(f"[red]FAIL[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if not results:
+        console.print("[yellow]No evidence found.[/yellow]")
+        return
+    table = Table(title="Retrieval Results")
+    table.add_column("Score")
+    table.add_column("Version")
+    table.add_column("Source")
+    table.add_column("Page")
+    table.add_column("Signals")
+    table.add_column("Text")
+    for result in results:
+        table.add_row(
+            f"{result.score:.4f}",
+            result.version,
+            result.source_name,
+            str(result.page),
+            ",".join(result.sources),
+            result.text[:180].replace("\n", " "),
+        )
+    console.print(table)
+
+
+@app.command("db-check")
+def db_check() -> None:
+    """Check PostgreSQL readiness."""
+
+    settings = get_settings()
+    status, detail = asyncio.run(
+        PostgresKnowledgeRepository.from_settings(settings).check_connection()
+    )
+    _print_check("PostgreSQL", status, detail)
+
+
+@app.command("chroma-check")
+def chroma_check() -> None:
+    """Check Chroma readiness."""
+
+    status, detail = ChromaVectorRepository.from_settings(get_settings()).check_connection()
+    _print_check("Chroma", status, detail)
+
+
+@app.command("graph-check")
+def graph_check() -> None:
+    """Check Neo4j readiness with a temporary node."""
+
+    repository = Neo4jGraphRepository(get_settings())
+    try:
+        status, detail = repository.run_graph_check()
+    finally:
+        repository.close()
+    _print_check("Neo4j", status, detail)
+
+
+@app.command("health-check")
+def health_check() -> None:
+    """Check PostgreSQL, Chroma, and Neo4j together."""
+
+    settings = get_settings()
+    postgres = asyncio.run(PostgresKnowledgeRepository.from_settings(settings).check_connection())
+    chroma = ChromaVectorRepository.from_settings(settings).check_connection()
+    graph_repo = Neo4jGraphRepository(settings)
+    try:
+        graph = graph_repo.run_graph_check()
+    finally:
+        graph_repo.close()
+    table = Table(title="GraphRAG Health")
+    table.add_column("Service")
+    table.add_column("Status")
+    table.add_column("Detail")
+    failures = 0
+    for service, (status, detail) in {
+        "PostgreSQL": postgres,
+        "Chroma": chroma,
+        "Neo4j": graph,
+    }.items():
+        table.add_row(service, "[green]PASS[/green]" if status else "[red]FAIL[/red]", detail)
+        failures += 0 if status else 1
+    console.print(table)
+    if failures:
+        raise typer.Exit(code=1)
+
+
+async def _ingest_many(
+    files: list[Path],
+    *,
+    system: str,
+    version: str,
+    kb: str,
+) -> list[tuple[Path, dict | None, str | None]]:
+    agent = KnowledgeBaseStoringAgent()
+    results: list[tuple[Path, dict | None, str | None]] = []
+    for path in files:
+        try:
+            result = await agent.ingest(path, kb, system=system, version=version)
+        except MultiAgenticRagError as exc:
+            results.append((path, None, str(exc)))
+            continue
+        results.append((path, result.model_dump(), None))
+    return results
+
+
+def _document_files(directory_path: Path, *, recursive: bool) -> list[Path]:
+    directory = directory_path.expanduser().resolve()
+    if not directory.exists() or not directory.is_dir():
+        raise typer.BadParameter(f"Directory does not exist: {directory}")
+    pattern = "**/*" if recursive else "*"
+    return sorted(
+        path
+        for path in directory.glob(pattern)
+        if path.is_file() and path.suffix.lower() in SUPPORTED_DOCUMENT_SUFFIXES
+    )
+
+
+def _delete_runtime_cache(settings: Settings) -> tuple[list[Path], list[tuple[Path, str]]]:
+    raw_paths = [
+        settings.multi_agentic_rag_home,
+        settings.document_store_path,
+        settings.object_store_path,
+        settings.manifest_store_path,
+        settings.chroma_path,
+        Path(".cache"),
+    ]
+    paths: list[Path] = []
+    for raw_path in raw_paths:
+        path = Path(raw_path).expanduser().resolve()
+        if any(path == parent or path.is_relative_to(parent) for parent in paths):
+            continue
+        paths.append(path)
+    deleted: list[Path] = []
+    skipped: list[tuple[Path, str]] = []
+    for path in paths:
+        if not path.exists():
+            continue
+        error = _delete_path_with_retries(path)
+        if error is not None:
+            skipped.append((path, error))
+            continue
+        deleted.append(path)
+    return deleted, skipped
+
+
+def _delete_path_with_retries(path: Path, *, attempts: int = 6) -> str | None:
+    last_error: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            if path.is_dir():
+                shutil.rmtree(path, onexc=_make_writable_and_retry)
+            else:
+                path.unlink()
+            return None
+        except OSError as exc:
+            last_error = exc
+            gc.collect()
+            if attempt < attempts - 1:
+                time.sleep(0.25 * (attempt + 1))
+    if last_error is None:
+        return "unknown deletion error"
+    return f"{type(last_error).__name__}: {last_error}"
+
+
+def _make_writable_and_retry(
+    function: Callable[[str], None],
+    path: str,
+    exc: BaseException,
+) -> None:
+    with suppress(OSError):
+        os.chmod(path, stat.S_IWRITE)
+    function(path)
+
+
+def _build_retriever() -> HybridKnowledgeRetriever:
+    settings = get_settings()
+    postgres = PostgresKnowledgeRepository.from_settings(settings)
+    chroma = ChromaVectorRepository.from_settings(settings)
+    graph = Neo4jGraphRepository(settings)
+    return HybridKnowledgeRetriever(
+        bm25=BM25Retriever(postgres),
+        vector=VectorRetriever(chroma),
+        graph=GraphRetriever(graph, postgres),
+        reranker=select_reranker(settings),
+    )
+
+
+def _print_check(service: str, status: bool, detail: str) -> None:
+    console.print(f"{service}: {'PASS' if status else 'FAIL'} - {detail}")
+    if not status:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

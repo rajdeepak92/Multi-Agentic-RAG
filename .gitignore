@@ -18,19 +18,13 @@ htmlcov/
 .env
 .codex/
 .agents/
-documents/inbox/
 
-# MARAG runtime state
+# Runtime state and local data
 .multi_agentic_rag/
 .cache/
-tests/generated/
-
-# Local Neo4j Desktop/runtime data
-neo4j/desktop-data/
-neo4j/cleanup-backup-*/
-neo4j/runtime/
-neo4j/dumps/
-neo4j/import/
+generated/
+documents/inbox/
+/neo4j/
 neo4j-desktop-data/
 
 # Local logs and ad hoc database files

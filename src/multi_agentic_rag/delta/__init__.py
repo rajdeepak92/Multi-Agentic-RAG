@@ -1,4 +1,4 @@
-"""Delta computation."""
+"""Delta analysis."""
 
 from multi_agentic_rag.delta.differ import compute_fact_deltas
 

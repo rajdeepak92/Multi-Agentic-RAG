@@ -1,25 +1,27 @@
-"""Domain exceptions for multi-agentic-rag."""
+"""Classified domain errors."""
+
+from __future__ import annotations
 
 
 class MultiAgenticRagError(Exception):
-    """Base exception for package-specific errors."""
+    """Base error for this package."""
 
 
-class ConfigurationError(MultiAgenticRagError):
-    """Raised when local configuration is invalid."""
-
-
-class RegistryError(MultiAgenticRagError):
-    """Raised when metadata registry operations fail."""
+class ConfigError(MultiAgenticRagError):
+    """Configuration is incomplete or invalid."""
 
 
 class IngestionError(MultiAgenticRagError):
-    """Raised when document ingestion cannot complete."""
+    """Document ingestion failed."""
+
+
+class PersistenceError(MultiAgenticRagError):
+    """Authoritative storage failed."""
 
 
 class RetrievalError(MultiAgenticRagError):
-    """Raised when retrieval cannot complete."""
+    """Retrieval failed."""
 
 
-class EvidenceError(MultiAgenticRagError):
-    """Raised when an answer would violate evidence requirements."""
+class ServiceUnavailableError(MultiAgenticRagError):
+    """A required external service is unavailable."""

@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import re
 
-from multi_agentic_rag.extraction.schemas import ExtractedFact
-from multi_agentic_rag.models import ChunkRecord, FactRecord
+from pydantic import BaseModel, Field
+
+from multi_agentic_rag.domain import ChunkRecord, FactRecord
 from multi_agentic_rag.utils.hashing import stable_id
 
 REQUIREMENT_RE = re.compile(
-    r"\b(?:"
-    r"(?:REQ|BRD|SRS|FRS|API|UC)[-_]?\d+(?:\.\d+)?"
-    r"|BR[-_]\s*[A-Z]{2,10}[-_]\s*\d+(?:\.\d+)?"
-    r")\b",
+    r"\b(?:(?:REQ|BRD|SRS|FRS|API|UC)[-_]?\d+(?:\.\d+)?|"
+    r"BR[-_]\s*[A-Z]{2,10}[-_]\s*\d+(?:\.\d+)?)\b",
     re.I,
 )
 PROTOCOLS = ("Modbus", "MQTT", "CAN", "REST")
@@ -50,7 +49,6 @@ DEVICE_RE = re.compile(
     r"\b(?i:(?:device|controller|gateway|plc|rtu|ecu|module|unit|sensor node))\s+"
     r"(?P<name>[A-Z][A-Za-z0-9_-]{1,40})\b"
 )
-TEST_CASE_RE = re.compile(r"\b(?:TC|TEST|TS)[-_]?\d+(?:\.\d+)?\b", re.I)
 MQTT_TOPIC_RE = re.compile(
     r"\b(?:MQTT\s+topic|topic)\s+(?P<topic>[/A-Za-z0-9_+.#{}-]{3,})",
     re.I,
@@ -59,18 +57,43 @@ REST_ENDPOINT_RE = re.compile(
     r"\b(?P<method>GET|POST|PUT|PATCH|DELETE)\s+(?P<path>/[A-Za-z0-9_./{}:-]+)\b",
     re.I,
 )
-CAN_ID_RE = re.compile(
-    r"\bCAN(?:\s+ID|\s+identifier)?\s*(?P<can_id>0x[0-9A-Fa-f]+|\d{2,})\b",
-    re.I,
-)
+CAN_ID_RE = re.compile(r"\bCAN(?:\s+ID|\s+identifier)?\s*(?P<can_id>0x[0-9A-Fa-f]+|\d{2,})\b", re.I)
 MODBUS_REGISTER_RE = re.compile(
-    r"\b(?:Modbus\s+)?(?P<kind>register|coil)\s*(?P<address>\d{1,5})\b",
-    re.I,
+    r"\b(?:Modbus\s+)?(?P<kind>register|coil)\s*(?P<address>\d{1,5})\b", re.I
 )
+
+
+class ExtractedFact(BaseModel):
+    """Extractor output before lineage is attached.
+
+    Attributes:
+        fact_type: Extractor category.
+        fact_key: Semantic key used for dedupe and deltas.
+        value: Extracted fact value.
+        evidence: Source-grounded evidence snippet.
+        unit: Optional unit associated with numeric values.
+        requirement_id: Nearby requirement identifier when found.
+        metadata: Extractor-specific structured metadata.
+    """
+
+    fact_type: str
+    fact_key: str
+    value: str
+    evidence: str
+    unit: str | None = None
+    requirement_id: str | None = None
+    metadata: dict[str, str | int | None] = Field(default_factory=dict)
 
 
 def extract_facts_from_text(text: str) -> list[ExtractedFact]:
-    """Extract deterministic domain facts from one chunk of text."""
+    """Extract deterministic domain facts from one chunk of text.
+
+    Args:
+        text: Chunk text to scan.
+
+    Returns:
+        Deduplicated extracted facts without document lineage.
+    """
 
     facts: list[ExtractedFact] = []
     facts.extend(_extract_requirements(text))
@@ -81,18 +104,24 @@ def extract_facts_from_text(text: str) -> list[ExtractedFact]:
     facts.extend(_extract_sensors(text))
     facts.extend(_extract_devices(text))
     facts.extend(_extract_topics(text))
-    facts.extend(_extract_tests(text))
     return _dedupe_facts(facts)
 
 
 def extract_facts_from_chunk(chunk: ChunkRecord) -> list[FactRecord]:
-    """Extract facts from a chunk and attach source lineage."""
+    """Extract facts from a chunk and attach source lineage.
+
+    Args:
+        chunk: Source chunk whose text should be scanned.
+
+    Returns:
+        Fact records with document, version, chunk, system, and status metadata.
+    """
 
     records: list[FactRecord] = []
     for extracted in extract_facts_from_text(chunk.text):
         fact_id = stable_id(
             "fact",
-            chunk.document_id,
+            chunk.document_version_id,
             chunk.chunk_id,
             extracted.fact_key,
             extracted.value,
@@ -105,15 +134,17 @@ def extract_facts_from_chunk(chunk: ChunkRecord) -> list[FactRecord]:
                 fact_type=extracted.fact_type,
                 value=extracted.value,
                 unit=extracted.unit,
+                document_version_id=chunk.document_version_id,
                 document_id=chunk.document_id,
                 chunk_id=chunk.chunk_id,
                 system_name=chunk.system_name,
+                kb_name=chunk.kb_name,
                 version=chunk.version,
                 status=chunk.status,
                 evidence=extracted.evidence,
                 requirement_id=extracted.requirement_id,
                 semantic_key=extracted.fact_key,
-                metadata=extracted.metadata,
+                metadata=dict(extracted.metadata),
             )
         )
     return records
@@ -123,19 +154,14 @@ def _extract_requirements(text: str) -> list[ExtractedFact]:
     facts = []
     for match in REQUIREMENT_RE.finditer(text):
         requirement_id = _normalize_requirement_id(match.group(0))
-        evidence = _evidence_window(text, match.start(), match.end())
         facts.append(
             ExtractedFact(
                 fact_type="requirement",
                 fact_key=f"requirement:{requirement_id}",
                 value=requirement_id,
-                evidence=evidence,
+                evidence=_evidence_window(text, match.start(), match.end()),
                 requirement_id=requirement_id,
-                metadata={
-                    "start": match.start(),
-                    "end": match.end(),
-                    "ontology_class": "Requirement",
-                },
+                metadata={"start": match.start(), "end": match.end()},
             )
         )
     return facts
@@ -148,21 +174,15 @@ def _extract_thresholds(text: str) -> list[ExtractedFact]:
             sensor = match.group("sensor").lower()
             value = match.group("value")
             unit = _normalize_unit(match.group("unit"))
-            evidence = _evidence_window(text, match.start(), match.end())
             facts.append(
                 ExtractedFact(
                     fact_type="threshold",
                     fact_key=f"threshold:{sensor}",
                     value=value,
                     unit=unit,
-                    evidence=evidence,
+                    evidence=_evidence_window(text, match.start(), match.end()),
                     requirement_id=_nearest_requirement_id(text, match.start()),
-                    metadata={
-                        "sensor": sensor,
-                        "start": match.start(),
-                        "end": match.end(),
-                        "ontology_class": "sosa:ObservableProperty",
-                    },
+                    metadata={"sensor": sensor, "start": match.start(), "end": match.end()},
                 )
             )
     return facts
@@ -196,14 +216,122 @@ def _extract_threshold_table_rows(text: str) -> list[ExtractedFact]:
                     unit=unit,
                     evidence=evidence,
                     requirement_id=_nearest_requirement_id(text, max(position, 0)),
-                    metadata={
-                        "sensor": sensor,
-                        "threshold_kind": kind,
-                        "threshold_label": label,
-                        "ontology_class": "sosa:ObservableProperty",
-                    },
+                    metadata={"sensor": sensor, "threshold_kind": kind, "threshold_label": label},
                 )
             )
+    return facts
+
+
+def _extract_protocols(text: str) -> list[ExtractedFact]:
+    facts = []
+    for protocol in PROTOCOLS:
+        for match in re.finditer(rf"\b{re.escape(protocol)}\b", text, re.I):
+            value = protocol.upper() if protocol in {"MQTT", "CAN", "REST"} else protocol
+            facts.append(
+                ExtractedFact(
+                    fact_type="protocol",
+                    fact_key=f"protocol:{value.lower()}",
+                    value=value,
+                    evidence=_evidence_window(text, match.start(), match.end()),
+                    requirement_id=_nearest_requirement_id(text, match.start()),
+                    metadata={"start": match.start(), "end": match.end()},
+                )
+            )
+    return facts
+
+
+def _extract_protocol_details(text: str) -> list[ExtractedFact]:
+    facts = []
+    for match in REST_ENDPOINT_RE.finditer(text):
+        method = match.group("method").upper()
+        path = match.group("path")
+        facts.append(
+            ExtractedFact(
+                fact_type="protocol_detail",
+                fact_key=f"protocol_detail:rest:{method.lower()}:{path.lower()}",
+                value=f"{method} {path}",
+                evidence=_evidence_window(text, match.start(), match.end()),
+                requirement_id=_nearest_requirement_id(text, match.start()),
+                metadata={"protocol": "REST", "method": method, "path": path},
+            )
+        )
+    for match in CAN_ID_RE.finditer(text):
+        can_id = match.group("can_id")
+        facts.append(
+            ExtractedFact(
+                fact_type="protocol_detail",
+                fact_key=f"protocol_detail:can:{can_id.lower()}",
+                value=can_id,
+                evidence=_evidence_window(text, match.start(), match.end()),
+                requirement_id=_nearest_requirement_id(text, match.start()),
+                metadata={"protocol": "CAN", "can_id": can_id},
+            )
+        )
+    for match in MODBUS_REGISTER_RE.finditer(text):
+        kind = match.group("kind").lower()
+        address = match.group("address")
+        facts.append(
+            ExtractedFact(
+                fact_type="protocol_detail",
+                fact_key=f"protocol_detail:modbus:{kind}:{address}",
+                value=f"{kind} {address}",
+                evidence=_evidence_window(text, match.start(), match.end()),
+                requirement_id=_nearest_requirement_id(text, match.start()),
+                metadata={"protocol": "Modbus", "kind": kind, "address": address},
+            )
+        )
+    return facts
+
+
+def _extract_sensors(text: str) -> list[ExtractedFact]:
+    facts = []
+    for sensor in SENSORS:
+        for match in re.finditer(rf"\b{sensor}\b", text, re.I):
+            normalized = sensor.lower()
+            facts.append(
+                ExtractedFact(
+                    fact_type="sensor",
+                    fact_key=f"sensor:{normalized}",
+                    value=normalized,
+                    evidence=_evidence_window(text, match.start(), match.end()),
+                    requirement_id=_nearest_requirement_id(text, match.start()),
+                    metadata={"start": match.start(), "end": match.end()},
+                )
+            )
+    return facts
+
+
+def _extract_devices(text: str) -> list[ExtractedFact]:
+    facts = []
+    for match in DEVICE_RE.finditer(text):
+        name = match.group("name").strip(".,;:")
+        facts.append(
+            ExtractedFact(
+                fact_type="device",
+                fact_key=f"device:{name.lower()}",
+                value=name,
+                evidence=_evidence_window(text, match.start(), match.end()),
+                requirement_id=_nearest_requirement_id(text, match.start()),
+                metadata={"start": match.start(), "end": match.end()},
+            )
+        )
+    return facts
+
+
+def _extract_topics(text: str) -> list[ExtractedFact]:
+    facts = []
+    for match in MQTT_TOPIC_RE.finditer(text):
+        topic = match.group("topic").strip(".,;:")
+        facts.append(
+            ExtractedFact(
+                fact_type="topic",
+                fact_key=f"topic:mqtt:{topic.lower()}",
+                value=topic,
+                evidence=_evidence_window(text, match.start(), match.end()),
+                requirement_id=_nearest_requirement_id(text, match.start()),
+                metadata={"protocol": "MQTT", "topic": topic},
+            )
+        )
     return facts
 
 
@@ -238,179 +366,6 @@ def _split_threshold_value(raw_value: str) -> tuple[str, str | None]:
         return text, None
     value = re.sub(r"\s+", "", match.group("value"))
     return value, _normalize_unit(match.group("unit"))
-
-
-def _extract_protocols(text: str) -> list[ExtractedFact]:
-    facts = []
-    for protocol in PROTOCOLS:
-        for match in re.finditer(rf"\b{re.escape(protocol)}\b", text, re.I):
-            value = protocol.upper() if protocol in {"MQTT", "CAN", "REST"} else protocol
-            facts.append(
-                ExtractedFact(
-                    fact_type="protocol",
-                    fact_key=f"protocol:{value.lower()}",
-                    value=value,
-                    evidence=_evidence_window(text, match.start(), match.end()),
-                    requirement_id=_nearest_requirement_id(text, match.start()),
-                    metadata={
-                        "start": match.start(),
-                        "end": match.end(),
-                        "ontology_class": "Protocol",
-                    },
-                )
-            )
-    return facts
-
-
-def _extract_protocol_details(text: str) -> list[ExtractedFact]:
-    facts = []
-    for match in REST_ENDPOINT_RE.finditer(text):
-        method = match.group("method").upper()
-        path = match.group("path")
-        facts.append(
-            ExtractedFact(
-                fact_type="protocol_detail",
-                fact_key=f"protocol_detail:rest:{method.lower()}:{path.lower()}",
-                value=f"{method} {path}",
-                evidence=_evidence_window(text, match.start(), match.end()),
-                requirement_id=_nearest_requirement_id(text, match.start()),
-                metadata={
-                    "protocol": "REST",
-                    "method": method,
-                    "path": path,
-                    "start": match.start(),
-                    "end": match.end(),
-                    "ontology_class": "ProtocolEndpoint",
-                },
-            )
-        )
-    for match in CAN_ID_RE.finditer(text):
-        can_id = match.group("can_id")
-        facts.append(
-            ExtractedFact(
-                fact_type="protocol_detail",
-                fact_key=f"protocol_detail:can:{can_id.lower()}",
-                value=can_id,
-                evidence=_evidence_window(text, match.start(), match.end()),
-                requirement_id=_nearest_requirement_id(text, match.start()),
-                metadata={
-                    "protocol": "CAN",
-                    "can_id": can_id,
-                    "start": match.start(),
-                    "end": match.end(),
-                    "ontology_class": "CANIdentifier",
-                },
-            )
-        )
-    for match in MODBUS_REGISTER_RE.finditer(text):
-        kind = match.group("kind").lower()
-        address = match.group("address")
-        facts.append(
-            ExtractedFact(
-                fact_type="protocol_detail",
-                fact_key=f"protocol_detail:modbus:{kind}:{address}",
-                value=f"{kind} {address}",
-                evidence=_evidence_window(text, match.start(), match.end()),
-                requirement_id=_nearest_requirement_id(text, match.start()),
-                metadata={
-                    "protocol": "Modbus",
-                    "kind": kind,
-                    "address": address,
-                    "start": match.start(),
-                    "end": match.end(),
-                    "ontology_class": "ModbusAddress",
-                },
-            )
-        )
-    return facts
-
-
-def _extract_sensors(text: str) -> list[ExtractedFact]:
-    facts = []
-    for sensor in SENSORS:
-        for match in re.finditer(rf"\b{sensor}\b", text, re.I):
-            normalized = sensor.lower()
-            facts.append(
-                ExtractedFact(
-                    fact_type="sensor",
-                    fact_key=f"sensor:{normalized}",
-                    value=normalized,
-                    evidence=_evidence_window(text, match.start(), match.end()),
-                    requirement_id=_nearest_requirement_id(text, match.start()),
-                    metadata={
-                        "start": match.start(),
-                        "end": match.end(),
-                        "ontology_class": "sosa:Sensor",
-                    },
-                )
-            )
-    return facts
-
-
-def _extract_devices(text: str) -> list[ExtractedFact]:
-    facts = []
-    for match in DEVICE_RE.finditer(text):
-        name = match.group("name").strip(".,;:")
-        normalized = name.lower()
-        facts.append(
-            ExtractedFact(
-                fact_type="device",
-                fact_key=f"device:{normalized}",
-                value=name,
-                evidence=_evidence_window(text, match.start(), match.end()),
-                requirement_id=_nearest_requirement_id(text, match.start()),
-                metadata={
-                    "start": match.start(),
-                    "end": match.end(),
-                    "ontology_class": "ssn:System",
-                },
-            )
-        )
-    return facts
-
-
-def _extract_topics(text: str) -> list[ExtractedFact]:
-    facts = []
-    for match in MQTT_TOPIC_RE.finditer(text):
-        topic = match.group("topic").strip(".,;:")
-        facts.append(
-            ExtractedFact(
-                fact_type="topic",
-                fact_key=f"topic:mqtt:{topic.lower()}",
-                value=topic,
-                evidence=_evidence_window(text, match.start(), match.end()),
-                requirement_id=_nearest_requirement_id(text, match.start()),
-                metadata={
-                    "protocol": "MQTT",
-                    "topic": topic,
-                    "start": match.start(),
-                    "end": match.end(),
-                    "ontology_class": "MQTTTopic",
-                },
-            )
-        )
-    return facts
-
-
-def _extract_tests(text: str) -> list[ExtractedFact]:
-    facts = []
-    for match in TEST_CASE_RE.finditer(text):
-        test_id = match.group(0).upper().replace("_", "-")
-        facts.append(
-            ExtractedFact(
-                fact_type="test",
-                fact_key=f"test:{test_id}",
-                value=test_id,
-                evidence=_evidence_window(text, match.start(), match.end()),
-                requirement_id=_nearest_requirement_id(text, match.start()),
-                metadata={
-                    "start": match.start(),
-                    "end": match.end(),
-                    "ontology_class": "qa:TestScenario",
-                },
-            )
-        )
-    return facts
 
 
 def _evidence_window(text: str, start: int, end: int, radius: int = 120) -> str:

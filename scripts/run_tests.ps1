@@ -6,5 +6,5 @@ if (-not (Test-Path -LiteralPath "pyproject.toml" -PathType Leaf)) {
 }
 
 Write-Host "Current directory: $(Get-Location)"
-uv run pytest -c pyproject.toml tests
+uv run pytest -q
 exit $LASTEXITCODE

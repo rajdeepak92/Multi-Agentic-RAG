@@ -1,7 +1,16 @@
-"""Retrieval and query orchestration."""
+"""Retrieval services."""
 
-from multi_agentic_rag.retrieval.hybrid_retriever import answer_query
-from multi_agentic_rag.retrieval.intent import QueryIntent, detect_intent
-from multi_agentic_rag.retrieval.keyword_retriever import KeywordRetriever
+from multi_agentic_rag.retrieval.bm25 import BM25Retriever
+from multi_agentic_rag.retrieval.graph import GraphRetriever
+from multi_agentic_rag.retrieval.hybrid import HybridKnowledgeRetriever
+from multi_agentic_rag.retrieval.reranker import NoOpRerankingService, RerankingService
+from multi_agentic_rag.retrieval.vector import VectorRetriever
 
-__all__ = ["KeywordRetriever", "QueryIntent", "answer_query", "detect_intent"]
+__all__ = [
+    "BM25Retriever",
+    "GraphRetriever",
+    "HybridKnowledgeRetriever",
+    "NoOpRerankingService",
+    "RerankingService",
+    "VectorRetriever",
+]
