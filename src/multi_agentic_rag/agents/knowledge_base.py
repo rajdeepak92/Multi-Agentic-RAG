@@ -13,7 +13,9 @@ from multi_agentic_rag.agents.sub_agents import (
     DeltaAnalysisAgent,
     DocumentResolutionAgent,
     DocumentVersioningAgent,
+    FactEnrichmentAgent,
     FactExtractionAgent,
+    FactReviewClient,
     HashingAgent,
     ManifestAgent,
     MetadataAgent,
@@ -39,6 +41,7 @@ from multi_agentic_rag.exceptions import IngestionError
 from multi_agentic_rag.infrastructure.chroma import ChromaVectorRepository
 from multi_agentic_rag.infrastructure.neo4j import Neo4jGraphRepository
 from multi_agentic_rag.infrastructure.postgres import PostgresKnowledgeRepository
+from multi_agentic_rag.llm import OpenAIReasoningClient
 from multi_agentic_rag.utils.hashing import stable_id
 
 
@@ -66,6 +69,8 @@ class KnowledgeBaseStoringAgent:
         chunking_agent: ChunkingAgent | None = None,
         manifest_agent: ManifestAgent | None = None,
         fact_agent: FactExtractionAgent | None = None,
+        fact_review_client: FactReviewClient | None = None,
+        review_facts: bool = False,
         delta_agent: DeltaAnalysisAgent | None = None,
         postgres_agent: PostgresPersistenceAgent | None = None,
         chroma_agent: ChromaIndexingAgent | None = None,
@@ -88,6 +93,10 @@ class KnowledgeBaseStoringAgent:
             chunking_agent: Optional chunk creation override.
             manifest_agent: Optional chunk manifest writer override.
             fact_agent: Optional deterministic fact extractor override.
+            fact_review_client: Optional LLM fact-review client override. Passing a
+                client enables LLM fact review.
+            review_facts: Whether to enable configured LLM fact review when no
+                explicit client is supplied.
             delta_agent: Optional version delta analyzer override.
             postgres_agent: Optional PostgreSQL persistence boundary override.
             chroma_agent: Optional Chroma indexing boundary override.
@@ -105,9 +114,16 @@ class KnowledgeBaseStoringAgent:
         self.parser_agent = parser_agent or ParserAgent()
         self.chunking_agent = chunking_agent or ChunkingAgent()
         self.manifest_agent = manifest_agent or ManifestAgent()
-        self.fact_agent = fact_agent or FactExtractionAgent()
         self.delta_agent = delta_agent or DeltaAnalysisAgent()
         loaded_settings = self.settings_agent.load()
+        self.fact_agent = fact_agent or FactExtractionAgent()
+        self.fact_enrichment_agent: FactEnrichmentAgent | None
+        if fact_review_client:
+            self.fact_enrichment_agent = FactEnrichmentAgent(fact_review_client)
+        elif review_facts and loaded_settings.openai_api_key:
+            self.fact_enrichment_agent = FactEnrichmentAgent(OpenAIReasoningClient(loaded_settings))
+        else:
+            self.fact_enrichment_agent = None
         self.postgres_agent = postgres_agent or PostgresPersistenceAgent(
             PostgresKnowledgeRepository.from_settings(loaded_settings)
         )
@@ -143,6 +159,26 @@ class KnowledgeBaseStoringAgent:
             IngestionError: If parsing, validation, persistence, graph projection, or required
             readiness checks fail.
         """
+
+        from multi_agentic_rag.agents.ingestion import (
+            IngestionRequest,
+            KnowledgeBaseIngestionAgent,
+        )
+
+        source_value, kb_name = _normalize_document_input(document_input)
+        if previous_knowledge_base:
+            kb_name = previous_knowledge_base
+        graph_result = await KnowledgeBaseIngestionAgent(self).run(
+            IngestionRequest(
+                document_path=Path(source_value),
+                system=system,
+                version=version,
+                kb=kb_name,
+            )
+        )
+        if graph_result.ingest_result is None:
+            raise IngestionError("Ingestion graph did not return an ingest result.")
+        return graph_result.ingest_result
 
         settings = self.settings_agent.load()
         configure_logging(settings.log_level)
@@ -246,6 +282,8 @@ class KnowledgeBaseStoringAgent:
                 chunks=chunks,
             )
             facts = self.fact_agent.extract(chunks)
+            if self.fact_enrichment_agent:
+                facts = await self.fact_enrichment_agent.enrich(chunks=chunks, facts=facts)
             deltas = (
                 self.delta_agent.compute(
                     system_name=system,
@@ -267,6 +305,11 @@ class KnowledgeBaseStoringAgent:
                 facts=facts,
                 deltas=deltas,
                 superseded_version_id=supersedes_version_id,
+            )
+            await _mark_ingestion_stage(
+                self.postgres_agent,
+                ingestion_run_id,
+                IngestionRunStatus.POSTGRES_COMMITTED,
             )
             postgres_status = "succeeded"
 
@@ -291,6 +334,11 @@ class KnowledgeBaseStoringAgent:
                 chroma_status = (
                     f"{chroma_status};superseded_refreshed:{refreshed_superseded_count}"
                 )
+            await _mark_ingestion_stage(
+                self.postgres_agent,
+                ingestion_run_id,
+                IngestionRunStatus.CHROMA_INDEXED,
+            )
 
             self.neo4j_agent.project(
                 document=document,
@@ -298,6 +346,11 @@ class KnowledgeBaseStoringAgent:
                 chunks=chunks,
                 facts=facts,
                 deltas=deltas,
+            )
+            await _mark_ingestion_stage(
+                self.postgres_agent,
+                ingestion_run_id,
+                IngestionRunStatus.NEO4J_PROJECTED,
             )
             neo4j_status = "projected"
 
@@ -348,3 +401,14 @@ def _normalize_document_input(document_input: str | Path | DocumentInput) -> tup
     if isinstance(document_input, DocumentInput):
         return document_input.path, document_input.kb_name
     return document_input, "default"
+
+
+async def _mark_ingestion_stage(
+    postgres_agent: object,
+    ingestion_run_id: str,
+    status: IngestionRunStatus,
+) -> None:
+    mark_stage = getattr(postgres_agent, "mark_stage", None)
+    if mark_stage is None:
+        return
+    await mark_stage(ingestion_run_id, status)

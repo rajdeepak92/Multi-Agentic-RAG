@@ -1,0 +1,48 @@
+"""Typed LangGraph state for user-story generation."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TypedDict
+
+from multi_agentic_rag.agents.user_stories.schemas import (
+    EvidenceAssessment,
+    EvidenceCandidate,
+    RetrievalPlan,
+    SourceRetrievalResponse,
+    UserStoryGenerationRequest,
+    UserStoryGenerationResult,
+)
+from multi_agentic_rag.domain import EvidenceBundle, GeneratedUserStory
+
+
+class UserStoryGenerationState(TypedDict, total=False):
+    """State exchanged by user-story graph nodes."""
+
+    request: UserStoryGenerationRequest
+    run_id: str
+    run_dir: Path
+    retrieval_plan: RetrievalPlan
+    postgres_response: SourceRetrievalResponse
+    chroma_response: SourceRetrievalResponse
+    neo4j_response: SourceRetrievalResponse
+    source_responses: list[SourceRetrievalResponse]
+    normalized_candidates: list[EvidenceCandidate]
+    deduplicated_candidates: list[EvidenceCandidate]
+    fused_results: list[EvidenceCandidate]
+    reranked_evidence: list[EvidenceCandidate]
+    evidence_assessment: EvidenceAssessment
+    evidence_bundle: EvidenceBundle
+    retrieval_round: int
+    prompt: str
+    raw_model_output: str
+    validated_stories: list[GeneratedUserStory]
+    artifact_paths: list[Path]
+    debug_trace_path: Path
+    invalid_model_output_path: Path
+    trace_metadata: dict[str, str]
+    retry_count: int
+    next_action: str
+    result: UserStoryGenerationResult
+    errors: list[str]
+    degraded_sources: list[str]

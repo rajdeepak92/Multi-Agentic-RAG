@@ -1,0 +1,115 @@
+{
+  "application": {
+    "name": "multi-agentic-rag",
+    "config_schema_version": 1
+  },
+  "paths": {
+    "cache_dir": ".global_cache",
+    "documents_dir": "documents",
+    "generated_dir": "generated"
+  },
+  "postgres": {
+    "connect_timeout_seconds": 10,
+    "command_timeout_seconds": 60,
+    "statement_timeout_ms": 60000,
+    "pool_size": 5,
+    "max_overflow": 5,
+    "pool_recycle_seconds": 1800,
+    "pool_pre_ping": true,
+    "retry_count": 2,
+    "retry_backoff_seconds": 1.0,
+    "ssl_mode": "require"
+  },
+  "chroma": {
+    "collection": "multi_agentic_rag_chunks",
+    "allow_legacy_without_fingerprint": false
+  },
+  "neo4j": {
+    "uri": "bolt://127.0.0.1:7687",
+    "username": "neo4j",
+    "database": "neo4j",
+    "graphrag_required": true
+  },
+  "retrieval": {
+    "required_sources": [
+      "postgres",
+      "chroma",
+      "neo4j"
+    ],
+    "lexical_top_k": 20,
+    "vector_top_k": 20,
+    "graph_top_k": 20,
+    "fusion_top_k": 30,
+    "rerank_top_k": 10,
+    "fusion_strategy": "preserve_current",
+    "reciprocal_rank_constant": 60,
+    "max_retrieval_rounds": 2,
+    "allow_degraded_retrieval": false
+  },
+  "lexical": {
+    "backend": "pg_textsearch",
+    "native_fts_allowed": false
+  },
+  "reasoning": {
+    "provider": "huggingface",
+    "openai_model": "gpt-5.5",
+    "openai_effort": "medium",
+    "openai_store_responses": false,
+    "gemini_model": "gemini-2.5-pro",
+    "hf_model": "Qwen/Qwen3-0.6B",
+    "hf_device": "auto",
+    "hf_dtype": "auto",
+    "hf_max_new_tokens": 512,
+    "hf_validation_max_new_tokens": 256,
+    "hf_timeout_seconds": 120,
+    "hf_answer_mode": "deterministic",
+    "hf_temperature": 0.0,
+    "hf_top_p": 0.8,
+    "hf_top_k": 20,
+    "hf_enable_thinking": false,
+    "structured_retries": 1
+  },
+  "embeddings": {
+    "provider": "sentence_transformers",
+    "model": "BAAI/bge-m3",
+    "revision": "default",
+    "dimension": 1024,
+    "device": "auto",
+    "normalize": true,
+    "distance_metric": "cosine",
+    "prompt_profile": "default"
+  },
+  "reranking": {
+    "provider": "none",
+    "model": null,
+    "device": "auto"
+  },
+  "ingestion": {
+    "chunk_size": 1200,
+    "chunk_overlap": 160,
+    "enable_pdf_ocr": false,
+    "supported_extensions": [
+      ".pdf",
+      ".docx",
+      ".txt",
+      ".md",
+      ".markdown"
+    ],
+    "recursive": true,
+    "atomic_batch": false,
+    "tesseract_cmd": null
+  },
+  "user_stories": {
+    "schema_version": "enterprise-user-story-v1"
+  },
+  "logging": {
+    "level": "INFO"
+  },
+  "secrets": {
+    "postgres_dsn_env": "POSTGRES_DSN",
+    "openai_api_key_env": "OPENAI_API_KEY",
+    "gemini_api_key_env": "GEMINI_API_KEY",
+    "hf_token_env": "HF_TOKEN",
+    "neo4j_password_env": "NEO4J_PASSWORD"
+  }
+}

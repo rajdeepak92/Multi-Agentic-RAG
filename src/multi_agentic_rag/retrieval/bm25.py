@@ -1,4 +1,4 @@
-"""PostgreSQL full-text BM25 retriever."""
+"""PostgreSQL lexical full-text retriever."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from multi_agentic_rag.domain import RetrievalResult
 
 
 class BM25Repository(Protocol):
-    """Repository contract used by BM25 retrieval."""
+    """Repository contract used by lexical retrieval."""
 
     async def search_chunks(
         self,
@@ -36,13 +36,13 @@ class BM25Repository(Protocol):
 
 
 class BM25Retriever:
-    """PostgreSQL FTS retriever."""
+    """PostgreSQL lexical retriever."""
 
     def __init__(self, repository: BM25Repository) -> None:
         """Initialize the BM25 retriever.
 
         Args:
-            repository: Backend repository that implements PostgreSQL full-text
+            repository: Backend repository that implements PostgreSQL lexical
                 chunk search.
         """
 
@@ -57,17 +57,18 @@ class BM25Retriever:
         version: str | None = None,
         top_k: int = 5,
     ) -> list[RetrievalResult]:
-        """Retrieve PostgreSQL FTS results.
+        """Retrieve PostgreSQL lexical results.
 
         Args:
-            query_text: User query to search with PostgreSQL full-text search.
+            query_text: User query to search with the configured PostgreSQL
+                lexical backend.
             system_name: System filter.
             kb_name: Knowledge-base filter.
             version: Optional document version filter.
             top_k: Maximum number of ranked chunks to return.
 
         Returns:
-            Ranked BM25/FTS results from the repository.
+            Ranked lexical results from the repository.
         """
 
         return await self.repository.search_chunks(

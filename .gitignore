@@ -6,6 +6,7 @@ dist/
 wheels/
 *.egg-info
 .pytest_cache/
+.pytest_tmp/
 .ruff_cache/
 .mypy_cache/
 .coverage
@@ -16,19 +17,24 @@ htmlcov/
 
 # Local secrets and machine-specific settings
 .env
+/base_config.json
 .codex/
 .agents/
 
 # Runtime state and local data
+/.global_cache/
 .multi_agentic_rag/
+/.multi_agentic_rag/chroma/
 .cache/
-generated/
+/generated/
 documents/inbox/
 /neo4j/
 neo4j-desktop-data/
 
 # Local logs and ad hoc database files
 *.log
+*.bak
+*.bak_*
 *.db
 *.sqlite
 *.sqlite3

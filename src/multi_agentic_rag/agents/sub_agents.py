@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from multi_agentic_rag.config import RuntimePaths, Settings, get_settings
 from multi_agentic_rag.delta import compute_fact_deltas
@@ -13,8 +13,11 @@ from multi_agentic_rag.domain import (
     DocumentRecord,
     DocumentStatus,
     DocumentVersionRecord,
+    FactEnrichmentBatch,
+    FactEnrichmentSuggestion,
     FactRecord,
     IngestionRunRecord,
+    IngestionRunStatus,
     PageText,
     SystemRecord,
 )
@@ -64,6 +67,18 @@ class KnowledgeRepository(Protocol):
             ingestion_run_id: Stable run identifier created before parsing.
             document_id: Persisted source document identifier.
             document_version_id: Persisted version identifier for this ingest.
+        """
+
+    async def mark_run_stage(
+        self,
+        ingestion_run_id: str,
+        status: IngestionRunStatus,
+    ) -> None:
+        """Mark a run stage checkpoint.
+
+        Args:
+            ingestion_run_id: Stable run identifier to update.
+            status: Stage state reached by the ingest pipeline.
         """
 
     async def mark_run_failed(self, ingestion_run_id: str, error_message: str) -> None:
@@ -507,6 +522,61 @@ class FactExtractionAgent:
         return facts
 
 
+class FactReviewClient(Protocol):
+    """Fact review contract used for ingest-time LLM enrichment."""
+
+    async def review_facts(
+        self,
+        *,
+        chunk_text: str,
+        facts: list[dict[str, Any]],
+    ) -> FactEnrichmentBatch:
+        """Review ambiguous facts extracted from a single chunk."""
+
+
+class FactEnrichmentAgent:
+    """LLM-assisted validation and enrichment for ambiguous facts."""
+
+    def __init__(self, reviewer: FactReviewClient | None = None) -> None:
+        self.reviewer = reviewer
+
+    async def enrich(
+        self,
+        *,
+        chunks: list[ChunkRecord],
+        facts: list[FactRecord],
+    ) -> list[FactRecord]:
+        """Annotate ambiguous facts without changing the canonical fact set."""
+
+        if not self.reviewer:
+            return facts
+        by_chunk: dict[str, list[FactRecord]] = {}
+        for fact in facts:
+            by_chunk.setdefault(fact.chunk_id, []).append(fact)
+        enriched: list[FactRecord] = []
+        for chunk in chunks:
+            chunk_facts = by_chunk.get(chunk.chunk_id, [])
+            candidates = [fact for fact in chunk_facts if _needs_review(fact, chunk.text)]
+            if not candidates:
+                enriched.extend(chunk_facts)
+                continue
+            try:
+                review = await self.reviewer.review_facts(
+                    chunk_text=chunk.text,
+                    facts=[_review_payload(fact) for fact in candidates],
+                )
+            except Exception:  # pragma: no cover - best-effort sidecar
+                enriched.extend(chunk_facts)
+                continue
+            suggestion_by_fact_id = {
+                suggestion.fact_id: suggestion for suggestion in review.suggestions
+            }
+            for fact in chunk_facts:
+                suggestion = suggestion_by_fact_id.get(fact.fact_id)
+                enriched.append(_merge_fact_review(fact, suggestion) if suggestion else fact)
+        return enriched
+
+
 class DeltaAnalysisAgent:
     """Compute fact-level deltas."""
 
@@ -576,6 +646,15 @@ class PostgresPersistenceAgent:
         """
 
         await self.repository.mark_run_failed(ingestion_run_id, error_message)
+
+    async def mark_stage(
+        self,
+        ingestion_run_id: str,
+        status: IngestionRunStatus,
+    ) -> None:
+        """Mark a stage checkpoint for an ingestion run."""
+
+        await self.repository.mark_run_stage(ingestion_run_id, status)
 
     async def succeed_run(
         self,
@@ -674,7 +753,7 @@ class PostgresPersistenceAgent:
         )
 
     async def check_bm25(self) -> tuple[bool, str]:
-        """Check PostgreSQL full-text readiness.
+        """Check PostgreSQL lexical-search readiness.
 
         Returns:
             Tuple of readiness flag and detail message.
@@ -791,6 +870,60 @@ class ValidationAgent:
         dangling = [fact.fact_id for fact in facts if fact.chunk_id not in chunk_ids]
         if dangling:
             raise IngestionError(f"Extracted facts reference missing chunks: {dangling[:3]}")
+
+
+def _needs_review(fact: FactRecord, chunk_text: str) -> bool:
+    if fact.fact_type in {"requirement", "sensor", "protocol"}:
+        return False
+    evidence = f"{fact.evidence} {chunk_text}".lower()
+    ambiguous_markers = (" and ", " or ", "/", ";", ", and ", " together with ", " plus ")
+    return any(marker in evidence for marker in ambiguous_markers) or fact.fact_type in {
+        "device",
+        "protocol_detail",
+        "topic",
+        "threshold",
+    }
+
+
+def _review_payload(fact: FactRecord) -> dict[str, object]:
+    return {
+        "fact_id": fact.fact_id,
+        "fact_key": fact.fact_key,
+        "fact_type": fact.fact_type,
+        "value": fact.value,
+        "evidence": fact.evidence,
+        "unit": fact.unit,
+        "requirement_id": fact.requirement_id,
+        "semantic_key": fact.semantic_key,
+        "metadata": fact.metadata,
+    }
+
+
+def _merge_fact_review(
+    fact: FactRecord,
+    suggestion: FactEnrichmentSuggestion | None,
+) -> FactRecord:
+    if suggestion is None:
+        return fact
+    metadata = dict(fact.metadata)
+    metadata.update(
+        {
+            "llm_reviewed": True,
+            "llm_review_status": suggestion.review_status,
+            "llm_review_confidence": suggestion.confidence,
+            "llm_review_reasoning": suggestion.reasoning_summary,
+            "llm_uncertain_relationships": suggestion.uncertain_relationships,
+            "llm_split_candidates": [
+                candidate.model_dump(mode="json")
+                for candidate in suggestion.split_candidates
+            ],
+        }
+    )
+    if suggestion.canonical_name:
+        metadata["llm_canonical_name"] = suggestion.canonical_name
+    if suggestion.relationship_hint:
+        metadata["llm_relationship_hint"] = suggestion.relationship_hint
+    return fact.model_copy(update={"metadata": metadata})
 
 
 def build_system_record(system_name: str) -> SystemRecord:

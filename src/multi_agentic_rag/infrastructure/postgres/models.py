@@ -237,6 +237,110 @@ class IngestionRunModel(Base):
     )
 
 
+class WorkflowRunModel(Base):
+    """Operational record for one LangGraph workflow run."""
+
+    __tablename__ = "workflow_runs"
+
+    workflow_run_id: Mapped[str] = mapped_column(String, primary_key=True)
+    system_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str | None] = mapped_column(String, nullable=True)
+    request: Mapped[str] = mapped_column(Text, nullable=False)
+    intent_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+
+    __table_args__ = (Index("idx_workflow_runs_scope", "system_name", "kb_name", "version"),)
+
+
+class WorkflowStepModel(Base):
+    """Operational record for one high-level workflow step."""
+
+    __tablename__ = "workflow_steps"
+
+    workflow_step_id: Mapped[str] = mapped_column(String, primary_key=True)
+    workflow_run_id: Mapped[str] = mapped_column(
+        String, ForeignKey("workflow_runs.workflow_run_id"), nullable=False
+    )
+    step_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    agent_name: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    messages: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    artifact_paths: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+
+    __table_args__ = (Index("idx_workflow_steps_run", "workflow_run_id", "step_index"),)
+
+
+class ArtifactRecordModel(Base):
+    """Audit record for generated local artifacts."""
+
+    __tablename__ = "artifact_records"
+
+    artifact_id: Mapped[str] = mapped_column(String, primary_key=True)
+    workflow_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    artifact_type: Mapped[str] = mapped_column(String, nullable=False)
+    artifact_path: Mapped[str] = mapped_column(Text, nullable=False)
+    debug_json_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_chunk_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String, nullable=False)
+    validation_status: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+
+    __table_args__ = (
+        Index("idx_artifact_records_scope", "system_name", "kb_name", "version"),
+    )
+
+
+class CanonicalFactModel(Base):
+    """Current semantic fact state carried across source versions."""
+
+    __tablename__ = "canonical_facts"
+
+    canonical_fact_id: Mapped[str] = mapped_column(String, primary_key=True)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    semantic_key: Mapped[str] = mapped_column(String, nullable=False)
+    current_value: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    originating_fact_id: Mapped[str] = mapped_column(String, nullable=False)
+    active_fact_id: Mapped[str] = mapped_column(String, nullable=False)
+    originating_version_id: Mapped[str] = mapped_column(String, nullable=False)
+    last_confirmed_version_id: Mapped[str] = mapped_column(String, nullable=False)
+    superseded_by_fact_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    confidence: Mapped[float] = mapped_column(nullable=False, default=1.0)
+    reasoning_summary: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "system_name",
+            "kb_name",
+            "semantic_key",
+            name="uq_canonical_fact_semantic_key",
+        ),
+        Index("idx_canonical_facts_active", "system_name", "kb_name", "status"),
+    )
+
+
 class RetrievalMetadataModel(Base):
     """Auxiliary metadata used to inspect and filter retrieval results."""
 

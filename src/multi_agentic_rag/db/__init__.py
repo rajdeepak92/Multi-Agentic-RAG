@@ -1,0 +1,1 @@
+"""Public database adapter layer."""

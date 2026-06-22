@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+import asyncio
+from typing import Any, Protocol
 
 from multi_agentic_rag.domain import RetrievalResult
+from multi_agentic_rag.retrieval.evidence import rank_retrieval_results
 from multi_agentic_rag.retrieval.reranker import NoOpRerankingService, RerankingService
 
 
@@ -86,8 +88,8 @@ class HybridKnowledgeRetriever:
             and optionally rescored by the configured reranker.
         """
 
-        ranked_lists: list[list[RetrievalResult]] = [
-            await self.bm25.retrieve(
+        calls = [
+            self.bm25.retrieve(
                 query_text,
                 system_name=system_name,
                 kb_name=kb_name,
@@ -96,8 +98,8 @@ class HybridKnowledgeRetriever:
             )
         ]
         if self.vector:
-            ranked_lists.append(
-                await self.vector.retrieve(
+            calls.append(
+                self.vector.retrieve(
                     query_text,
                     system_name=system_name,
                     kb_name=kb_name,
@@ -106,8 +108,8 @@ class HybridKnowledgeRetriever:
                 )
             )
         if self.graph:
-            ranked_lists.append(
-                await self.graph.retrieve(
+            calls.append(
+                self.graph.retrieve(
                     query_text,
                     system_name=system_name,
                     kb_name=kb_name,
@@ -115,29 +117,60 @@ class HybridKnowledgeRetriever:
                     top_k=top_k,
                 )
             )
+        ranked_lists = list(await asyncio.gather(*calls))
         fused = self._fuse(ranked_lists)
-        return self.reranker.rerank(query_text, fused[:top_k])
+        reranked = self.reranker.rerank(query_text, fused[:top_k])
+        ranked: list[RetrievalResult] = list(rank_retrieval_results(reranked))
+        return ranked
 
     def _fuse(self, ranked_lists: list[list[RetrievalResult]]) -> list[RetrievalResult]:
         scores: dict[str, float] = {}
         best: dict[str, RetrievalResult] = {}
         sources: dict[str, set[str]] = {}
+        metadata: dict[str, dict[str, Any]] = {}
         for ranked in ranked_lists:
             for rank, result in enumerate(ranked, start=1):
                 scores[result.chunk_id] = scores.get(result.chunk_id, 0.0) + 1.0 / (
                     self.fusion_k + rank
                 )
+                scores[result.chunk_id] += _graph_signal_boost(result)
                 current = best.get(result.chunk_id)
                 if current is None or result.score > current.score:
                     best[result.chunk_id] = result
                 sources.setdefault(result.chunk_id, set()).update(result.sources)
+                metadata.setdefault(result.chunk_id, {}).update(result.metadata)
+        for chunk_id, source_set in sources.items():
+            if "graph" in source_set and source_set.intersection({"bm25", "fts", "vector"}):
+                scores[chunk_id] = scores.get(chunk_id, 0.0) + 0.02
         fused = [
             best[chunk_id].model_copy(
                 update={
                     "score": score,
                     "sources": sorted(sources.get(chunk_id, set())),
+                    "metadata": {
+                        **metadata.get(chunk_id, {}),
+                        "fusion_score": score,
+                        "fusion_sources": sorted(sources.get(chunk_id, set())),
+                    },
                 }
             )
             for chunk_id, score in scores.items()
         ]
         return sorted(fused, key=lambda item: (-item.score, item.chunk_id))
+
+
+def _graph_signal_boost(result: RetrievalResult) -> float:
+    if "graph" not in result.sources:
+        return 0.0
+    graph_score = _float_metadata(result.metadata.get("graph_score"))
+    path_count = _float_metadata(result.metadata.get("graph_path_count"))
+    return min(graph_score, 6.0) * 0.005 + min(path_count, 5.0) * 0.002
+
+
+def _float_metadata(value: object) -> float:
+    if isinstance(value, int | float | str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0

@@ -47,24 +47,35 @@ class NoOpRerankingService:
 class SentenceTransformerRerankingService:
     """Optional local cross-encoder reranker."""
 
-    def __init__(self, model_name: str, *, hf_token: str | None = None) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        hf_token: str | None = None,
+        device: str = "auto",
+    ) -> None:
         """Initialize the lazy cross-encoder reranker.
 
         Args:
             model_name: Local or Hugging Face cross-encoder model name loaded on
                 first rerank call.
             hf_token: Optional Hugging Face token used for Hub downloads.
+            device: Target torch device. ``auto`` keeps sentence-transformers defaults.
         """
 
         self.model_name = model_name
         self.hf_token = hf_token
+        self.device = device
         self._model: Any | None = None
 
     def _load(self) -> Any:
         if self._model is None:
             _configure_hf_token(self.hf_token)
             module = import_module("sentence_transformers")
-            self._model = module.CrossEncoder(self.model_name, token=self.hf_token)
+            kwargs: dict[str, str | None] = {"token": self.hf_token}
+            if not _uses_auto_device(self.device):
+                kwargs["device"] = self.device
+            self._model = module.CrossEncoder(self.model_name, **kwargs)
         return self._model
 
     def rerank(self, query_text: str, results: list[RetrievalResult]) -> list[RetrievalResult]:
@@ -102,9 +113,15 @@ def select_reranker(settings: Settings) -> RerankingService:
         deterministic reranker.
     """
 
+    settings.ensure_project_cache_paths()
     if settings.reranker_provider == "sentence_transformers" and settings.reranker_model:
         return SentenceTransformerRerankingService(
             settings.reranker_model,
             hf_token=settings.hf_token,
+            device=settings.reranker_device,
         )
     return NoOpRerankingService()
+
+
+def _uses_auto_device(device: str) -> bool:
+    return device.strip().lower() == "auto"

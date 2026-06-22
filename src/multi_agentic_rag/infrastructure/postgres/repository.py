@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
-from sqlalchemy import Select, delete, func, select, text, update
+from sqlalchemy import Select, bindparam, delete, func, literal_column, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from multi_agentic_rag.config import Settings
 from multi_agentic_rag.domain import (
+    ArtifactRecord,
+    CanonicalFactRecord,
     ChunkRecord,
     DeltaRecord,
     DocumentRecord,
@@ -25,9 +28,14 @@ from multi_agentic_rag.domain import (
     RequirementRecord,
     RetrievalResult,
     SystemRecord,
+    WorkflowRunRecord,
+    WorkflowStatus,
+    WorkflowStepRecord,
 )
 from multi_agentic_rag.exceptions import ConfigError
 from multi_agentic_rag.infrastructure.postgres.models import (
+    ArtifactRecordModel,
+    CanonicalFactModel,
     ChunkModel,
     DeltaModel,
     DocumentModel,
@@ -38,23 +46,62 @@ from multi_agentic_rag.infrastructure.postgres.models import (
     RequirementModel,
     RetrievalMetadataModel,
     SystemModel,
+    WorkflowRunModel,
+    WorkflowStepModel,
 )
 from multi_agentic_rag.infrastructure.postgres.session import create_async_session_factory
 from multi_agentic_rag.utils.hashing import stable_id
+
+BM25Backend = Literal["pg_textsearch", "postgres_fts"]
+
+
+@dataclass(frozen=True)
+class PostgresLexicalReadiness:
+    """Detailed readiness state for the configured PostgreSQL lexical backend."""
+
+    connected: bool
+    backend: str
+    detail: str
+    pg_textsearch_extension: bool | None = None
+    bm25_index: bool | None = None
+    bm25_operator: bool | None = None
+    native_fts_index: bool | None = None
+
+    @property
+    def ready(self) -> bool:
+        if not self.connected:
+            return False
+        if self.backend == "pg_textsearch":
+            return (
+                self.pg_textsearch_extension is True
+                and self.bm25_index is True
+                and self.bm25_operator is True
+            )
+        if self.backend == "postgres_fts":
+            return self.native_fts_index is True
+        return False
 
 
 class PostgresKnowledgeRepository:
     """Authoritative async PostgreSQL repository."""
 
-    def __init__(self, session_factory: Callable[[], AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: Callable[[], AsyncSession],
+        *,
+        bm25_backend: BM25Backend = "pg_textsearch",
+    ) -> None:
         """Initialize the repository with an async session factory.
 
         Args:
             session_factory: Callable that opens an ``AsyncSession`` or
                 transaction-scoped async session context.
+            bm25_backend: Lexical search backend. ``pg_textsearch`` uses the
+                BM25 extension and ``postgres_fts`` uses native PostgreSQL FTS.
         """
 
         self.session_factory = session_factory
+        self.bm25_backend = bm25_backend
 
     @classmethod
     def from_settings(cls, settings: Settings) -> PostgresKnowledgeRepository:
@@ -72,18 +119,129 @@ class PostgresKnowledgeRepository:
 
         if not settings.postgres_dsn:
             raise ConfigError("POSTGRES_DSN is required.")
-        return cls(create_async_session_factory(settings.postgres_dsn))
+        return cls(
+            create_async_session_factory(
+                settings.postgres_dsn,
+                connect_timeout=settings.postgres_connect_timeout_seconds,
+                command_timeout=settings.postgres_command_timeout_seconds,
+                statement_timeout_ms=settings.postgres_statement_timeout_ms,
+                pool_size=settings.postgres_pool_size,
+                max_overflow=settings.postgres_max_overflow,
+                pool_recycle=settings.postgres_pool_recycle_seconds,
+                pool_pre_ping=settings.postgres_pool_pre_ping,
+            ),
+            bm25_backend=settings.bm25_backend,
+        )
 
     async def check_connection(self) -> tuple[bool, str]:
-        """Verify PostgreSQL connectivity and FTS availability."""
+        """Verify PostgreSQL connectivity and configured lexical index availability."""
+
+        readiness = await self.check_lexical_readiness()
+        return readiness.ready, readiness.detail
+
+    async def check_lexical_readiness(self) -> PostgresLexicalReadiness:
+        """Return detailed PostgreSQL lexical readiness for doctor output."""
 
         try:
             async with self.session_factory() as session:
                 await session.execute(text("SELECT 1"))
-                await session.execute(text("SELECT to_tsvector('english', 'health check')"))
+                if self.bm25_backend == "pg_textsearch":
+                    extension = await session.execute(
+                        text(
+                            "SELECT EXISTS ("
+                            "SELECT 1 FROM pg_extension WHERE extname = 'pg_textsearch'"
+                            ")"
+                        )
+                    )
+                    if not extension.scalar_one_or_none():
+                        return PostgresLexicalReadiness(
+                            connected=True,
+                            backend=self.bm25_backend,
+                            pg_textsearch_extension=False,
+                            bm25_index=None,
+                            detail=(
+                                "pg_textsearch extension is not available in this "
+                                "POSTGRES_DSN target."
+                            ),
+                        )
+                    index = await session.execute(
+                        text("SELECT to_regclass('idx_chunks_text_bm25')")
+                    )
+                    if index.scalar_one_or_none() is None:
+                        return PostgresLexicalReadiness(
+                            connected=True,
+                            backend=self.bm25_backend,
+                            pg_textsearch_extension=True,
+                            bm25_index=False,
+                            bm25_operator=None,
+                            detail=(
+                                "pg_textsearch BM25 index idx_chunks_text_bm25 is not "
+                                "available; run `uv run --no-sync alembic upgrade head` "
+                                "against this POSTGRES_DSN."
+                            ),
+                        )
+                    try:
+                        await session.execute(
+                            text(
+                                "SELECT chunk_id, "
+                                "text <@> to_bm25query("
+                                "'requirements user story', 'idx_chunks_text_bm25'"
+                                ") AS score "
+                                "FROM chunks "
+                                "ORDER BY score "
+                                "LIMIT 1"
+                            )
+                        )
+                    except Exception as exc:
+                        return PostgresLexicalReadiness(
+                            connected=True,
+                            backend=self.bm25_backend,
+                            pg_textsearch_extension=True,
+                            bm25_index=True,
+                            bm25_operator=False,
+                            detail=f"pg_textsearch BM25 operator smoke query failed: {exc}",
+                        )
+                    return PostgresLexicalReadiness(
+                        connected=True,
+                        backend=self.bm25_backend,
+                        pg_textsearch_extension=True,
+                        bm25_index=True,
+                        bm25_operator=True,
+                        detail=(
+                            "PostgreSQL connection, pg_textsearch BM25 index, "
+                            "and BM25 operator are ready."
+                        ),
+                    )
+                if self.bm25_backend == "postgres_fts":
+                    index = await session.execute(text("SELECT to_regclass('idx_chunks_text_fts')"))
+                    if index.scalar_one_or_none() is None:
+                        message = (
+                            "Native PostgreSQL FTS index idx_chunks_text_fts "
+                            "is not available."
+                        )
+                        return PostgresLexicalReadiness(
+                            connected=True,
+                            backend=self.bm25_backend,
+                            native_fts_index=False,
+                            detail=message,
+                        )
+                    return PostgresLexicalReadiness(
+                        connected=True,
+                        backend=self.bm25_backend,
+                        native_fts_index=True,
+                        detail="PostgreSQL connection and native FTS index are ready.",
+                    )
+                return PostgresLexicalReadiness(
+                    connected=True,
+                    backend=self.bm25_backend,
+                    detail=f"Unsupported BM25_BACKEND: {self.bm25_backend}",
+                )
         except Exception as exc:
-            return False, str(exc)
-        return True, "PostgreSQL connection and FTS are ready."
+            return PostgresLexicalReadiness(
+                connected=False,
+                backend=self.bm25_backend,
+                detail=str(exc),
+            )
 
     async def clear(
         self,
@@ -105,6 +263,8 @@ class PostgresKnowledgeRepository:
         counts: dict[str, int] = {}
         ordered_models = [
             RetrievalMetadataModel,
+            ArtifactRecordModel,
+            CanonicalFactModel,
             IngestionRunModel,
             DeltaModel,
             EntityModel,
@@ -115,6 +275,22 @@ class PostgresKnowledgeRepository:
             DocumentModel,
         ]
         async with self.session_factory.begin() as session:
+            workflow_filters = _cleanup_filters(WorkflowRunModel, system_name, kb_name)
+            workflow_run_ids = await session.execute(
+                select(WorkflowRunModel.workflow_run_id).where(*workflow_filters)
+            )
+            run_ids = list(workflow_run_ids.scalars().all())
+            if run_ids:
+                result = await session.execute(
+                    delete(WorkflowStepModel).where(WorkflowStepModel.workflow_run_id.in_(run_ids))
+                )
+                counts[WorkflowStepModel.__tablename__] = int(result.rowcount or 0)
+            else:
+                counts[WorkflowStepModel.__tablename__] = 0
+            result = await session.execute(
+                delete(WorkflowRunModel).where(*workflow_filters)
+            )
+            counts[WorkflowRunModel.__tablename__] = int(result.rowcount or 0)
             for model in ordered_models:
                 result = await session.execute(
                     delete(model).where(*_cleanup_filters(model, system_name, kb_name))
@@ -162,12 +338,26 @@ class PostgresKnowledgeRepository:
                 update(IngestionRunModel)
                 .where(IngestionRunModel.ingestion_run_id == ingestion_run_id)
                 .values(
-                    status=IngestionRunStatus.SUCCEEDED.value,
+                    status=IngestionRunStatus.COMPLETED.value,
                     ended_at=datetime.now(UTC),
                     document_id=document_id,
                     document_version_id=document_version_id,
                     error_message=None,
                 )
+            )
+
+    async def mark_run_stage(
+        self,
+        ingestion_run_id: str,
+        status: IngestionRunStatus,
+    ) -> None:
+        """Mark an ingestion run stage checkpoint."""
+
+        async with self.session_factory.begin() as session:
+            await session.execute(
+                update(IngestionRunModel)
+                .where(IngestionRunModel.ingestion_run_id == ingestion_run_id)
+                .values(status=status.value)
             )
 
     async def mark_run_failed(self, ingestion_run_id: str, error_message: str) -> None:
@@ -187,6 +377,61 @@ class PostgresKnowledgeRepository:
                     ended_at=datetime.now(UTC),
                     error_message=error_message,
                 )
+            )
+
+    async def begin_workflow_run(self, run: WorkflowRunRecord) -> None:
+        """Create or update a started workflow run."""
+
+        async with self.session_factory.begin() as session:
+            await self._upsert_one(
+                session,
+                WorkflowRunModel,
+                _workflow_run_values(run),
+                ["workflow_run_id"],
+            )
+
+    async def finish_workflow_run(
+        self,
+        workflow_run_id: str,
+        *,
+        status: WorkflowStatus,
+        intent_type: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Mark a workflow run finished."""
+
+        async with self.session_factory.begin() as session:
+            await session.execute(
+                update(WorkflowRunModel)
+                .where(WorkflowRunModel.workflow_run_id == workflow_run_id)
+                .values(
+                    status=status.value,
+                    ended_at=datetime.now(UTC),
+                    intent_type=intent_type,
+                    error_message=error_message,
+                )
+            )
+
+    async def record_workflow_step(self, step: WorkflowStepRecord) -> None:
+        """Create or update one workflow step audit row."""
+
+        async with self.session_factory.begin() as session:
+            await self._upsert_one(
+                session,
+                WorkflowStepModel,
+                _workflow_step_values(step),
+                ["workflow_step_id"],
+            )
+
+    async def record_artifact(self, record: ArtifactRecord) -> None:
+        """Create or update one generated artifact audit row."""
+
+        async with self.session_factory.begin() as session:
+            await self._upsert_one(
+                session,
+                ArtifactRecordModel,
+                _artifact_record_values(record),
+                ["artifact_id"],
             )
 
     async def get_active_document_version(
@@ -322,6 +567,10 @@ class PostgresKnowledgeRepository:
             await self._upsert_many(
                 session, FactModel, [_fact_values(fact) for fact in facts], ["fact_id"]
             )
+            await self._upsert_canonical_facts(
+                session,
+                _canonical_facts_from_facts(facts),
+            )
             await self._upsert_many(
                 session,
                 RequirementModel,
@@ -351,10 +600,10 @@ class PostgresKnowledgeRepository:
         active_only: bool | None = None,
         top_k: int = 5,
     ) -> list[RetrievalResult]:
-        """Search chunks with PostgreSQL full-text ranking.
+        """Search chunks with the configured lexical ranking backend.
 
         Args:
-            query_text: Query text converted to a PostgreSQL plainto_tsquery.
+            query_text: Query text converted to the configured lexical query.
             system_name: System filter for active chunks.
             kb_name: Knowledge-base filter for active chunks.
             version: Optional version filter.
@@ -364,37 +613,145 @@ class PostgresKnowledgeRepository:
             top_k: Maximum number of ranked chunks to return.
 
         Returns:
-            Ranked retrieval results with ``bm25`` as the source signal.
+            Ranked retrieval results with ``bm25`` or ``fts`` as the source signal.
         """
 
-        filters = [
-            ChunkModel.system_name == system_name,
-            ChunkModel.kb_name == kb_name,
-            text("to_tsvector('english', chunks.text) @@ plainto_tsquery('english', :query_text)"),
-        ]
-        if active_only is None:
-            active_only = version is None
-        if active_only:
-            filters.append(ChunkModel.status == DocumentStatus.ACTIVE.value)
-        if version:
-            filters.append(ChunkModel.version == version)
-        rank = func.ts_rank_cd(
-            func.to_tsvector("english", ChunkModel.text),
-            func.plainto_tsquery("english", query_text),
-        ).label("score")
+        if self.bm25_backend == "pg_textsearch":
+            return await self._search_chunks_pg_textsearch(
+                query_text,
+                system_name=system_name,
+                kb_name=kb_name,
+                version=version,
+                active_only=active_only,
+                top_k=top_k,
+            )
+        if self.bm25_backend == "postgres_fts":
+            return await self._search_chunks_postgres_fts(
+                query_text,
+                system_name=system_name,
+                kb_name=kb_name,
+                version=version,
+                active_only=active_only,
+                top_k=top_k,
+            )
+        raise ConfigError(f"Unsupported BM25_BACKEND: {self.bm25_backend}")
+
+    async def _search_chunks_pg_textsearch(
+        self,
+        query_text: str,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str | None,
+        active_only: bool | None,
+        top_k: int,
+    ) -> list[RetrievalResult]:
+        bm25_query = func.to_bm25query(
+            bindparam("query_text"),
+            literal_column("'idx_chunks_text_bm25'"),
+        )
+        score = ChunkModel.text.op("<@>")(bm25_query).label("score")
+        filters = self._chunk_search_filters(
+            system_name=system_name,
+            kb_name=kb_name,
+            version=version,
+            active_only=active_only,
+            match_expr=score < 0,
+        )
         stmt: Select[Any] = (
-            select(ChunkModel, rank)
+            select(ChunkModel, score)
             .where(*filters)
-            .order_by(text("score DESC"), ChunkModel.page.asc(), ChunkModel.chunk_index.asc())
+            .order_by(score.asc(), ChunkModel.page.asc(), ChunkModel.chunk_index.asc())
             .limit(top_k)
         )
         async with self.session_factory() as session:
             result = await session.execute(stmt, {"query_text": query_text})
             rows = result.all()
         return [
-            _retrieval_result_from_chunk_model(chunk, score=float(score or 0.0), source="bm25")
+            _retrieval_result_from_chunk_model(
+                chunk,
+                score=float(score_value or 0.0),
+                source="bm25",
+            )
+            for chunk, score_value in rows
+        ]
+
+    async def _search_chunks_postgres_fts(
+        self,
+        query_text: str,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str | None,
+        active_only: bool | None,
+        top_k: int,
+    ) -> list[RetrievalResult]:
+        english_config = literal_column("'english'")
+        search_query = func.websearch_to_tsquery(english_config, bindparam("query_text"))
+        search_vector = func.to_tsvector(
+            english_config,
+            func.coalesce(ChunkModel.text, ""),
+        )
+        match_expr = search_vector.op("@@")(search_query)
+        filters = self._chunk_search_filters(
+            system_name=system_name,
+            kb_name=kb_name,
+            version=version,
+            active_only=active_only,
+            match_expr=match_expr,
+        )
+        rank = func.ts_rank_cd(search_vector, search_query).label("score")
+        stmt: Select[Any] = (
+            select(ChunkModel, rank)
+            .where(*filters)
+            .order_by(rank.desc(), ChunkModel.page.asc(), ChunkModel.chunk_index.asc())
+            .limit(top_k)
+        )
+        async with self.session_factory() as session:
+            result = await session.execute(stmt, {"query_text": query_text})
+            rows = result.all()
+        return [
+            _retrieval_result_from_chunk_model(chunk, score=float(score or 0.0), source="fts")
             for chunk, score in rows
         ]
+
+    def _chunk_search_filters(
+        self,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str | None,
+        active_only: bool | None,
+        match_expr: Any,
+    ) -> list[Any]:
+        filters = [
+            ChunkModel.system_name == system_name,
+            ChunkModel.kb_name == kb_name,
+            match_expr,
+        ]
+        if active_only is None:
+            active_only = version is None
+        if active_only:
+            active_canonical_fact_exists = (
+                select(CanonicalFactModel.canonical_fact_id)
+                .join(FactModel, FactModel.fact_id == CanonicalFactModel.active_fact_id)
+                .where(
+                    FactModel.chunk_id == ChunkModel.chunk_id,
+                    CanonicalFactModel.system_name == system_name,
+                    CanonicalFactModel.kb_name == kb_name,
+                    CanonicalFactModel.status == DocumentStatus.ACTIVE.value,
+                )
+                .exists()
+            )
+            filters.append(
+                or_(
+                    ChunkModel.status == DocumentStatus.ACTIVE.value,
+                    active_canonical_fact_exists,
+                )
+            )
+        if version:
+            filters.append(ChunkModel.version == version)
+        return filters
 
     async def list_chunks_by_ids(
         self,
@@ -480,6 +837,31 @@ class PostgresKnowledgeRepository:
         stmt = stmt.on_conflict_do_update(index_elements=conflict_columns, set_=update_values)
         await session.execute(stmt)
 
+    async def _upsert_canonical_facts(
+        self,
+        session: AsyncSession,
+        records: list[CanonicalFactRecord],
+    ) -> None:
+        rows = [_canonical_fact_values(record) for record in records]
+        if not rows:
+            return
+        table = CanonicalFactModel.__table__
+        stmt = pg_insert(table).values(rows)
+        update_values = {
+            "current_value": stmt.excluded.current_value,
+            "status": stmt.excluded.status,
+            "active_fact_id": stmt.excluded.active_fact_id,
+            "last_confirmed_version_id": stmt.excluded.last_confirmed_version_id,
+            "superseded_by_fact_id": stmt.excluded.superseded_by_fact_id,
+            "confidence": stmt.excluded.confidence,
+            "reasoning_summary": stmt.excluded.reasoning_summary,
+        }
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["canonical_fact_id"],
+            set_=update_values,
+        )
+        await session.execute(stmt)
+
 
 def _system_values(record: SystemRecord) -> dict[str, Any]:
     payload = record.model_dump(mode="python")
@@ -544,6 +926,30 @@ def _run_values(record: IngestionRunRecord) -> dict[str, Any]:
     payload["status"] = record.status.value
     payload["metadata"] = payload.pop("metadata")
     return payload
+
+
+def _workflow_run_values(record: WorkflowRunRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["status"] = record.status.value
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
+def _workflow_step_values(record: WorkflowStepRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["status"] = record.status.value
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
+def _artifact_record_values(record: ArtifactRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
+def _canonical_fact_values(record: CanonicalFactRecord) -> dict[str, Any]:
+    return record.model_dump(mode="python")
 
 
 def _cleanup_filters(model: Any, system_name: str | None, kb_name: str | None) -> list[Any]:
@@ -691,3 +1097,29 @@ def _entity_from_fact(fact: FactRecord) -> EntityRecord | None:
         version=fact.version,
         status=fact.status,
     )
+
+
+def _canonical_facts_from_facts(facts: list[FactRecord]) -> list[CanonicalFactRecord]:
+    records: dict[str, CanonicalFactRecord] = {}
+    for fact in facts:
+        semantic_key = fact.semantic_key or fact.fact_key
+        canonical_fact_id = stable_id(
+            "canonical_fact",
+            fact.system_name,
+            fact.kb_name,
+            semantic_key,
+        )
+        records[canonical_fact_id] = CanonicalFactRecord(
+            canonical_fact_id=canonical_fact_id,
+            system_name=fact.system_name,
+            kb_name=fact.kb_name,
+            semantic_key=semantic_key,
+            current_value=fact.value,
+            status=DocumentStatus.ACTIVE.value,
+            originating_fact_id=fact.fact_id,
+            active_fact_id=fact.fact_id,
+            originating_version_id=fact.document_version_id,
+            last_confirmed_version_id=fact.document_version_id,
+            reasoning_summary="deterministic extraction; absent facts are carried forward",
+        )
+    return list(records.values())

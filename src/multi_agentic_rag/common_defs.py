@@ -1,0 +1,46 @@
+"""Stable names shared across CLI, runtime, and tests."""
+
+from __future__ import annotations
+
+BASE_CONFIG_NAME = "base_config.json"
+DOCUMENTS_DIR_NAME = "documents"
+GLOBAL_CACHE_DIR_NAME = ".global_cache"
+GENERATED_DIR_NAME = "generated"
+LOGS_DIR_NAME = "logs"
+RESULTS_DIR_NAME = "results"
+ARTIFACTS_DIR_NAME = "artifacts"
+DEBUG_DIR_NAME = "debug"
+USER_STORIES_DIR_NAME = "user_stories"
+
+PROVIDER_OPENAI = "openai"
+PROVIDER_HF = "hf"
+PROVIDER_GEMINI = "gemini"
+REASONING_PROVIDER_IDS = (PROVIDER_OPENAI, PROVIDER_HF, PROVIDER_GEMINI)
+EMBEDDING_PROVIDER_HASH = "hash"
+EMBEDDING_PROVIDER_SENTENCE_TRANSFORMERS = "sentence_transformers"
+RERANKING_PROVIDER_NONE = "none"
+RERANKING_PROVIDER_SENTENCE_TRANSFORMERS = "sentence_transformers"
+
+LEXICAL_PG_TEXTSEARCH = "pg_textsearch"
+LEXICAL_POSTGRES_FTS = "postgres_fts"
+LEXICAL_BACKEND_IDS = (LEXICAL_PG_TEXTSEARCH, LEXICAL_POSTGRES_FTS)
+
+CLI_MULTI_AGENTIC_RAG = "multi-agentic-rag"
+CLI_MULTI_RAG = "multi-rag"
+
+RUN_STATE_STARTED = "started"
+RUN_STATE_POSTGRES_COMMITTED = "postgres_committed"
+RUN_STATE_CHROMA_INDEXED = "chroma_indexed"
+RUN_STATE_NEO4J_PROJECTED = "neo4j_projected"
+RUN_STATE_COMPLETED = "completed"
+RUN_STATE_FAILED = "failed"
+RUN_STATE_NAMES = (
+    RUN_STATE_STARTED,
+    RUN_STATE_POSTGRES_COMMITTED,
+    RUN_STATE_CHROMA_INDEXED,
+    RUN_STATE_NEO4J_PROJECTED,
+    RUN_STATE_COMPLETED,
+    RUN_STATE_FAILED,
+)
+
+SUPPORTED_DOCUMENT_SUFFIXES = (".pdf", ".docx", ".txt", ".md", ".markdown")

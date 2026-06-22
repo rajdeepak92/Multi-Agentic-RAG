@@ -143,24 +143,35 @@ class SentenceTransformerEmbeddingProvider:
 
     name = "sentence_transformers"
 
-    def __init__(self, model: str, *, hf_token: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str,
+        *,
+        hf_token: str | None = None,
+        device: str = "auto",
+    ) -> None:
         """Initialize a lazily loaded sentence-transformer provider.
 
         Args:
             model: Local or Hugging Face model name passed to
                 ``SentenceTransformer`` on first use.
             hf_token: Optional Hugging Face token used for Hub downloads.
+            device: Target torch device. ``auto`` keeps sentence-transformers defaults.
         """
 
         self.model = model
         self.hf_token = hf_token
+        self.device = device
         self._model: Any | None = None
 
     def _load(self) -> Any:
         if self._model is None:
             _configure_hf_token(self.hf_token)
             module = import_module("sentence_transformers")
-            self._model = module.SentenceTransformer(self.model, token=self.hf_token)
+            kwargs: dict[str, str | None] = {"token": self.hf_token}
+            if not _uses_auto_device(self.device):
+                kwargs["device"] = self.device
+            self._model = module.SentenceTransformer(self.model, **kwargs)
         return self._model
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -208,10 +219,12 @@ def select_embedding_provider(settings: Settings) -> EmbeddingProvider:
         the deterministic hash provider.
     """
 
+    settings.ensure_project_cache_paths()
     if settings.embedding_provider == "sentence_transformers":
         return SentenceTransformerEmbeddingProvider(
             settings.embedding_model,
             hf_token=settings.hf_token,
+            device=settings.embedding_device,
         )
     return HashEmbeddingProvider(
         dimensions=settings.embedding_dimensions,
@@ -230,3 +243,7 @@ def _configure_hf_token(hf_token: str | None) -> None:
         return
     os.environ.setdefault("HF_TOKEN", hf_token)
     os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", hf_token)
+
+
+def _uses_auto_device(device: str) -> bool:
+    return device.strip().lower() == "auto"

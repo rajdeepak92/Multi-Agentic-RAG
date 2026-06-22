@@ -8,6 +8,8 @@ from typing import Any
 
 from multi_agentic_rag.config import Settings
 from multi_agentic_rag.domain import ChunkRecord, RetrievalResult
+from multi_agentic_rag.exceptions import ConfigError
+from multi_agentic_rag.infrastructure.chroma.fingerprint import EmbeddingSpaceFingerprint
 from multi_agentic_rag.infrastructure.embeddings import EmbeddingProvider, select_embedding_provider
 
 
@@ -20,6 +22,8 @@ class ChromaVectorRepository:
         path: Path,
         collection_name: str,
         embedding_provider: EmbeddingProvider,
+        embedding_fingerprint: EmbeddingSpaceFingerprint | None = None,
+        allow_legacy_without_fingerprint: bool = False,
     ) -> None:
         """Initialize the lazy Chroma adapter.
 
@@ -32,6 +36,8 @@ class ChromaVectorRepository:
         self.path = path
         self.collection_name = collection_name
         self.embedding_provider = embedding_provider
+        self.embedding_fingerprint = embedding_fingerprint
+        self.allow_legacy_without_fingerprint = allow_legacy_without_fingerprint
         self._client: Any | None = None
         self._collection: Any | None = None
 
@@ -48,10 +54,13 @@ class ChromaVectorRepository:
             first use.
         """
 
+        settings.ensure_project_cache_paths()
         return cls(
             path=settings.chroma_path,
             collection_name=settings.chroma_collection,
             embedding_provider=select_embedding_provider(settings),
+            embedding_fingerprint=EmbeddingSpaceFingerprint.from_settings(settings),
+            allow_legacy_without_fingerprint=settings.chroma_allow_legacy_without_fingerprint,
         )
 
     def check_connection(self) -> tuple[bool, str]:
@@ -200,11 +209,35 @@ class ChromaVectorRepository:
             self.path.mkdir(parents=True, exist_ok=True)
             chromadb = import_module("chromadb")
             self._client = chromadb.PersistentClient(path=str(self.path))
+            metadata: dict[str, Any] = {"hnsw:space": "cosine"}
+            if self.embedding_fingerprint is not None:
+                metadata.update(self.embedding_fingerprint.metadata())
             self._collection = self._client.get_or_create_collection(
                 name=self.collection_name,
-                metadata={"hnsw:space": "cosine"},
+                metadata=metadata,
             )
+            self._validate_collection_fingerprint(self._collection)
         return self._collection
+
+    def _validate_collection_fingerprint(self, collection: Any) -> None:
+        if self.embedding_fingerprint is None:
+            return
+        persisted = EmbeddingSpaceFingerprint.from_metadata(
+            getattr(collection, "metadata", None)
+        )
+        if persisted is None:
+            if self.allow_legacy_without_fingerprint:
+                return
+            raise ConfigError(
+                "Chroma collection is missing embedding-space fingerprint metadata. "
+                "Create a new collection or explicitly migrate/reindex the collection."
+            )
+        if not persisted.compatible_with(self.embedding_fingerprint):
+            raise ConfigError(
+                "Chroma collection embedding-space fingerprint does not match current "
+                "embedding settings. Reindex into a versioned collection instead of "
+                "mixing vector spaces."
+            )
 
     def _metadata(self, chunk: ChunkRecord) -> dict[str, str | int]:
         return {
