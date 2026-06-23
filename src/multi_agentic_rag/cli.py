@@ -82,6 +82,7 @@ REVIEW_FACTS_OPTION_HELP = (
     "Run LLM fact review during ingestion. Defaults off so ingest stays deterministic "
     "and does not invoke local HF generation per chunk."
 )
+REVIEW_OPTION_HELP = "Render deterministic review/audit tables without invoking model review."
 OPENAI_QUOTA_HINT = (
     "OpenAI quota is exhausted. Rerun the same command with `--model hf` after installing "
     "`uv sync --dev --extra hf-reasoning --extra cpu --link-mode=copy` for CPU or "
@@ -128,6 +129,10 @@ def ingest(
         bool,
         typer.Option("--review-facts/--no-review-facts", help=REVIEW_FACTS_OPTION_HELP),
     ] = False,
+    review: Annotated[
+        bool,
+        typer.Option("--review/--no-review", help=REVIEW_OPTION_HELP),
+    ] = False,
 ) -> None:
     """Ingest a versioned document into PostgreSQL, Chroma, and Neo4j.
 
@@ -157,6 +162,7 @@ def ingest(
                     system=system,
                     version=version,
                     kb=kb,
+                    review=review,
                 )
             )
         )
@@ -166,6 +172,11 @@ def ingest(
         console.print("[red]FAIL[/red] Ingestion graph did not return an ingest result.")
         raise typer.Exit(code=1)
     _print_ingest_result(result.ingest_result.model_dump())
+    if review:
+        _print_review_events(
+            "Ingestion Review",
+            [event.model_dump(mode="json") for event in result.review_events],
+        )
 
 
 @app.command("ingest-directory")
@@ -185,6 +196,10 @@ def ingest_directory(
     review_facts: Annotated[
         bool,
         typer.Option("--review-facts/--no-review-facts", help=REVIEW_FACTS_OPTION_HELP),
+    ] = False,
+    review: Annotated[
+        bool,
+        typer.Option("--review/--no-review", help=REVIEW_OPTION_HELP),
     ] = False,
 ) -> None:
     """Ingest every supported document in a directory.
@@ -213,6 +228,7 @@ def ingest_directory(
             kb=kb,
             model=model,
             review_facts=review_facts,
+            review=review,
         )
     )
     table = Table(title="Directory Ingestion")
@@ -229,6 +245,7 @@ def ingest_directory(
             table.add_row(path.name, "[red]FAIL[/red]", "-", "-", "-", error)
             continue
         assert result is not None
+        review_events = result.get("review_events", [])
         table.add_row(
             path.name,
             "[green]PASS[/green]",
@@ -237,6 +254,8 @@ def ingest_directory(
             str(result["facts_count"]),
             "; ".join(result["warnings"]),
         )
+        if review and review_events:
+            _print_review_events(f"Ingestion Review: {path.name}", review_events)
     console.print(table)
     if failures:
         for _, _, error in results:
@@ -490,6 +509,27 @@ def _print_ingest_result(rows: dict[str, Any]) -> None:
         console.print(f"[yellow]WARN[/yellow] {warning}")
 
 
+def _print_review_events(title: str, events: list[dict[str, Any]]) -> None:
+    table = Table(title=title)
+    table.add_column("Event")
+    table.add_column("Severity")
+    table.add_column("Message")
+    table.add_column("Payload")
+    if not events:
+        table.add_row("review", "info", "No review events emitted.", "{}")
+        console.print(table)
+        return
+    for event in events:
+        payload = event.get("redacted_payload") or event.get("payload") or {}
+        table.add_row(
+            str(event.get("event_type") or "review"),
+            str(event.get("severity") or "info"),
+            str(event.get("message") or ""),
+            json.dumps(redact_secrets(payload), sort_keys=True),
+        )
+    console.print(table)
+
+
 @app.command("retrieve")
 def retrieve(
     query: Annotated[str, typer.Argument(help="Query text.")],
@@ -584,6 +624,10 @@ def ask(
         ReasoningModelSelector | None,
         typer.Option("--model", help=MODEL_OPTION_HELP),
     ] = None,
+    review: Annotated[
+        bool,
+        typer.Option("--review/--no-review", help=REVIEW_OPTION_HELP),
+    ] = False,
 ) -> None:
     """Answer a question using validated hybrid evidence and model synthesis."""
 
@@ -599,6 +643,22 @@ def ask(
         _print_agent_failure(result.messages)
     for message in result.messages:
         console.print(message, markup=False)
+    if review:
+        _print_review_events(
+            "Ask Review",
+            [
+                {
+                    "event_type": "ask",
+                    "severity": "info",
+                    "message": f"status={result.status.value}",
+                    "payload": {
+                        "evidence_ids": result.evidence_ids,
+                        "artifact_paths": result.artifact_paths,
+                        "query_intent": result.payload.get("query_intent"),
+                    },
+                }
+            ],
+        )
 
 
 @app.command("requirements")
@@ -741,6 +801,70 @@ def requirements_rebuild(
     )
 
 
+@app.command("chroma-reindex")
+def chroma_reindex(
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str, typer.Option("--version", help="Document version.")],
+    kb: Annotated[str, typer.Option("--kb", help="Knowledge base name or context.")] = "default",
+    requirements: Annotated[
+        bool,
+        typer.Option(
+            "--requirements/--no-requirements",
+            help="Also upsert canonical requirement vectors.",
+        ),
+    ] = True,
+) -> None:
+    """Reindex stored PostgreSQL chunks into the configured Chroma collection."""
+
+    settings = get_settings()
+    repo = PostgresKnowledgeRepository.from_settings(settings)
+    chroma = ChromaVectorRepository.from_settings(settings)
+    chunk_count = 0
+    requirement_count = 0
+
+    async def load_records() -> tuple[list[Any], list[Any]]:
+        chunks = await repo.list_chunks_for_scope(
+            system_name=system,
+            kb_name=kb,
+            version=version,
+            active_only=True,
+        )
+        requirement_records = (
+            await repo.list_requirements_for_scope(
+                system_name=system,
+                kb_name=kb,
+                version=version,
+                active_only=True,
+            )
+            if requirements
+            else []
+        )
+        return chunks, requirement_records
+
+    try:
+        chunks, requirement_records = asyncio.run(load_records())
+        if not chunks and not requirement_records:
+            console.print(
+                "[yellow]No active chunks or requirements found for the requested scope.[/yellow]"
+            )
+            raise typer.Exit(code=1)
+        chunk_count = chroma.index_chunks(chunks)
+        requirement_count = (
+            chroma.index_requirements(requirement_records)
+            if requirements
+            else 0
+        )
+    except MultiAgenticRagError as exc:
+        _print_cli_error(exc)
+    finally:
+        chroma.close()
+    console.print(
+        "[green]PASS[/green] reindexed Chroma: "
+        f"chunks={chunk_count}, requirements={requirement_count}, "
+        f"collection={settings.chroma_collection}"
+    )
+
+
 @app.command("user-stories")
 def user_stories(
     system: Annotated[str, typer.Option("--system", help="System name.")],
@@ -750,6 +874,10 @@ def user_stories(
         ReasoningModelSelector | None,
         typer.Option("--model", help=MODEL_OPTION_HELP),
     ] = None,
+    review: Annotated[
+        bool,
+        typer.Option("--review/--no-review", help=REVIEW_OPTION_HELP),
+    ] = False,
 ) -> None:
     """Generate user-story YAML artifacts from an already ingested version."""
 
@@ -767,6 +895,21 @@ def user_stories(
         console.print(message, markup=False)
     for path in result.artifact_paths:
         console.print(f"artifact: {path}")
+    if review:
+        _print_review_events(
+            "User Story Review",
+            [
+                {
+                    "event_type": "user_stories",
+                    "severity": "info",
+                    "message": f"status={result.status.value}",
+                    "payload": {
+                        "artifact_count": len(result.artifact_paths),
+                        "evidence_count": len(result.evidence_ids),
+                    },
+                }
+            ],
+        )
 
 
 @app.command("ingest-and-user-stories")
@@ -783,6 +926,10 @@ def ingest_and_user_stories(
         bool,
         typer.Option("--review-facts/--no-review-facts", help=REVIEW_FACTS_OPTION_HELP),
     ] = False,
+    review: Annotated[
+        bool,
+        typer.Option("--review/--no-review", help=REVIEW_OPTION_HELP),
+    ] = False,
 ) -> None:
     """Ingest one document and then generate user-story artifacts."""
 
@@ -792,13 +939,16 @@ def ingest_and_user_stories(
             model_selector=model,
             review_facts=review_facts,
         )
+        workflow_kwargs: dict[str, Any] = {
+            "document_path": document_path,
+            "system": system,
+            "version": version,
+            "kb": kb,
+        }
+        if review:
+            workflow_kwargs["review"] = True
         ingest_result, story_result = asyncio.run(
-            application.ingest_then_user_stories(
-                document_path=document_path,
-                system=system,
-                version=version,
-                kb=kb,
-            )
+            application.ingest_then_user_stories(**workflow_kwargs)
         )
     except MultiAgenticRagError as exc:
         _print_cli_error(exc)
@@ -808,6 +958,22 @@ def ingest_and_user_stories(
         console.print(f"[yellow]WARN[/yellow] {warning}")
     for path in story_result.artifact_paths:
         console.print(f"artifact: {path}")
+    if review:
+        _print_review_events(
+            "Ingest And User Stories Review",
+            [
+                *[
+                    event.model_dump(mode="json")
+                    for event in getattr(ingest_result, "review_events", [])
+                ],
+                {
+                    "event_type": "user_stories",
+                    "severity": "info",
+                    "message": f"story_status={story_result.status}",
+                    "payload": {"artifact_count": len(story_result.artifact_paths)},
+                },
+            ],
+        )
 
 
 @app.command("run")
@@ -1019,6 +1185,7 @@ async def _ingest_many(
     kb: str,
     model: ReasoningModelSelector | None,
     review_facts: bool,
+    review: bool,
 ) -> list[tuple[Path, dict[str, Any] | None, str | None]]:
     settings = get_settings()
     application = build_application(
@@ -1035,6 +1202,7 @@ async def _ingest_many(
                     system=system,
                     version=version,
                     kb=kb,
+                    review=review,
                 )
             )
         except MultiAgenticRagError as exc:
@@ -1043,7 +1211,11 @@ async def _ingest_many(
         if result.ingest_result is None:
             results.append((path, None, "Ingestion graph did not return an ingest result."))
             continue
-        results.append((path, result.ingest_result.model_dump(), None))
+        payload = result.ingest_result.model_dump()
+        payload["review_events"] = [
+            event.model_dump(mode="json") for event in getattr(result, "review_events", [])
+        ]
+        results.append((path, payload, None))
     return results
 
 

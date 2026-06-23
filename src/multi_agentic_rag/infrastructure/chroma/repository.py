@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from multi_agentic_rag.config import Settings
-from multi_agentic_rag.domain import ChunkRecord, RetrievalResult
+from multi_agentic_rag.domain import ChunkRecord, RequirementRecord, RetrievalResult
 from multi_agentic_rag.exceptions import ConfigError
 from multi_agentic_rag.infrastructure.chroma.fingerprint import EmbeddingSpaceFingerprint
 from multi_agentic_rag.infrastructure.embeddings import EmbeddingProvider, select_embedding_provider
@@ -133,6 +133,26 @@ class ChromaVectorRepository:
         )
         return len(chunks)
 
+    def index_requirements(self, requirements: list[RequirementRecord]) -> int:
+        """Upsert canonical requirement vectors without altering source chunks."""
+
+        if not requirements:
+            return 0
+        collection = self._get_collection()
+        ids = [
+            requirement.requirement_pk
+            or f"requirement:{requirement.document_version_id}:{requirement.requirement_id}"
+            for requirement in requirements
+        ]
+        documents = [requirement.text for requirement in requirements]
+        collection.upsert(
+            ids=ids,
+            documents=documents,
+            embeddings=self.embedding_provider.embed_documents(documents),
+            metadatas=[self._requirement_metadata(requirement) for requirement in requirements],
+        )
+        return len(requirements)
+
     def query(
         self,
         query_text: str,
@@ -189,9 +209,15 @@ class ChromaVectorRepository:
             result_metadata = dict(metadata)
             result_metadata["vector_score"] = score
             result_metadata["vector_distance"] = float(distance or 0.0)
+            result_metadata["vector_record_id"] = str(chunk_id)
+            source_chunk_id = (
+                str(metadata.get("chunk_id") or chunk_id)
+                if metadata.get("entity_kind") == "canonical_requirement"
+                else str(chunk_id)
+            )
             results.append(
                 RetrievalResult(
-                    chunk_id=str(chunk_id),
+                    chunk_id=source_chunk_id,
                     document_id=str(metadata.get("document_id", "")),
                     document_version_id=str(metadata.get("document_version_id", "")),
                     system_name=str(metadata.get("system_name", "")),
@@ -244,6 +270,7 @@ class ChromaVectorRepository:
 
     def _metadata(self, chunk: ChunkRecord) -> dict[str, str | int]:
         return {
+            "entity_kind": "source_chunk",
             "document_id": chunk.document_id,
             "document_version_id": chunk.document_version_id,
             "system_name": chunk.system_name,
@@ -255,6 +282,29 @@ class ChromaVectorRepository:
             "section_title": chunk.section_title or "",
             "chunk_index": chunk.chunk_index,
             "content_hash": chunk.content_hash,
+            "embedding_provider": self.embedding_provider.name,
+            "embedding_model": self.embedding_provider.model,
+        }
+
+    def _requirement_metadata(self, requirement: RequirementRecord) -> dict[str, str | int | float]:
+        return {
+            "entity_kind": "canonical_requirement",
+            "requirement_pk": requirement.requirement_pk or "",
+            "canonical_id": requirement.canonical_id or requirement.requirement_id,
+            "requirement_id": requirement.requirement_id,
+            "requirement_type": requirement.requirement_type.value,
+            "document_id": requirement.document_id,
+            "document_version_id": requirement.document_version_id,
+            "chunk_id": requirement.chunk_id,
+            "system_name": requirement.system_name,
+            "kb_name": requirement.kb_name,
+            "version": requirement.version,
+            "status": requirement.status.value,
+            "source_name": requirement.source_name or "",
+            "page": requirement.page or 1,
+            "section_title": requirement.section_title or "",
+            "semantic_key": requirement.semantic_key or "",
+            "confidence": requirement.confidence,
             "embedding_provider": self.embedding_provider.name,
             "embedding_model": self.embedding_provider.model,
         }

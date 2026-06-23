@@ -120,6 +120,39 @@ class ChunkModel(Base):
     )
 
 
+class SourceSegmentModel(Base):
+    """Logical source segment projected from parsed/chunked document text."""
+
+    __tablename__ = "source_segments"
+
+    segment_id: Mapped[str] = mapped_column(String, primary_key=True)
+    document_version_id: Mapped[str] = mapped_column(
+        String, ForeignKey("document_versions.document_version_id"), nullable=False
+    )
+    document_id: Mapped[str] = mapped_column(String, nullable=False)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    source_name: Mapped[str] = mapped_column(String, nullable=False)
+    page: Mapped[int] = mapped_column(Integer, nullable=False)
+    segment_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    segment_type: Mapped[str] = mapped_column(String, nullable=False, default="body")
+    section_title: Mapped[str | None] = mapped_column(String, nullable=True)
+    start_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    end_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    chunk_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+
+    __table_args__ = (
+        Index("idx_source_segments_version", "document_version_id", "segment_index"),
+        Index("idx_source_segments_scope", "system_name", "kb_name", "version"),
+    )
+
+
 class FactModel(Base):
     """Extracted evidence fact anchored to the chunk that supports it."""
 
@@ -273,6 +306,106 @@ class RequirementCoverageModel(Base):
             name="uq_requirement_coverage_story",
         ),
         Index("idx_requirement_coverage_status", "coverage_status"),
+    )
+
+
+class RequirementCandidateModel(Base):
+    """Requirement candidate row retained for review and traceability."""
+
+    __tablename__ = "requirement_candidates"
+
+    candidate_id: Mapped[str] = mapped_column(String, primary_key=True)
+    document_version_id: Mapped[str] = mapped_column(String, nullable=False)
+    document_id: Mapped[str] = mapped_column(String, nullable=False)
+    segment_id: Mapped[str] = mapped_column(String, nullable=False)
+    chunk_id: Mapped[str] = mapped_column(String, nullable=False)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    requirement_type: Mapped[str] = mapped_column(String, nullable=False)
+    canonical_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    proposed_requirement_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_text: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_text: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_start_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    evidence_end_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scope: Mapped[str | None] = mapped_column(String, nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    semantic_key: Mapped[str] = mapped_column(String, nullable=False)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "document_version_id",
+            "semantic_key",
+            name="uq_requirement_candidate_semantic",
+        ),
+        Index("idx_requirement_candidates_scope", "system_name", "kb_name", "version"),
+        Index("idx_requirement_candidates_segment", "segment_id"),
+    )
+
+
+class DocumentCoverageModel(Base):
+    """Per-segment discovery coverage inventory."""
+
+    __tablename__ = "document_coverage"
+
+    coverage_inventory_id: Mapped[str] = mapped_column(String, primary_key=True)
+    document_version_id: Mapped[str] = mapped_column(String, nullable=False)
+    document_id: Mapped[str] = mapped_column(String, nullable=False)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    segment_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    section_title: Mapped[str | None] = mapped_column(String, nullable=True)
+    coverage_status: Mapped[str] = mapped_column(String, nullable=False)
+    requirement_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    candidate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    conflict_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    notes: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("idx_document_coverage_scope", "system_name", "kb_name", "version"),
+        Index("idx_document_coverage_segment", "segment_id"),
+    )
+
+
+class RequirementConflictModel(Base):
+    """Unresolved or resolved requirement conflicts."""
+
+    __tablename__ = "requirement_conflicts"
+
+    conflict_id: Mapped[str] = mapped_column(String, primary_key=True)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    document_version_id: Mapped[str] = mapped_column(String, nullable=False)
+    semantic_key: Mapped[str] = mapped_column(String, nullable=False)
+    requirement_pks: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    candidate_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    claims: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("idx_requirement_conflicts_scope", "system_name", "kb_name", "version"),
+        Index("idx_requirement_conflicts_status", "status"),
     )
 
 
@@ -456,6 +589,113 @@ class RetrievalMetadataModel(Base):
     document_version_id: Mapped[str] = mapped_column(String, nullable=False)
     system_name: Mapped[str] = mapped_column(String, nullable=False)
     kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+
+
+class RetrievalRunModel(Base):
+    """Retrieval execution audit row."""
+
+    __tablename__ = "retrieval_runs"
+
+    retrieval_run_id: Mapped[str] = mapped_column(String, primary_key=True)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str | None] = mapped_column(String, nullable=True)
+    query_text: Mapped[str] = mapped_column(Text, nullable=False)
+    retrieval_mode: Mapped[str] = mapped_column(String, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+
+
+class RetrievalHitModel(Base):
+    """Retrieval result hit audit row."""
+
+    __tablename__ = "retrieval_hits"
+
+    retrieval_hit_id: Mapped[str] = mapped_column(String, primary_key=True)
+    retrieval_run_id: Mapped[str] = mapped_column(String, nullable=False)
+    result_id: Mapped[str] = mapped_column(String, nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    chunk_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    requirement_pk: Mapped[str | None] = mapped_column(String, nullable=True)
+    evidence_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    lineage_key: Mapped[str] = mapped_column(String, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+
+    __table_args__ = (Index("idx_retrieval_hits_run", "retrieval_run_id", "rank"),)
+
+
+class EvidencePackModel(Base):
+    """Evidence pack passed to generation or answering."""
+
+    __tablename__ = "evidence_packs"
+
+    evidence_pack_id: Mapped[str] = mapped_column(String, primary_key=True)
+    retrieval_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str | None] = mapped_column(String, nullable=True)
+    query_text: Mapped[str] = mapped_column(Text, nullable=False)
+    requirement_pks: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    chunk_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    conflict_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ReviewEventModel(Base):
+    """Typed review event emitted by graph nodes and services."""
+
+    __tablename__ = "review_events"
+
+    review_event_id: Mapped[str] = mapped_column(String, primary_key=True)
+    workflow_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    ingestion_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    retrieval_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    severity: Mapped[str] = mapped_column(String, nullable=False)
+    system_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    kb_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    version: Mapped[str | None] = mapped_column(String, nullable=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    redacted_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("idx_review_events_ingestion", "ingestion_run_id"),
+        Index("idx_review_events_workflow", "workflow_run_id"),
+    )
+
+
+class TraceManifestModel(Base):
+    """Artifact trace manifest."""
+
+    __tablename__ = "trace_manifests"
+
+    trace_manifest_id: Mapped[str] = mapped_column(String, primary_key=True)
+    artifact_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    workflow_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    generation_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_document_version_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    requirement_pks: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    evidence_pack_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    story_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    config_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    model_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    schema_version: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict
     )

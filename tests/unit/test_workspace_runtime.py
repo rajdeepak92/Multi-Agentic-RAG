@@ -15,6 +15,7 @@ from multi_agentic_rag.runtime.config_loader import (
     apply_project_config,
     resolve_config_value,
 )
+from multi_agentic_rag.runtime.device import resolve_device
 from multi_agentic_rag.runtime.logging import configure_runtime_logging
 from multi_agentic_rag.runtime.path_resolver import resolve_ingestion_inputs
 from multi_agentic_rag.runtime.project import initialize_project_root, resolve_project_root
@@ -58,6 +59,61 @@ def test_resolve_project_root_finds_base_config_without_workspace_marker(tmp_pat
     child.mkdir(parents=True)
 
     assert resolve_project_root(cwd=child) == project_root
+
+
+def test_resolve_project_root_accepts_explicit_config_path(tmp_path) -> None:
+    project_root = initialize_project_root(tmp_path / "repo with spaces")
+
+    assert (
+        resolve_project_root(explicit_config_path=project_root / BASE_CONFIG_NAME)
+        == project_root
+    )
+
+
+def test_apply_project_config_rejects_paths_outside_project(tmp_path) -> None:
+    project_root = initialize_project_root(tmp_path / "repo")
+    config_path = project_root / BASE_CONFIG_NAME
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["paths"]["cache_dir"] = str(tmp_path / "outside")
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="outside PROJECT_ROOT"):
+        apply_project_config(project_root, environ={})
+
+
+def test_device_auto_uses_cpu_when_cuda_is_unavailable(monkeypatch) -> None:
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    monkeypatch.setattr(
+        "multi_agentic_rag.runtime.device.import_module",
+        lambda name: FakeTorch,
+    )
+
+    assert resolve_device("auto", purpose="test").resolved == "cpu"
+
+
+def test_device_cuda_fails_when_unavailable(monkeypatch) -> None:
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    monkeypatch.setattr(
+        "multi_agentic_rag.runtime.device.import_module",
+        lambda name: FakeTorch,
+    )
+
+    with pytest.raises(ConfigError, match="requested CUDA"):
+        resolve_device("cuda", purpose="test")
 
 
 def test_resolve_config_value_precedence(monkeypatch) -> None:

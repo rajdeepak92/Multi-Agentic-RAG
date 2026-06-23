@@ -1,0 +1,60 @@
+flowchart TD
+  subgraph Platform
+    root["Project root / base_config.json"]
+    env[".env secrets"]
+    pg["PostgreSQL\nledger, audit, retrieval"]
+    chroma["Chroma\nchunk + requirement vectors"]
+    neo["Neo4j\ngraph projection"]
+    root --> pg
+    root --> chroma
+    root --> neo
+    env --> pg
+    env --> neo
+  end
+
+  subgraph IngestionDiscovery["Ingestion and discovery"]
+    ingest["CLI ingest / ingest-directory"]
+    parse["Parse source"]
+    segment["Segment"]
+    chunk["Chunk"]
+    facts["Deterministic facts"]
+    discover["Requirement discovery result"]
+    validate["Validate candidates and coverage"]
+    conflicts["Conflict detection"]
+    deltas["Deltas"]
+    persist["Persist / index / project"]
+    ingest --> parse --> segment --> chunk --> facts --> discover --> validate --> conflicts --> deltas --> persist
+  end
+
+  subgraph UserStories["User-story generation"]
+    ledger["Enumerate ledger"]
+    retrieveStories["Retrieve evidence"]
+    fuseStories["Provenance-aware fusion"]
+    generate["Generate or deterministic fallback"]
+    coverage["Coverage records"]
+    trace["Artifact trace manifest"]
+    ledger --> retrieveStories --> fuseStories --> generate --> coverage --> trace
+  end
+
+  subgraph AskQuery["Ask query"]
+    ask["CLI ask"]
+    classify["Classify query"]
+    exhaustive["Enumerate all active requirements"]
+    retrieveAsk["Hybrid retrieval"]
+    answer["Grounded answer"]
+    review["Review table"]
+    ask --> classify
+    classify --> exhaustive --> answer
+    classify --> retrieveAsk --> answer --> review
+  end
+
+  persist --> pg
+  persist --> chroma
+  persist --> neo
+  pg --> ledger
+  chroma --> retrieveStories
+  neo --> retrieveStories
+  pg --> exhaustive
+  pg --> retrieveAsk
+  chroma --> retrieveAsk
+  neo --> retrieveAsk

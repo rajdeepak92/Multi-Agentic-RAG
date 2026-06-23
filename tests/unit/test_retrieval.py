@@ -360,6 +360,21 @@ def test_reranker_receives_hf_token_from_settings(monkeypatch) -> None:
 
 def test_reranker_receives_device_from_settings(monkeypatch) -> None:
     _clear_project_cache_env(monkeypatch)
+
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    def fake_import_module(name: str) -> object:
+        if name == "torch":
+            return FakeTorch()
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr("multi_agentic_rag.runtime.device.import_module", fake_import_module)
     reranker = select_reranker(
         Settings(
             postgres_dsn="postgresql+asyncpg://x",

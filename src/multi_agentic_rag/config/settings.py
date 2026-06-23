@@ -90,20 +90,20 @@ class Settings(BaseSettings):
 
     neo4j_uri: str | None = Field(default="bolt://127.0.0.1:7687")
     neo4j_username: str = Field(default="neo4j")
-    neo4j_password: str = Field(default="password")
+    neo4j_password: str | None = Field(default=None)
     neo4j_database: str | None = Field(default="neo4j")
     graphrag_required: bool = Field(default=True)
 
     chroma_path: Path = Field(default=PROJECT_CACHE_PATH_DEFAULTS["chroma_path"])
-    chroma_collection: str = Field(default="multi_agentic_rag_chunks")
+    chroma_collection: str = Field(default="multi_agentic_rag_chunks_minilm_l6_v1")
     chroma_allow_legacy_without_fingerprint: bool = Field(default=False)
 
     embedding_provider: Literal["hash", "sentence_transformers"] = Field(
         default="sentence_transformers"
     )
-    embedding_model: str = Field(default="BAAI/bge-m3")
+    embedding_model: str = Field(default="sentence-transformers/all-MiniLM-L6-v2")
     embedding_model_revision: str = Field(default="default")
-    embedding_dimensions: int = Field(default=1024)
+    embedding_dimensions: int = Field(default=384)
     embedding_device: str = Field(default="auto")
     embedding_normalize: bool = Field(default=True)
     embedding_distance_metric: str = Field(default="cosine")
@@ -157,7 +157,7 @@ class Settings(BaseSettings):
     enable_pdf_ocr: bool = Field(default=False)
     tesseract_cmd: str | None = Field(default=None)
 
-    bm25_backend: Literal["pg_textsearch", "postgres_fts"] = Field(default="pg_textsearch")
+    bm25_backend: Literal["pg_textsearch", "postgres_fts"] = Field(default="postgres_fts")
     retrieval_required_sources: tuple[str, ...] = Field(
         default=("postgres", "chroma", "neo4j")
     )
@@ -177,7 +177,7 @@ class Settings(BaseSettings):
     user_story_requirement_batch_size: int = Field(default=6)
     user_story_max_stories_per_batch: int = Field(default=8)
     user_story_coverage_required_types: tuple[str, ...] = Field(
-        default=("functional", "non_functional", "automation_rule")
+        default=("business_rule", "functional", "non_functional", "automation_rule")
     )
     user_story_allow_partial_coverage: bool = Field(default=False)
     log_level: str = Field(default="INFO")
@@ -241,7 +241,7 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             stripped = value.strip()
             if not stripped:
-                return ("functional", "non_functional", "automation_rule")
+                return ("business_rule", "functional", "non_functional", "automation_rule")
             if stripped.startswith("["):
                 import json
 

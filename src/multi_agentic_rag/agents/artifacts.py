@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 import yaml
 
 from multi_agentic_rag.config import Settings
 from multi_agentic_rag.domain import ArtifactManifest, EvidenceBundle, GeneratedUserStory
-from multi_agentic_rag.utils.hashing import stable_id
+from multi_agentic_rag.utils.hashing import stable_hash, stable_id
 
 
 class UserStoryArtifactWriter:
@@ -48,6 +49,7 @@ class UserStoryArtifactWriter:
         debug_dir.mkdir(parents=True, exist_ok=True)
         yaml_path = story_dir / f"{story_id}.yaml"
         debug_path = debug_dir / f"{story_id}.json"
+        trace_path = debug_dir / f"{story_id}.trace.json"
         story_payload = story.model_dump(mode="json")
         yaml_path.write_text(
             yaml.safe_dump(story_payload, sort_keys=False, allow_unicode=False),
@@ -86,6 +88,51 @@ class UserStoryArtifactWriter:
             json.dumps(debug_payload, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+        trace_payload = {
+            "schema_version": "trace-manifest-v1",
+            "artifact": {
+                "story_id": story.id,
+                "path": str(yaml_path),
+                "debug_json_path": str(debug_path),
+            },
+            "workflow": {
+                "run_id": self.settings.active_run_id,
+                "generation": "user_story",
+            },
+            "source": {
+                "document_version_ids": sorted(
+                    {result.document_version_id for result in evidence.ranked_results}
+                ),
+                "chunk_ids": evidence.source_chunk_ids,
+            },
+            "requirements": story.traceability.get("requirement_ids", []),
+            "evidence": {
+                "graph_paths": evidence.graph_paths,
+                "query": evidence.query,
+                "version_scope": evidence.version_scope,
+            },
+            "story": {"id": story.id},
+            "config_fingerprint": stable_hash(
+                {
+                    "schema_version": self.settings.user_story_schema_version,
+                    "retrieval_sources": self.settings.retrieval_required_sources,
+                    "embedding_model": self.settings.embedding_model,
+                    "lexical_backend": self.settings.bm25_backend,
+                }
+            ),
+            "model_fingerprint": stable_hash(
+                {
+                    "model": model,
+                    "prompt_version": prompt_version,
+                    "reasoning_provider": self.settings.reasoning_provider,
+                }
+            ),
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        trace_path.write_text(
+            json.dumps(trace_payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         return ArtifactManifest(
             artifact_id=stable_id(
                 "artifact",
@@ -98,6 +145,7 @@ class UserStoryArtifactWriter:
             story_id=story.id,
             generated_file_path=str(yaml_path),
             debug_json_path=str(debug_path),
+            trace_manifest_path=str(trace_path),
             source_chunk_ids=evidence.source_chunk_ids,
             model=model,
             prompt_version=prompt_version,

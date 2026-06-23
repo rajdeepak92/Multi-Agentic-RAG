@@ -18,12 +18,34 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """Create the primary pg_textsearch BM25 index for lexical retrieval."""
+    """Create the optional pg_textsearch BM25 index when the server supports it."""
 
-    op.execute("CREATE EXTENSION IF NOT EXISTS pg_textsearch")
     op.execute(
-        "CREATE INDEX IF NOT EXISTS idx_chunks_text_bm25 "
-        "ON chunks USING bm25 (text) WITH (text_config='english')"
+        """
+        DO $$
+        BEGIN
+            CREATE EXTENSION IF NOT EXISTS pg_textsearch;
+        EXCEPTION
+            WHEN undefined_file OR insufficient_privilege THEN
+                RAISE NOTICE 'pg_textsearch is unavailable; keeping native FTS only.';
+        END
+        $$;
+        """
+    )
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_textsearch') THEN
+                CREATE INDEX IF NOT EXISTS idx_chunks_text_bm25
+                ON chunks USING bm25 (text) WITH (text_config='english');
+            END IF;
+        EXCEPTION
+            WHEN undefined_object OR invalid_parameter_value THEN
+                RAISE NOTICE 'pg_textsearch BM25 index could not be created.';
+        END
+        $$;
+        """
     )
 
 

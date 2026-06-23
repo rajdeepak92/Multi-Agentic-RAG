@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -29,14 +30,14 @@ DEFAULT_BASE_CONFIG: dict[str, Any] = {
         "generated_dir": "generated",
     },
     "lexical": {
-        "backend": "pg_textsearch",
-        "native_fts_allowed": False,
+        "backend": "postgres_fts",
+        "native_fts_allowed": True,
     },
     "embeddings": {
         "provider": "sentence_transformers",
-        "model": "BAAI/bge-m3",
-        "device": "cuda",
-        "dimension": 1024,
+        "model": "sentence-transformers/all-MiniLM-L6-v2",
+        "device": "auto",
+        "dimension": 384,
         "normalize": True,
         "distance_metric": "cosine",
         "prompt_profile": "default",
@@ -44,15 +45,15 @@ DEFAULT_BASE_CONFIG: dict[str, Any] = {
     "reranking": {
         "provider": "none",
         "model": None,
-        "device": "cuda",
+        "device": "auto",
     },
     "reasoning": {
-        "provider": "hf",
+        "provider": "openai",
         "openai_model": "gpt-5.5",
         "openai_effort": "medium",
         "openai_store_responses": False,
         "hf_model": "Qwen/Qwen3-0.6B",
-        "hf_device": "cuda",
+        "hf_device": "auto",
         "hf_dtype": "auto",
         "hf_answer_mode": "deterministic",
         "hf_max_new_tokens": 512,
@@ -81,7 +82,7 @@ DEFAULT_BASE_CONFIG: dict[str, Any] = {
         "graphrag_required": True,
     },
     "chroma": {
-        "collection": "multi_agentic_rag_chunks",
+        "collection": "multi_agentic_rag_chunks_minilm_l6_v1",
         "allow_legacy_without_fingerprint": False,
     },
     "logging": {
@@ -125,17 +126,27 @@ def initialize_project_root(project_root: Path, *, force: bool = False) -> Path:
 def resolve_project_root(
     explicit_project_root: Path | None = None,
     *,
+    explicit_config_path: Path | None = None,
     cwd: Path | None = None,
     require: bool = True,
 ) -> Path | None:
-    """Resolve the runtime project root from an explicit path or cwd."""
+    """Resolve the runtime project root from explicit inputs, env, cwd, or install path."""
 
     root: Path | None
-    if explicit_project_root is not None:
-        root = explicit_project_root.expanduser().resolve()
+    if explicit_config_path is not None:
+        root = _config_parent(explicit_config_path)
+    elif explicit_project_root is not None:
+        root = _resolve_existing_root(explicit_project_root)
+    elif cwd is not None:
+        current = cwd.expanduser().resolve()
+        root = _find_project_root(current)
+    elif os.environ.get("PROJECT_ROOT"):
+        root = _resolve_existing_root(Path(os.environ["PROJECT_ROOT"]))
+    elif os.environ.get("BASE_CONFIG_PATH"):
+        root = _config_parent(Path(os.environ["BASE_CONFIG_PATH"]))
     else:
         current = (cwd or Path.cwd()).expanduser().resolve()
-        root = _find_project_root(current)
+        root = _find_project_root(current) or _installed_package_root()
 
     if root is None:
         if require:
@@ -145,6 +156,22 @@ def resolve_project_root(
             )
         return None
     return root
+
+
+def _resolve_existing_root(path: Path) -> Path:
+    root = path.expanduser().resolve(strict=False)
+    if root.exists() and not root.is_dir():
+        raise ConfigError(f"Project root must be a directory: {root}")
+    return root
+
+
+def _config_parent(path: Path) -> Path:
+    config_path = path.expanduser().resolve(strict=False)
+    if config_path.name != BASE_CONFIG_NAME:
+        raise ConfigError(f"Config path must point to {BASE_CONFIG_NAME}: {config_path}")
+    if config_path.exists() and not config_path.is_file():
+        raise ConfigError(f"Config path must be a file: {config_path}")
+    return config_path.parent
 
 
 def _assert_writable(path: Path) -> None:
@@ -175,6 +202,19 @@ def _find_project_root(start: Path) -> Path | None:
         if (candidate / BASE_CONFIG_NAME).exists():
             return candidate
     for candidate in candidates:
+        if (candidate / "pyproject.toml").exists() and (
+            candidate / "src" / "multi_agentic_rag"
+        ).exists():
+            return candidate
+    return None
+
+
+def _installed_package_root() -> Path | None:
+    current = Path(__file__).resolve()
+    for candidate in current.parents:
+        if (candidate / BASE_CONFIG_NAME).exists():
+            return candidate
+    for candidate in current.parents:
         if (candidate / "pyproject.toml").exists() and (
             candidate / "src" / "multi_agentic_rag"
         ).exists():

@@ -157,7 +157,20 @@ class AgentRetrieveAnswer:
         question: str,
         top_k: int | None = None,
     ) -> AgentRunResult:
-        """Run hybrid retrieval and OpenAI answer synthesis."""
+        """Delegate answer generation to the internal ask graph."""
+
+        from multi_agentic_rag.agents.ask import run_ask_graph
+
+        return await run_ask_graph(self, intent, question=question, top_k=top_k)
+
+    async def _run_direct(
+        self,
+        intent: TaskIntent,
+        *,
+        question: str,
+        top_k: int | None = None,
+    ) -> AgentRunResult:
+        """Run hybrid retrieval and answer synthesis."""
 
         if not intent.system:
             return _blocked("system is required for answer generation")

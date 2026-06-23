@@ -21,7 +21,7 @@
     "ssl_mode": "require"
   },
   "chroma": {
-    "collection": "multi_agentic_rag_chunks",
+    "collection": "multi_agentic_rag_chunks_minilm_l6_v1",
     "allow_legacy_without_fingerprint": false
   },
   "neo4j": {
@@ -50,11 +50,11 @@
     "answer_max_snippets": 8
   },
   "lexical": {
-    "backend": "pg_textsearch",
-    "native_fts_allowed": false
+    "backend": "postgres_fts",
+    "native_fts_allowed": true
   },
   "reasoning": {
-    "provider": "huggingface",
+    "provider": "openai",
     "openai_model": "gpt-5.5",
     "openai_effort": "medium",
     "openai_store_responses": false,
@@ -74,9 +74,9 @@
   },
   "embeddings": {
     "provider": "sentence_transformers",
-    "model": "BAAI/bge-m3",
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
     "revision": "default",
-    "dimension": 1024,
+    "dimension": 384,
     "device": "auto",
     "normalize": true,
     "distance_metric": "cosine",
@@ -107,6 +107,7 @@
     "requirement_batch_size": 6,
     "max_stories_per_batch": 8,
     "coverage_required_types": [
+      "business_rule",
       "functional",
       "non_functional",
       "automation_rule"

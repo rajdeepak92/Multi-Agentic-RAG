@@ -13,6 +13,7 @@ from multi_agentic_rag.infrastructure.embeddings.provider import (
     _configure_hf_token,
     _suppress_sentence_transformers_cache_warning,
 )
+from multi_agentic_rag.runtime.device import resolve_device
 
 
 class RerankingService(Protocol):
@@ -138,7 +139,7 @@ def select_reranker(settings: Settings) -> RerankingService:
         return SentenceTransformerRerankingService(
             settings.reranker_model,
             hf_token=settings.hf_token,
-            device=settings.reranker_device,
+            device=resolve_device(settings.reranker_device, purpose="reranker").resolved,
             cache_dir=settings.sentence_transformers_home,
         )
     return NoOpRerankingService()

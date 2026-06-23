@@ -17,8 +17,11 @@ from multi_agentic_rag.domain import (
     FactRecord,
     IngestResult,
     PageText,
+    RequirementDiscoveryResult,
     RequirementEvidenceRecord,
     RequirementRecord,
+    ReviewEventRecord,
+    SourceSegmentRecord,
 )
 
 
@@ -40,12 +43,14 @@ class IngestionState(TypedDict, total=False):
     document_status: DocumentStatus
     managed_source: Path
     pages: list[PageText]
+    segments: list[SourceSegmentRecord]
     chunks: list[ChunkRecord]
     old_chunks: list[ChunkRecord]
     facts: list[FactRecord]
     old_facts: list[FactRecord]
     requirements: list[RequirementRecord]
     requirement_evidence: list[RequirementEvidenceRecord]
+    requirement_discovery: RequirementDiscoveryResult
     deltas: list[DeltaRecord]
     supersedes_version_id: str | None
     manifest_path: Path
@@ -59,4 +64,5 @@ class IngestionState(TypedDict, total=False):
     ingest_result: IngestResult
     errors: list[str]
     warnings: list[str]
+    review_events: list[ReviewEventRecord]
     metadata: dict[str, Any]

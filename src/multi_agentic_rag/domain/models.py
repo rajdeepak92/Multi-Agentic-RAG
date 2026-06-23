@@ -22,6 +22,7 @@ class DocumentStatus(StrEnum):
 class RequirementType(StrEnum):
     """Canonical requirement ledger categories."""
 
+    BUSINESS_RULE = "business_rule"
     FUNCTIONAL = "functional"
     NON_FUNCTIONAL = "non_functional"
     AUTOMATION_RULE = "automation_rule"
@@ -38,6 +39,39 @@ class RequirementCoverageStatus(StrEnum):
     DEFERRED = "deferred"
     NOT_APPLICABLE = "not_applicable"
     MISSING = "missing"
+
+
+class RequirementCandidateStatus(StrEnum):
+    """Lifecycle state for a discovered requirement candidate."""
+
+    PROPOSED = "proposed"
+    VALIDATED = "validated"
+    PROMOTED = "promoted"
+    REJECTED = "rejected"
+
+
+class DocumentCoverageStatus(StrEnum):
+    """Document-level requirement discovery coverage state."""
+
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+    UNKNOWN = "unknown"
+
+
+class RequirementConflictStatus(StrEnum):
+    """Version-scoped conflict resolution status."""
+
+    UNRESOLVED = "unresolved"
+    RESOLVED = "resolved"
+    SUPERSEDED = "superseded"
+
+
+class ReviewEventSeverity(StrEnum):
+    """Operator-review event severity."""
+
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
 
 
 class IngestionRunStatus(StrEnum):
@@ -223,6 +257,196 @@ class ChunkRecord(BaseModel):
     chunk_index: int
     content_hash: str
     text: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SourceSegmentRecord(BaseModel):
+    """Logical source segment used before chunk-level retrieval indexing."""
+
+    segment_id: str
+    document_version_id: str
+    document_id: str
+    system_name: str
+    kb_name: str
+    version: str
+    status: DocumentStatus
+    source_name: str
+    page: int
+    segment_index: int
+    segment_type: str = "body"
+    section_title: str | None = None
+    start_offset: int | None = None
+    end_offset: int | None = None
+    text: str
+    chunk_ids: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RequirementCandidateRecord(BaseModel):
+    """Requirement candidate found before promotion into the canonical ledger."""
+
+    candidate_id: str
+    document_version_id: str
+    document_id: str
+    segment_id: str
+    chunk_id: str
+    system_name: str
+    kb_name: str
+    version: str
+    status: RequirementCandidateStatus = RequirementCandidateStatus.PROPOSED
+    requirement_type: RequirementType = RequirementType.FUNCTIONAL
+    canonical_id: str | None = None
+    proposed_requirement_id: str | None = None
+    text: str
+    normalized_text: str
+    evidence_text: str
+    evidence_start_offset: int | None = None
+    evidence_end_offset: int | None = None
+    scope: str | None = None
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    semantic_key: str
+    rejection_reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class RequirementDiscoveryResult(BaseModel):
+    """Single validated requirement-discovery bundle emitted by ingestion."""
+
+    discovery_id: str
+    document_version_id: str
+    document_id: str
+    system_name: str
+    kb_name: str
+    version: str
+    segments: list[SourceSegmentRecord] = Field(default_factory=list)
+    candidates: list[RequirementCandidateRecord] = Field(default_factory=list)
+    requirements: list[RequirementRecord] = Field(default_factory=list)
+    requirement_evidence: list[RequirementEvidenceRecord] = Field(default_factory=list)
+    coverage: list[DocumentCoverageRecord] = Field(default_factory=list)
+    conflicts: list[RequirementConflictRecord] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DocumentCoverageRecord(BaseModel):
+    """Document coverage inventory for requirement discovery."""
+
+    coverage_inventory_id: str
+    document_version_id: str
+    document_id: str
+    system_name: str
+    kb_name: str
+    version: str
+    segment_id: str | None = None
+    section_title: str | None = None
+    coverage_status: DocumentCoverageStatus = DocumentCoverageStatus.UNKNOWN
+    requirement_count: int = 0
+    candidate_count: int = 0
+    conflict_count: int = 0
+    notes: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class RequirementConflictRecord(BaseModel):
+    """Version-scoped conflicting requirement claims with preserved evidence."""
+
+    conflict_id: str
+    system_name: str
+    kb_name: str
+    version: str
+    document_version_id: str
+    semantic_key: str
+    requirement_pks: list[str] = Field(default_factory=list)
+    candidate_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    claims: list[str] = Field(default_factory=list)
+    status: RequirementConflictStatus = RequirementConflictStatus.UNRESOLVED
+    summary: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class RetrievalRunRecord(BaseModel):
+    """Audit row for one retrieval execution."""
+
+    retrieval_run_id: str
+    system_name: str
+    kb_name: str
+    version: str | None = None
+    query_text: str
+    retrieval_mode: str = "hybrid"
+    started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    ended_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RetrievalHitRecord(BaseModel):
+    """Audit row for one retrieval hit and its provenance grouping key."""
+
+    retrieval_hit_id: str
+    retrieval_run_id: str
+    result_id: str
+    rank: int
+    score: float
+    source: str
+    chunk_id: str | None = None
+    requirement_pk: str | None = None
+    evidence_id: str | None = None
+    lineage_key: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvidencePackRecord(BaseModel):
+    """Version-scoped evidence pack passed to generation or answering."""
+
+    evidence_pack_id: str
+    retrieval_run_id: str | None = None
+    system_name: str
+    kb_name: str
+    version: str | None = None
+    query_text: str
+    requirement_pks: list[str] = Field(default_factory=list)
+    chunk_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    conflict_ids: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class ReviewEventRecord(BaseModel):
+    """Human-readable review/audit event emitted by graph nodes and services."""
+
+    review_event_id: str
+    workflow_run_id: str | None = None
+    ingestion_run_id: str | None = None
+    retrieval_run_id: str | None = None
+    event_type: str
+    severity: ReviewEventSeverity = ReviewEventSeverity.INFO
+    system_name: str | None = None
+    kb_name: str | None = None
+    version: str | None = None
+    message: str
+    redacted_payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class TraceManifestRecord(BaseModel):
+    """Trace manifest linking artifacts to source/config/model evidence."""
+
+    trace_manifest_id: str
+    artifact_id: str | None = None
+    workflow_run_id: str | None = None
+    generation_id: str | None = None
+    source_document_version_id: str | None = None
+    requirement_pks: list[str] = Field(default_factory=list)
+    evidence_pack_id: str | None = None
+    story_ids: list[str] = Field(default_factory=list)
+    config_fingerprint: str
+    model_fingerprint: str
+    schema_version: str = "trace-manifest-v1"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -707,6 +931,7 @@ class ArtifactManifest(BaseModel):
     story_id: str | None = None
     generated_file_path: str
     debug_json_path: str
+    trace_manifest_path: str | None = None
     source_chunk_ids: list[str] = Field(default_factory=list)
     model: str
     prompt_version: str

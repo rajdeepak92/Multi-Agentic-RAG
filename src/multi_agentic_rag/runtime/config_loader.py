@@ -75,9 +75,27 @@ def load_base_config(project_root: Path) -> tuple[Path, dict[str, Any]]:
     return config_path, payload
 
 
+def load_config_file(config_path: Path) -> tuple[Path, dict[str, Any]]:
+    """Load an explicitly selected base config file."""
+
+    path = config_path.expanduser().resolve(strict=False)
+    if path.name != BASE_CONFIG_NAME:
+        raise ConfigError(f"Config path must point to {BASE_CONFIG_NAME}: {path}")
+    if not path.exists():
+        return path, {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"Invalid JSON in {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ConfigError(f"{path} must contain a JSON object.")
+    return path, payload
+
+
 def apply_project_config(
     project_root: Path,
     *,
+    config_path: Path | None = None,
     cli_overrides: dict[str, Any] | None = None,
     environ: MutableMapping[str, str] | None = None,
 ) -> RuntimeConfigResolution:
@@ -85,7 +103,14 @@ def apply_project_config(
 
     env = environ if environ is not None else os.environ
     root = project_root.expanduser().resolve()
-    config_path, config = load_base_config(root)
+    loaded_config_path, config = (
+        load_config_file(config_path) if config_path is not None else load_base_config(root)
+    )
+    if loaded_config_path.parent != root and loaded_config_path.exists():
+        raise ConfigError(
+            f"{loaded_config_path} is outside PROJECT_ROOT ({root}). "
+            "Select a config whose parent is the project root."
+        )
     applied: dict[str, str] = {}
 
     defaults = _env_defaults(root, config, env)
@@ -104,7 +129,7 @@ def apply_project_config(
 
     return RuntimeConfigResolution(
         project_root=root,
-        config_path=config_path,
+        config_path=loaded_config_path,
         config=config,
         applied_env=applied,
         cli_overrides=cli_overrides or {},
@@ -152,7 +177,21 @@ def _env_defaults(
     lexical = _dict(config.get("lexical"))
     logging = _dict(config.get("logging"))
 
-    cache_dir = project_root / str(paths.get("cache_dir", GLOBAL_CACHE_DIR_NAME))
+    cache_dir = _resolve_project_path(
+        project_root,
+        paths.get("cache_dir", GLOBAL_CACHE_DIR_NAME),
+        field_name="paths.cache_dir",
+    )
+    documents_dir = _resolve_project_path(
+        project_root,
+        paths.get("documents_dir", "documents"),
+        field_name="paths.documents_dir",
+    )
+    generated_dir = _resolve_project_path(
+        project_root,
+        paths.get("generated_dir", GENERATED_DIR_NAME),
+        field_name="paths.generated_dir",
+    )
     model_cache_dir = cache_dir / "models"
     runtime_dir = cache_dir / "runtime"
     defaults: dict[str, str | None] = {
@@ -172,9 +211,8 @@ def _env_defaults(
         "DOCUMENT_STORE_PATH": str(runtime_dir / "documents"),
         "OBJECT_STORE_PATH": str(runtime_dir / "objects"),
         "MANIFEST_STORE_PATH": str(runtime_dir / "manifests"),
-        "USER_STORY_OUTPUT_DIR": str(
-            project_root / str(paths.get("generated_dir", GENERATED_DIR_NAME))
-        ),
+        "DOCUMENTS_DIR": str(documents_dir),
+        "USER_STORY_OUTPUT_DIR": str(generated_dir),
         "NEO4J_URI": _string_or_none(neo4j.get("uri")),
         "NEO4J_USERNAME": _string_or_none(neo4j.get("username")),
         "NEO4J_DATABASE": _string_or_none(neo4j.get("database")),
@@ -322,3 +360,15 @@ def _string_or_none(value: Any) -> str | None:
     if isinstance(value, list | dict | tuple):
         return json.dumps(value)
     return str(value)
+
+
+def _resolve_project_path(project_root: Path, value: Any, *, field_name: str) -> Path:
+    raw = Path(str(value or ".")).expanduser()
+    candidate = raw if raw.is_absolute() else project_root / raw
+    resolved = candidate.resolve(strict=False)
+    if resolved != project_root and not resolved.is_relative_to(project_root):
+        raise ConfigError(
+            f"{field_name} resolves outside PROJECT_ROOT: {resolved} "
+            f"(PROJECT_ROOT={project_root})."
+        )
+    return resolved

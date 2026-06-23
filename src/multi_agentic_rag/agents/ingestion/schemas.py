@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from multi_agentic_rag.domain import IngestResult
+from multi_agentic_rag.domain import IngestResult, ReviewEventRecord
 
 
 class IngestionRequest(BaseModel):
@@ -17,6 +17,7 @@ class IngestionRequest(BaseModel):
     system: str
     version: str
     kb: str = "default"
+    review: bool = False
 
 
 class IngestionResult(BaseModel):
@@ -27,3 +28,4 @@ class IngestionResult(BaseModel):
     run_id: str | None = None
     errors: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    review_events: list[ReviewEventRecord] = Field(default_factory=list)

@@ -319,11 +319,12 @@ def _extract_explicit_requirement_records(
         if not body:
             continue
         evidence = _clean_evidence(f"{requirement_id} {body}".strip())
-        requirement_type = (
-            RequirementType.ACCEPTANCE_CRITERION
-            if requirement_id.startswith("AC-")
-            else RequirementType.FUNCTIONAL
-        )
+        if requirement_id.startswith("AC-"):
+            requirement_type = RequirementType.ACCEPTANCE_CRITERION
+        elif requirement_id.startswith("BR-"):
+            requirement_type = RequirementType.BUSINESS_RULE
+        else:
+            requirement_type = RequirementType.FUNCTIONAL
         category = _category_from_requirement_id(requirement_id)
         records.append(
             ExtractedRequirement(
@@ -338,8 +339,10 @@ def _extract_explicit_requirement_records(
                 start_offset=match.start(),
                 end_offset=min(next_start or len(text), len(text)),
                 section_title=chunk.section_title,
-                story_driving=requirement_type is RequirementType.FUNCTIONAL,
-                coverage_required=requirement_type is RequirementType.FUNCTIONAL,
+                story_driving=requirement_type
+                in {RequirementType.BUSINESS_RULE, RequirementType.FUNCTIONAL},
+                coverage_required=requirement_type
+                in {RequirementType.BUSINESS_RULE, RequirementType.FUNCTIONAL},
                 metadata={"source": "explicit_id", "match": match.group(0)},
             )
         )

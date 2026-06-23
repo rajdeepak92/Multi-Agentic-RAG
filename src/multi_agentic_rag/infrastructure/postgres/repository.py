@@ -29,20 +29,30 @@ from multi_agentic_rag.domain import (
     CanonicalFactRecord,
     ChunkRecord,
     DeltaRecord,
+    DocumentCoverageRecord,
     DocumentRecord,
     DocumentStatus,
     DocumentVersionRecord,
     EntityRecord,
+    EvidencePackRecord,
     FactRecord,
     IngestionRunRecord,
     IngestionRunStatus,
+    RequirementCandidateRecord,
+    RequirementConflictRecord,
     RequirementCoverageRecord,
     RequirementCoverageStatus,
+    RequirementDiscoveryResult,
     RequirementEvidenceRecord,
     RequirementRecord,
     RequirementType,
+    RetrievalHitRecord,
     RetrievalResult,
+    RetrievalRunRecord,
+    ReviewEventRecord,
+    SourceSegmentRecord,
     SystemRecord,
+    TraceManifestRecord,
     WorkflowRunRecord,
     WorkflowStatus,
     WorkflowStepRecord,
@@ -54,16 +64,25 @@ from multi_agentic_rag.infrastructure.postgres.models import (
     CanonicalFactModel,
     ChunkModel,
     DeltaModel,
+    DocumentCoverageModel,
     DocumentModel,
     DocumentVersionModel,
     EntityModel,
+    EvidencePackModel,
     FactModel,
     IngestionRunModel,
+    RequirementCandidateModel,
+    RequirementConflictModel,
     RequirementCoverageModel,
     RequirementEvidenceModel,
     RequirementModel,
+    RetrievalHitModel,
     RetrievalMetadataModel,
+    RetrievalRunModel,
+    ReviewEventModel,
+    SourceSegmentModel,
     SystemModel,
+    TraceManifestModel,
     WorkflowRunModel,
     WorkflowStepModel,
 )
@@ -108,7 +127,7 @@ class PostgresKnowledgeRepository:
         self,
         session_factory: Callable[[], AsyncSession],
         *,
-        bm25_backend: BM25Backend = "pg_textsearch",
+        bm25_backend: BM25Backend = "postgres_fts",
         retry_count: int = 0,
         retry_backoff_seconds: float = 0.0,
     ) -> None:
@@ -314,12 +333,21 @@ class PostgresKnowledgeRepository:
 
         counts: dict[str, int] = {}
         ordered_models = [
+            TraceManifestModel,
+            ReviewEventModel,
+            EvidencePackModel,
+            RetrievalHitModel,
+            RetrievalRunModel,
             RetrievalMetadataModel,
             ArtifactRecordModel,
             CanonicalFactModel,
             IngestionRunModel,
             DeltaModel,
             EntityModel,
+            RequirementConflictModel,
+            DocumentCoverageModel,
+            RequirementCandidateModel,
+            SourceSegmentModel,
             RequirementModel,
             FactModel,
             ChunkModel,
@@ -499,6 +527,60 @@ class PostgresKnowledgeRepository:
                 ["artifact_id"],
             )
 
+    async def record_review_event(self, record: ReviewEventRecord) -> None:
+        """Create or update one review event row."""
+
+        async with self.session_factory.begin() as session:
+            await self._upsert_one(
+                session,
+                ReviewEventModel,
+                _review_event_values(record),
+                ["review_event_id"],
+            )
+
+    async def record_retrieval_run(
+        self,
+        run: RetrievalRunRecord,
+        hits: list[RetrievalHitRecord] | None = None,
+    ) -> None:
+        """Create or update a retrieval run and its hits."""
+
+        async with self.session_factory.begin() as session:
+            await self._upsert_one(
+                session,
+                RetrievalRunModel,
+                _retrieval_run_values(run),
+                ["retrieval_run_id"],
+            )
+            await self._upsert_many(
+                session,
+                RetrievalHitModel,
+                [_retrieval_hit_values(hit) for hit in hits or []],
+                ["retrieval_hit_id"],
+            )
+
+    async def record_evidence_pack(self, record: EvidencePackRecord) -> None:
+        """Create or update one evidence pack row."""
+
+        async with self.session_factory.begin() as session:
+            await self._upsert_one(
+                session,
+                EvidencePackModel,
+                _evidence_pack_values(record),
+                ["evidence_pack_id"],
+            )
+
+    async def record_trace_manifest(self, record: TraceManifestRecord) -> None:
+        """Create or update one trace manifest row."""
+
+        async with self.session_factory.begin() as session:
+            await self._upsert_one(
+                session,
+                TraceManifestModel,
+                _trace_manifest_values(record),
+                ["trace_manifest_id"],
+            )
+
     async def get_active_document_version(
         self,
         *,
@@ -566,6 +648,44 @@ class PostgresKnowledgeRepository:
                 .order_by(ChunkModel.page.asc(), ChunkModel.chunk_index.asc())
             )
             rows = result.scalars().all()
+        return [_chunk_from_model(row) for row in rows]
+
+    async def list_chunks_for_scope(
+        self,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str,
+        active_only: bool = True,
+    ) -> list[ChunkRecord]:
+        """List chunks for one system/kb/version scope.
+
+        This is used by operational reindexing paths that need all chunks in a
+        version scope, including directory ingests that can contain multiple
+        source documents with the same version label.
+        """
+
+        filters = [
+            ChunkModel.system_name == system_name,
+            ChunkModel.kb_name == kb_name,
+            ChunkModel.version == version,
+        ]
+        if active_only:
+            filters.append(ChunkModel.status == DocumentStatus.ACTIVE.value)
+        async def load() -> list[ChunkModel]:
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(ChunkModel)
+                    .where(*filters)
+                    .order_by(
+                        ChunkModel.source_name.asc(),
+                        ChunkModel.page.asc(),
+                        ChunkModel.chunk_index.asc(),
+                    )
+                )
+                return list(result.scalars().all())
+
+        rows = await self._run_with_retry(load, operation_name="list_chunks_for_scope")
         return [_chunk_from_model(row) for row in rows]
 
     async def list_requirements_for_scope(
@@ -825,6 +945,7 @@ class PostgresKnowledgeRepository:
         facts: list[FactRecord],
         deltas: list[DeltaRecord],
         superseded_version_id: str | None,
+        requirement_discovery_result: RequirementDiscoveryResult | None = None,
     ) -> None:
         """Persist the ingestion bundle in one transaction.
 
@@ -839,10 +960,20 @@ class PostgresKnowledgeRepository:
                 if a newer valid version was ingested.
         """
 
-        requirements, requirement_evidence = extract_requirement_ledger_from_chunks(chunks)
-        if not requirements:
-            requirements = _requirements_from_facts(facts)
-            requirement_evidence = _requirement_evidence_from_requirements(requirements, chunks)
+        discovery = requirement_discovery_result or RequirementDiscoveryResult(
+            discovery_id=stable_id(
+                "requirement_discovery",
+                document_version.document_version_id,
+                "not-run",
+            ),
+            document_version_id=document_version.document_version_id,
+            document_id=document.document_id,
+            system_name=document.system_name,
+            kb_name=document.kb_name,
+            version=document_version.version,
+        )
+        requirements = list(discovery.requirements)
+        requirement_evidence = list(discovery.requirement_evidence)
         entities = _entities_from_facts(facts)
         retrieval_metadata = [
             {
@@ -882,6 +1013,12 @@ class PostgresKnowledgeRepository:
                     session, ChunkModel, [_chunk_values(chunk) for chunk in chunks], ["chunk_id"]
                 )
                 await self._upsert_many(
+                    session,
+                    SourceSegmentModel,
+                    [_source_segment_values(segment) for segment in discovery.segments],
+                    ["segment_id"],
+                )
+                await self._upsert_many(
                     session, FactModel, [_fact_values(fact) for fact in facts], ["fact_id"]
                 )
                 await self._upsert_canonical_facts(
@@ -905,6 +1042,27 @@ class PostgresKnowledgeRepository:
                     RequirementEvidenceModel,
                     [_requirement_evidence_values(item) for item in aligned_evidence],
                     ["requirement_evidence_id"],
+                )
+                await self._upsert_many(
+                    session,
+                    RequirementCandidateModel,
+                    [
+                        _requirement_candidate_values(candidate)
+                        for candidate in discovery.candidates
+                    ],
+                    ["candidate_id"],
+                )
+                await self._upsert_many(
+                    session,
+                    DocumentCoverageModel,
+                    [_document_coverage_values(item) for item in discovery.coverage],
+                    ["coverage_inventory_id"],
+                )
+                await self._upsert_many(
+                    session,
+                    RequirementConflictModel,
+                    [_requirement_conflict_values(item) for item in discovery.conflicts],
+                    ["conflict_id"],
                 )
                 await self._upsert_many(
                     session,
@@ -1229,6 +1387,13 @@ def _chunk_values(record: ChunkRecord) -> dict[str, Any]:
     return payload
 
 
+def _source_segment_values(record: SourceSegmentRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["status"] = record.status.value
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
 def _fact_values(record: FactRecord) -> dict[str, Any]:
     payload = record.model_dump(mode="python")
     payload["status"] = record.status.value
@@ -1380,6 +1545,28 @@ def _requirement_evidence_values(record: RequirementEvidenceRecord) -> dict[str,
     return payload
 
 
+def _requirement_candidate_values(record: RequirementCandidateRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["status"] = record.status.value
+    payload["requirement_type"] = record.requirement_type.value
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
+def _document_coverage_values(record: DocumentCoverageRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["coverage_status"] = record.coverage_status.value
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
+def _requirement_conflict_values(record: RequirementConflictRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["status"] = record.status.value
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
 def _requirement_coverage_values(record: RequirementCoverageRecord) -> dict[str, Any]:
     payload = record.model_dump(mode="python")
     payload["coverage_status"] = record.coverage_status.value
@@ -1420,6 +1607,36 @@ def _workflow_step_values(record: WorkflowStepRecord) -> dict[str, Any]:
 
 
 def _artifact_record_values(record: ArtifactRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
+def _retrieval_run_values(record: RetrievalRunRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
+def _retrieval_hit_values(record: RetrievalHitRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
+def _evidence_pack_values(record: EvidencePackRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
+def _review_event_values(record: ReviewEventRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["severity"] = record.severity.value
+    return payload
+
+
+def _trace_manifest_values(record: TraceManifestRecord) -> dict[str, Any]:
     payload = record.model_dump(mode="python")
     payload["metadata"] = payload.pop("metadata")
     return payload

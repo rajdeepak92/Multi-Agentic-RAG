@@ -44,6 +44,7 @@ from multi_agentic_rag.llm.structured import (
     LLMUserStoryPrompt,
     extract_json_object,
 )
+from multi_agentic_rag.runtime.device import resolve_device
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -538,23 +539,25 @@ class HuggingFaceReasoningClient:
             "trust_remote_code": True,
             "torch_dtype": self._torch_dtype(torch),
         }
-        if _uses_auto_device(self.settings) and not self._force_cpu:
+        if self._resolved_hf_device() == "cuda" and not self._force_cpu:
             kwargs["device_map"] = "auto"
         return kwargs
 
     def _target_device(self) -> str | None:
         if self._force_cpu:
             return "cpu"
-        if _uses_auto_device(self.settings):
-            return None
-        return self.settings.hf_reason_device
+        resolved = self._resolved_hf_device()
+        return None if resolved == "cuda" else resolved
 
     def _can_retry_on_cpu(self, exc: Exception) -> bool:
         return (
-            _uses_auto_device(self.settings)
+            self.settings.hf_reason_device.strip().lower() == "auto"
             and not self._force_cpu
             and _is_cuda_memory_error(exc)
         )
+
+    def _resolved_hf_device(self) -> str:
+        return resolve_device(self.settings.hf_reason_device, purpose="HF reasoning").resolved
 
     def _switch_to_cpu(self) -> None:
         self._force_cpu = True
@@ -1144,7 +1147,14 @@ def inspect_hf_reasoning_environment(
 
     loaded_settings = settings or get_settings()
     dependency_names = list(HF_BASE_DEPENDENCIES)
-    accelerate_required = _uses_auto_device(loaded_settings)
+    try:
+        resolved_device = resolve_device(
+            loaded_settings.hf_reason_device,
+            purpose="HF reasoning",
+        ).resolved
+    except ConfigError:
+        resolved_device = loaded_settings.hf_reason_device.strip().lower()
+    accelerate_required = resolved_device == "cuda"
     if accelerate_required:
         dependency_names.append(HF_AUTO_DEVICE_DEPENDENCY)
 
@@ -1308,7 +1318,7 @@ def _nvidia_smi_available() -> bool:
 
 
 def _uses_auto_device(settings: Settings) -> bool:
-    return settings.hf_reason_device.strip().lower() == "auto"
+    return resolve_device(settings.hf_reason_device, purpose="HF reasoning").resolved == "cuda"
 
 
 def _is_cuda_memory_error(exc: Exception) -> bool:

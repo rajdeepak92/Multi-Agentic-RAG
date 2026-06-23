@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from multi_agentic_rag.config import Settings
+from multi_agentic_rag.runtime.device import resolve_device
 
 
 class EmbeddingProvider(Protocol):
@@ -236,7 +237,7 @@ def select_embedding_provider(settings: Settings) -> EmbeddingProvider:
         return SentenceTransformerEmbeddingProvider(
             settings.embedding_model,
             hf_token=settings.hf_token,
-            device=settings.embedding_device,
+            device=resolve_device(settings.embedding_device, purpose="embedding").resolved,
             cache_dir=settings.sentence_transformers_home,
         )
     return HashEmbeddingProvider(

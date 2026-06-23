@@ -19,9 +19,12 @@ from multi_agentic_rag.domain import (
     IngestionRunRecord,
     IngestionRunStatus,
     IngestResult,
+    ReviewEventRecord,
+    ReviewEventSeverity,
 )
 from multi_agentic_rag.exceptions import IngestionError
-from multi_agentic_rag.extraction.rule_extractors import extract_requirement_ledger_from_chunks
+from multi_agentic_rag.extraction.requirements import discover_requirements_from_segments
+from multi_agentic_rag.extraction.segments import segments_from_chunks
 from multi_agentic_rag.utils.hashing import stable_id
 
 
@@ -211,8 +214,10 @@ class IngestionGraphRuntime:
                 document_version=state["document_version"],
                 chunks=chunks,
             )
+            segments = segments_from_chunks(chunks)
             return {
                 **state,
+                "segments": segments,
                 "chunks": chunks,
                 "manifest_path": manifest_path,
                 "stage": IngestionStage.DOCUMENT_CHUNKED,
@@ -230,14 +235,38 @@ class IngestionGraphRuntime:
                     chunks=state["chunks"],
                     facts=facts,
                 )
-            requirements, requirement_evidence = extract_requirement_ledger_from_chunks(
-                state["chunks"]
+            requirement_discovery = discover_requirements_from_segments(
+                state["segments"],
+                chunks=state["chunks"],
             )
+            review_events = list(state.get("review_events", []))
+            if state["request"].review:
+                review_events.append(
+                    _review_event(
+                        state,
+                        event_type="requirement_discovery",
+                        message=(
+                            "Requirement discovery completed with "
+                            f"{len(requirement_discovery.segments)} segment(s), "
+                            f"{len(requirement_discovery.candidates)} candidate(s), "
+                            f"{len(requirement_discovery.requirements)} requirement(s), "
+                            f"{len(requirement_discovery.conflicts)} conflict(s)."
+                        ),
+                        payload={
+                            "segments": len(requirement_discovery.segments),
+                            "candidates": len(requirement_discovery.candidates),
+                            "requirements": len(requirement_discovery.requirements),
+                            "conflicts": len(requirement_discovery.conflicts),
+                        },
+                    )
+                )
             return {
                 **state,
                 "facts": facts,
-                "requirements": requirements,
-                "requirement_evidence": requirement_evidence,
+                "requirement_discovery": requirement_discovery,
+                "requirements": requirement_discovery.requirements,
+                "requirement_evidence": requirement_discovery.requirement_evidence,
+                "review_events": review_events,
                 "stage": IngestionStage.KNOWLEDGE_EXTRACTED,
             }
         except Exception as exc:
@@ -281,20 +310,37 @@ class IngestionGraphRuntime:
 
         try:
             request = state["request"]
-            await self.legacy_agent.postgres_agent.persist(
-                system=build_system_record(request.system),
-                document=state["document"],
-                document_version=state["document_version"],
-                chunks=state["chunks"],
-                facts=state["facts"],
-                deltas=state.get("deltas", []),
-                superseded_version_id=state.get("supersedes_version_id"),
-            )
+            try:
+                await self.legacy_agent.postgres_agent.persist(
+                    system=build_system_record(request.system),
+                    document=state["document"],
+                    document_version=state["document_version"],
+                    chunks=state["chunks"],
+                    facts=state["facts"],
+                    deltas=state.get("deltas", []),
+                    superseded_version_id=state.get("supersedes_version_id"),
+                    requirement_discovery_result=state["requirement_discovery"],
+                )
+            except TypeError as exc:
+                if "requirement_discovery_result" not in str(exc):
+                    raise
+                await self.legacy_agent.postgres_agent.persist(
+                    system=build_system_record(request.system),
+                    document=state["document"],
+                    document_version=state["document_version"],
+                    chunks=state["chunks"],
+                    facts=state["facts"],
+                    deltas=state.get("deltas", []),
+                    superseded_version_id=state.get("supersedes_version_id"),
+                )
             await _mark_ingestion_stage(
                 self.legacy_agent.postgres_agent,
                 state["run_id"],
                 IngestionRunStatus.POSTGRES_COMMITTED,
             )
+            if request.review:
+                for event in state.get("review_events", []):
+                    await self.legacy_agent.postgres_agent.record_review_event(event)
             return {
                 **state,
                 "postgres_status": "succeeded",
@@ -313,6 +359,23 @@ class IngestionGraphRuntime:
                     f"Chroma indexed {indexed_count} chunks but ingestion produced "
                     f"{len(state['chunks'])}."
                 )
+            requirement_indexing_supported = hasattr(
+                self.legacy_agent.chroma_agent,
+                "index_requirements",
+            )
+            requirement_indexed_count = 0
+            if requirement_indexing_supported:
+                requirement_indexed_count = self.legacy_agent.chroma_agent.index_requirements(
+                    state.get("requirements", [])
+                )
+            if requirement_indexing_supported and requirement_indexed_count != len(
+                state.get("requirements", [])
+            ):
+                raise IngestionError(
+                    "Chroma indexed "
+                    f"{requirement_indexed_count} requirements but ingestion discovered "
+                    f"{len(state.get('requirements', []))}."
+                )
             superseded_chunks = [
                 chunk.model_copy(update={"status": DocumentStatus.SUPERSEDED})
                 for chunk in state.get("old_chunks", [])
@@ -329,6 +392,8 @@ class IngestionGraphRuntime:
                 IngestionRunStatus.CHROMA_INDEXED,
             )
             chroma_status = f"indexed:{indexed_count}"
+            if requirement_indexing_supported:
+                chroma_status = f"{chroma_status};requirements:{requirement_indexed_count}"
             if superseded_chunks:
                 chroma_status = f"{chroma_status};superseded_refreshed:{refreshed_count}"
             return {
@@ -343,15 +408,34 @@ class IngestionGraphRuntime:
         """Project the synchronized graph representation into Neo4j."""
 
         try:
-            self.legacy_agent.neo4j_agent.project(
-                document=state["document"],
-                document_version=state["document_version"],
-                chunks=state["chunks"],
-                facts=state["facts"],
-                deltas=state.get("deltas", []),
-                requirements=state.get("requirements", []),
-                requirement_evidence=state.get("requirement_evidence", []),
-            )
+            try:
+                self.legacy_agent.neo4j_agent.project(
+                    document=state["document"],
+                    document_version=state["document_version"],
+                    chunks=state["chunks"],
+                    facts=state["facts"],
+                    deltas=state.get("deltas", []),
+                    requirements=state.get("requirements", []),
+                    requirement_evidence=state.get("requirement_evidence", []),
+                    segments=state.get("segments", []),
+                    requirement_candidates=state["requirement_discovery"].candidates,
+                    requirement_conflicts=state["requirement_discovery"].conflicts,
+                )
+            except TypeError as exc:
+                if not any(
+                    name in str(exc)
+                    for name in ("segments", "requirement_candidates", "requirement_conflicts")
+                ):
+                    raise
+                self.legacy_agent.neo4j_agent.project(
+                    document=state["document"],
+                    document_version=state["document_version"],
+                    chunks=state["chunks"],
+                    facts=state["facts"],
+                    deltas=state.get("deltas", []),
+                    requirements=state.get("requirements", []),
+                    requirement_evidence=state.get("requirement_evidence", []),
+                )
             await _mark_ingestion_stage(
                 self.legacy_agent.postgres_agent,
                 state["run_id"],
@@ -406,6 +490,7 @@ class IngestionGraphRuntime:
                     ingest_result=ingest_result,
                     run_id=state["run_id"],
                     warnings=state.get("warnings", []),
+                    review_events=state.get("review_events", []),
                 ),
                 "stage": IngestionStage.COMPLETED,
             }
@@ -435,6 +520,7 @@ class IngestionGraphRuntime:
                 run_id=state.get("run_id"),
                 errors=errors or ["Ingestion failed."],
                 warnings=state.get("warnings", []),
+                review_events=state.get("review_events", []),
             ),
         }
 
@@ -498,6 +584,33 @@ def _state_error(state: IngestionState, exc: Exception) -> IngestionState:
         "errors": errors,
         "stage": IngestionStage.FAILED,
     }
+
+
+def _review_event(
+    state: IngestionState,
+    *,
+    event_type: str,
+    message: str,
+    payload: dict[str, object],
+    severity: ReviewEventSeverity = ReviewEventSeverity.INFO,
+) -> ReviewEventRecord:
+    request = state["request"]
+    return ReviewEventRecord(
+        review_event_id=stable_id(
+            "review_event",
+            state.get("run_id"),
+            event_type,
+            payload,
+        ),
+        ingestion_run_id=state.get("run_id"),
+        event_type=event_type,
+        severity=severity,
+        system_name=request.system,
+        kb_name=request.kb,
+        version=state.get("effective_version") or request.version,
+        message=message,
+        redacted_payload=dict(payload),
+    )
 
 
 async def _mark_ingestion_stage(

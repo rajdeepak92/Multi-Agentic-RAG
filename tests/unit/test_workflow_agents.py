@@ -728,17 +728,29 @@ def test_hf_reasoning_client_missing_dependencies_has_install_hint(monkeypatch) 
         asyncio.run(client.route_intent("ask"))
 
 
-def test_hf_reasoning_preflight_requires_accelerate_for_auto(monkeypatch) -> None:
+def test_hf_reasoning_auto_cpu_device_does_not_require_accelerate(monkeypatch) -> None:
+    imported_names: list[str] = []
+
+    def fake_import_module(name: str):
+        imported_names.append(name)
+        if name == "accelerate":
+            raise AssertionError("accelerate should not be imported for auto on CPU")
+        return _fake_hf_module(name)
+
     monkeypatch.setattr(
         "multi_agentic_rag.llm.hf_reasoning.import_module",
-        _fake_hf_importer(missing={"accelerate"}),
+        fake_import_module,
     )
-    client = HuggingFaceReasoningClient(
-        Settings(postgres_dsn="postgresql+asyncpg://x", hf_reason_device="auto")
-    )
+    settings = Settings(postgres_dsn="postgresql+asyncpg://x", hf_reason_device="auto")
+    client = HuggingFaceReasoningClient(settings)
 
-    with pytest.raises(ConfigError, match='device_map="auto"'):
-        client._load_model()
+    report = validate_hf_reasoning_environment(settings)
+    model_kwargs = client._model_load_kwargs(FakeHFTorchModule())
+
+    assert report.dependencies_ready is True
+    assert report.accelerate_required is False
+    assert "accelerate" not in imported_names
+    assert "device_map" not in model_kwargs
 
 
 def test_hf_reasoning_cpu_device_does_not_require_accelerate(monkeypatch) -> None:
@@ -889,7 +901,7 @@ def test_hf_check_reports_dependencies_without_loading_model(monkeypatch) -> Non
     assert "Model load skipped" in result.output
 
 
-def test_hf_check_reports_missing_accelerate_without_loading_model(monkeypatch) -> None:
+def test_hf_check_reports_auto_cpu_without_requiring_accelerate(monkeypatch) -> None:
     runner = CliRunner()
     settings = Settings(postgres_dsn="postgresql+asyncpg://x", hf_reason_device="auto")
 
@@ -905,9 +917,9 @@ def test_hf_check_reports_missing_accelerate_without_loading_model(monkeypatch) 
 
     result = runner.invoke(cli.app, ["hf-check"])
 
-    assert result.exit_code == 1
-    assert "accelerate" in result.output
-    assert 'device_map="auto"' in result.output
+    assert result.exit_code == 0
+    assert "accelerate required" in result.output
+    assert 'device_map="auto"' not in result.output
     assert "Model load skipped" in result.output
 
 

@@ -52,7 +52,7 @@ def test_hash_embedding_provider_is_deterministic() -> None:
     assert len(provider.embed_query("same")) == 8
 
 
-def test_default_embedding_provider_uses_bge_m3(monkeypatch) -> None:
+def test_default_embedding_provider_uses_minilm(monkeypatch) -> None:
     _clear_project_cache_env(monkeypatch)
     monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
     provider = select_embedding_provider(
@@ -60,7 +60,7 @@ def test_default_embedding_provider_uses_bge_m3(monkeypatch) -> None:
     )
 
     assert isinstance(provider, SentenceTransformerEmbeddingProvider)
-    assert provider.model == "BAAI/bge-m3"
+    assert provider.model == "sentence-transformers/all-MiniLM-L6-v2"
 
 
 def test_settings_accepts_legacy_postgres_bm25_alias() -> None:
@@ -175,6 +175,21 @@ def test_embedding_provider_receives_hf_token_from_settings(monkeypatch) -> None
 
 def test_embedding_provider_receives_device_from_settings(monkeypatch) -> None:
     _clear_project_cache_env(monkeypatch)
+
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    def fake_import_module(name: str) -> object:
+        if name == "torch":
+            return FakeTorch()
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr("multi_agentic_rag.runtime.device.import_module", fake_import_module)
     provider = select_embedding_provider(
         Settings(
             postgres_dsn="postgresql+asyncpg://x",
@@ -544,7 +559,8 @@ def test_postgres_readiness_requires_pg_textsearch_extension_and_index() -> None
                 _FakeScalarResult("idx"),
                 _FakeRowsResult([]),
             ]
-        )
+        ),
+        bm25_backend="pg_textsearch",
     )
 
     ready, message = asyncio.run(repository.check_connection())
@@ -555,7 +571,8 @@ def test_postgres_readiness_requires_pg_textsearch_extension_and_index() -> None
 
 def test_postgres_readiness_fails_when_pg_textsearch_extension_is_missing() -> None:
     repository = PostgresKnowledgeRepository(
-        _FakeAsyncSessionFactory([_FakeScalarResult(1), _FakeScalarResult(False)])
+        _FakeAsyncSessionFactory([_FakeScalarResult(1), _FakeScalarResult(False)]),
+        bm25_backend="pg_textsearch",
     )
 
     ready, message = asyncio.run(repository.check_connection())
@@ -565,7 +582,8 @@ def test_postgres_readiness_fails_when_pg_textsearch_extension_is_missing() -> N
 
     readiness = asyncio.run(
         PostgresKnowledgeRepository(
-            _FakeAsyncSessionFactory([_FakeScalarResult(1), _FakeScalarResult(False)])
+            _FakeAsyncSessionFactory([_FakeScalarResult(1), _FakeScalarResult(False)]),
+            bm25_backend="pg_textsearch",
         ).check_lexical_readiness()
     )
     assert readiness.connected is True
@@ -577,7 +595,8 @@ def test_postgres_readiness_fails_when_pg_textsearch_index_is_missing() -> None:
     repository = PostgresKnowledgeRepository(
         _FakeAsyncSessionFactory(
             [_FakeScalarResult(1), _FakeScalarResult(True), _FakeScalarResult(None)]
-        )
+        ),
+        bm25_backend="pg_textsearch",
     )
 
     ready, message = asyncio.run(repository.check_connection())
@@ -589,7 +608,8 @@ def test_postgres_readiness_fails_when_pg_textsearch_index_is_missing() -> None:
         PostgresKnowledgeRepository(
             _FakeAsyncSessionFactory(
                 [_FakeScalarResult(1), _FakeScalarResult(True), _FakeScalarResult(None)]
-            )
+            ),
+            bm25_backend="pg_textsearch",
         ).check_lexical_readiness()
     )
     assert readiness.connected is True
@@ -609,7 +629,7 @@ def test_postgres_readiness_uses_native_fts_fallback() -> None:
     assert "native FTS index" in message
 
 
-def test_postgres_search_chunks_uses_pg_textsearch_bm25_by_default() -> None:
+def test_postgres_search_chunks_uses_native_fts_by_default() -> None:
     chunk = ChunkModel(
         chunk_id="chunk-1",
         document_version_id="version-1",
@@ -626,7 +646,7 @@ def test_postgres_search_chunks_uses_pg_textsearch_bm25_by_default() -> None:
         text="REQ-1 temperature threshold maximum is 90 C.",
         metadata_json={},
     )
-    session_factory = _FakeAsyncSessionFactory([_FakeRowsResult([(chunk, -2.4)])])
+    session_factory = _FakeAsyncSessionFactory([_FakeRowsResult([(chunk, 0.42)])])
     repository = PostgresKnowledgeRepository(session_factory)
 
     results = asyncio.run(
@@ -639,15 +659,13 @@ def test_postgres_search_chunks_uses_pg_textsearch_bm25_by_default() -> None:
     )
 
     sql = session_factory.statements[0]
-    assert "<@>" in sql
-    assert "to_bm25query" in sql
-    assert "idx_chunks_text_bm25" in sql
-    assert "score <" in sql or "< %(param_1)" in sql
-    assert "ORDER BY score ASC" in sql
+    assert "websearch_to_tsquery" in sql
+    assert "to_tsvector" in sql
+    assert "ORDER BY score DESC" in sql
     assert session_factory.params[0] == {"query_text": "temperature threshold"}
     assert results[0].chunk_id == "chunk-1"
-    assert results[0].score == -2.4
-    assert results[0].sources == ["bm25"]
+    assert results[0].score == 0.42
+    assert results[0].sources == ["fts"]
 
 
 def test_postgres_search_chunks_uses_native_fts_fallback() -> None:

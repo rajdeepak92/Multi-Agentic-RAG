@@ -60,6 +60,7 @@ class GraphRagApplication:
         system: str,
         version: str,
         kb: str = "default",
+        review: bool = False,
     ) -> tuple[IngestionResult, UserStoryGenerationResult]:
         """Compose the two agents without introducing a third business agent."""
 
@@ -69,6 +70,7 @@ class GraphRagApplication:
                 system=system,
                 version=version,
                 kb=kb,
+                review=review,
             )
         )
         story_result = await self.user_stories(

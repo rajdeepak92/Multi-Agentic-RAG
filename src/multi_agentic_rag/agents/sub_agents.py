@@ -19,8 +19,13 @@ from multi_agentic_rag.domain import (
     IngestionRunRecord,
     IngestionRunStatus,
     PageText,
+    RequirementCandidateRecord,
+    RequirementConflictRecord,
+    RequirementDiscoveryResult,
     RequirementEvidenceRecord,
     RequirementRecord,
+    ReviewEventRecord,
+    SourceSegmentRecord,
     SystemRecord,
 )
 from multi_agentic_rag.exceptions import IngestionError
@@ -137,6 +142,7 @@ class KnowledgeRepository(Protocol):
         facts: list[FactRecord],
         deltas: list[DeltaRecord],
         superseded_version_id: str | None,
+        requirement_discovery_result: RequirementDiscoveryResult | None = None,
     ) -> None:
         """Persist an ingestion bundle.
 
@@ -148,7 +154,11 @@ class KnowledgeRepository(Protocol):
             facts: Extracted facts tied to chunks.
             deltas: Version deltas to store for newer ingests.
             superseded_version_id: Previous active version to mark superseded, if any.
+            requirement_discovery_result: Validated segment/candidate/ledger result.
         """
+
+    async def record_review_event(self, record: ReviewEventRecord) -> None:
+        """Persist one review event if review mode is enabled."""
 
 
 class VectorRepository(Protocol):
@@ -169,6 +179,16 @@ class VectorRepository(Protocol):
 
         Returns:
             Number of chunks indexed.
+        """
+
+    def index_requirements(self, requirements: list[RequirementRecord]) -> int:
+        """Index canonical requirements.
+
+        Args:
+            requirements: Requirements to embed as separate vector records.
+
+        Returns:
+            Number of requirements indexed.
         """
 
 
@@ -192,6 +212,9 @@ class GraphRepository(Protocol):
         deltas: list[DeltaRecord],
         requirements: list[RequirementRecord] | None = None,
         requirement_evidence: list[RequirementEvidenceRecord] | None = None,
+        segments: list[SourceSegmentRecord] | None = None,
+        requirement_candidates: list[RequirementCandidateRecord] | None = None,
+        requirement_conflicts: list[RequirementConflictRecord] | None = None,
     ) -> None:
         """Project graph state.
 
@@ -201,6 +224,11 @@ class GraphRepository(Protocol):
             chunks: Chunks to project as graph nodes.
             facts: Facts to project and connect to chunks/requirements/entities.
             deltas: Deltas to project between versions.
+            requirements: Canonical ledger requirements to project.
+            requirement_evidence: One-to-many evidence spans for requirements.
+            segments: Source segments to project.
+            requirement_candidates: Requirement candidates to project.
+            requirement_conflicts: Requirement conflicts to project.
         """
 
 
@@ -733,6 +761,7 @@ class PostgresPersistenceAgent:
         facts: list[FactRecord],
         deltas: list[DeltaRecord],
         superseded_version_id: str | None,
+        requirement_discovery_result: RequirementDiscoveryResult | None = None,
     ) -> None:
         """Persist an ingestion bundle.
 
@@ -744,6 +773,7 @@ class PostgresPersistenceAgent:
             facts: Extracted facts to persist.
             deltas: Version deltas to persist.
             superseded_version_id: Previous active version ID to supersede, when present.
+            requirement_discovery_result: Validated segment/candidate/ledger result.
         """
 
         await self.repository.persist_ingestion(
@@ -754,6 +784,7 @@ class PostgresPersistenceAgent:
             facts=facts,
             deltas=deltas,
             superseded_version_id=superseded_version_id,
+            requirement_discovery_result=requirement_discovery_result,
         )
 
     async def check_bm25(self) -> tuple[bool, str]:
@@ -764,6 +795,11 @@ class PostgresPersistenceAgent:
         """
 
         return await self.repository.check_connection()
+
+    async def record_review_event(self, record: ReviewEventRecord) -> None:
+        """Persist one review event."""
+
+        await self.repository.record_review_event(record)
 
 
 class ChromaIndexingAgent:
@@ -789,6 +825,14 @@ class ChromaIndexingAgent:
         """
 
         return self.repository.index_chunks(chunks)
+
+    def index_requirements(self, requirements: list[RequirementRecord]) -> int:
+        """Index canonical requirements when the repository supports it."""
+
+        indexer = getattr(self.repository, "index_requirements", None)
+        if indexer is None:
+            return 0
+        return int(indexer(requirements))
 
     def check(self) -> tuple[bool, str]:
         """Check Chroma readiness.
@@ -822,6 +866,9 @@ class Neo4jGraphAgent:
         deltas: list[DeltaRecord],
         requirements: list[RequirementRecord] | None = None,
         requirement_evidence: list[RequirementEvidenceRecord] | None = None,
+        segments: list[SourceSegmentRecord] | None = None,
+        requirement_candidates: list[RequirementCandidateRecord] | None = None,
+        requirement_conflicts: list[RequirementConflictRecord] | None = None,
     ) -> None:
         """Project graph records.
 
@@ -833,6 +880,9 @@ class Neo4jGraphAgent:
             deltas: Delta nodes and version links to project.
             requirements: Canonical ledger requirements to project.
             requirement_evidence: One-to-many evidence spans for requirements.
+            segments: Source segments to project.
+            requirement_candidates: Requirement candidates to project.
+            requirement_conflicts: Requirement conflicts to project.
         """
 
         self.repository.upsert_graph(
@@ -843,6 +893,9 @@ class Neo4jGraphAgent:
             deltas=deltas,
             requirements=requirements or [],
             requirement_evidence=requirement_evidence or [],
+            segments=segments or [],
+            requirement_candidates=requirement_candidates or [],
+            requirement_conflicts=requirement_conflicts or [],
         )
 
     def check(self) -> tuple[bool, str]:

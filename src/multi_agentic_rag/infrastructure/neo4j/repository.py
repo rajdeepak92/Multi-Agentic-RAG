@@ -18,8 +18,11 @@ from multi_agentic_rag.domain import (
     DocumentVersionRecord,
     FactRecord,
     GraphMatch,
+    RequirementCandidateRecord,
+    RequirementConflictRecord,
     RequirementEvidenceRecord,
     RequirementRecord,
+    SourceSegmentRecord,
 )
 from multi_agentic_rag.utils.hashing import stable_id
 
@@ -31,6 +34,11 @@ CONSTRAINTS = [
         "FOR (n:DocumentVersion) REQUIRE n.document_version_id IS UNIQUE"
     ),
     "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (n:Chunk) REQUIRE n.chunk_id IS UNIQUE",
+    "CREATE CONSTRAINT segment_id IF NOT EXISTS FOR (n:Segment) REQUIRE n.segment_id IS UNIQUE",
+    (
+        "CREATE CONSTRAINT candidate_id IF NOT EXISTS "
+        "FOR (n:Candidate) REQUIRE n.candidate_id IS UNIQUE"
+    ),
     "CREATE CONSTRAINT passage_id IF NOT EXISTS FOR (n:Passage) REQUIRE n.passage_id IS UNIQUE",
     "CREATE CONSTRAINT sentence_id IF NOT EXISTS FOR (n:Sentence) REQUIRE n.sentence_id IS UNIQUE",
     "CREATE CONSTRAINT fact_id IF NOT EXISTS FOR (n:Fact) REQUIRE n.fact_id IS UNIQUE",
@@ -44,6 +52,15 @@ CONSTRAINTS = [
     ),
     "CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (n:Entity) REQUIRE n.entity_id IS UNIQUE",
     "CREATE CONSTRAINT delta_id IF NOT EXISTS FOR (n:Delta) REQUIRE n.delta_id IS UNIQUE",
+    "CREATE CONSTRAINT conflict_id IF NOT EXISTS FOR (n:Conflict) REQUIRE n.conflict_id IS UNIQUE",
+    (
+        "CREATE CONSTRAINT retrieval_run_id IF NOT EXISTS "
+        "FOR (n:RetrievalRun) REQUIRE n.retrieval_run_id IS UNIQUE"
+    ),
+    (
+        "CREATE CONSTRAINT evidence_pack_id IF NOT EXISTS "
+        "FOR (n:EvidencePack) REQUIRE n.evidence_pack_id IS UNIQUE"
+    ),
     "CREATE CONSTRAINT artifact_id IF NOT EXISTS FOR (n:Artifact) REQUIRE n.artifact_id IS UNIQUE",
     "CREATE CONSTRAINT user_story_id IF NOT EXISTS FOR (n:UserStory) REQUIRE n.story_key IS UNIQUE",
 ]
@@ -180,6 +197,9 @@ class Neo4jGraphRepository:
         deltas: list[DeltaRecord],
         requirements: list[RequirementRecord] | None = None,
         requirement_evidence: list[RequirementEvidenceRecord] | None = None,
+        segments: list[SourceSegmentRecord] | None = None,
+        requirement_candidates: list[RequirementCandidateRecord] | None = None,
+        requirement_conflicts: list[RequirementConflictRecord] | None = None,
     ) -> None:
         """Project the ingestion bundle into Neo4j.
 
@@ -202,6 +222,9 @@ class Neo4jGraphRepository:
                 deltas=deltas,
                 requirements=requirements or [],
                 requirement_evidence=requirement_evidence or [],
+                segments=segments or [],
+                requirement_candidates=requirement_candidates or [],
+                requirement_conflicts=requirement_conflicts or [],
             ):
                 session.run(query, params)
 
@@ -359,6 +382,9 @@ class Neo4jGraphRepository:
         deltas: list[DeltaRecord],
         requirements: list[RequirementRecord] | None = None,
         requirement_evidence: list[RequirementEvidenceRecord] | None = None,
+        segments: list[SourceSegmentRecord] | None = None,
+        requirement_candidates: list[RequirementCandidateRecord] | None = None,
+        requirement_conflicts: list[RequirementConflictRecord] | None = None,
     ) -> list[tuple[str, dict[str, Any]]]:
         """Build idempotent Cypher statements for tests and execution.
 
@@ -485,6 +511,8 @@ class Neo4jGraphRepository:
                     },
                 )
             )
+        for segment in segments or []:
+            statements.append(_segment_statement(segment))
         for chunk in chunks:
             statements.append(
                 (
@@ -538,6 +566,10 @@ class Neo4jGraphRepository:
             statements.append(_requirement_statement(requirement))
         for evidence in requirement_evidence or []:
             statements.append(_requirement_evidence_statement(evidence))
+        for candidate in requirement_candidates or []:
+            statements.append(_candidate_statement(candidate))
+        for conflict in requirement_conflicts or []:
+            statements.append(_conflict_statement(conflict))
         for delta in deltas:
             statements.append(
                 (
@@ -1151,6 +1183,101 @@ def _chunk_projection_params(chunk: ChunkRecord) -> dict[str, Any]:
         "passage_id": stable_id("passage", chunk.chunk_id),
         "sentences": _sentence_rows(chunk),
     }
+
+
+def _segment_statement(segment: SourceSegmentRecord) -> tuple[str, dict[str, Any]]:
+    payload = {**segment.model_dump(mode="json"), "status": segment.status.value}
+    return (
+        """
+        MATCH (v:DocumentVersion {document_version_id: $document_version_id})
+        MERGE (seg:Segment {segment_id: $segment_id})
+        SET seg.document_id = $document_id,
+            seg.document_version_id = $document_version_id,
+            seg.system_name = $system_name,
+            seg.kb_name = $kb_name,
+            seg.version = $version,
+            seg.status = $status,
+            seg.source_name = $source_name,
+            seg.page = $page,
+            seg.segment_index = $segment_index,
+            seg.segment_type = $segment_type,
+            seg.section_title = $section_title,
+            seg.start_offset = $start_offset,
+            seg.end_offset = $end_offset,
+            seg.text = $text
+        MERGE (v)-[:HAS_SEGMENT]->(seg)
+        WITH seg
+        UNWIND $chunk_ids AS chunk_id
+        MATCH (c:Chunk {chunk_id: chunk_id})
+        MERGE (seg)-[:CONTAINS_CHUNK]->(c)
+        MERGE (c)-[:IN_SEGMENT]->(seg)
+        """,
+        payload,
+    )
+
+
+def _candidate_statement(candidate: RequirementCandidateRecord) -> tuple[str, dict[str, Any]]:
+    payload = {
+        **candidate.model_dump(mode="json"),
+        "status": candidate.status.value,
+        "requirement_type": candidate.requirement_type.value,
+    }
+    return (
+        """
+        OPTIONAL MATCH (seg:Segment {segment_id: $segment_id})
+        OPTIONAL MATCH (c:Chunk {chunk_id: $chunk_id})
+        OPTIONAL MATCH (r:Requirement {requirement_pk: $canonical_id})
+        MERGE (cand:Candidate {candidate_id: $candidate_id})
+        SET cand.document_id = $document_id,
+            cand.document_version_id = $document_version_id,
+            cand.segment_id = $segment_id,
+            cand.chunk_id = $chunk_id,
+            cand.system_name = $system_name,
+            cand.kb_name = $kb_name,
+            cand.version = $version,
+            cand.status = $status,
+            cand.requirement_type = $requirement_type,
+            cand.canonical_id = $canonical_id,
+            cand.proposed_requirement_id = $proposed_requirement_id,
+            cand.text = $text,
+            cand.normalized_text = $normalized_text,
+            cand.evidence_text = $evidence_text,
+            cand.scope = $scope,
+            cand.confidence = $confidence,
+            cand.semantic_key = $semantic_key,
+            cand.rejection_reason = $rejection_reason
+        FOREACH (_ IN CASE WHEN seg IS NULL THEN [] ELSE [1] END |
+            MERGE (seg)-[:HAS_CANDIDATE]->(cand)
+        )
+        FOREACH (_ IN CASE WHEN c IS NULL THEN [] ELSE [1] END |
+            MERGE (cand)-[:FROM_CHUNK]->(c)
+        )
+        """,
+        payload,
+    )
+
+
+def _conflict_statement(conflict: RequirementConflictRecord) -> tuple[str, dict[str, Any]]:
+    payload = {**conflict.model_dump(mode="json"), "status": conflict.status.value}
+    return (
+        """
+        MERGE (conflict:Conflict {conflict_id: $conflict_id})
+        SET conflict.system_name = $system_name,
+            conflict.kb_name = $kb_name,
+            conflict.version = $version,
+            conflict.document_version_id = $document_version_id,
+            conflict.semantic_key = $semantic_key,
+            conflict.claims = $claims,
+            conflict.status = $status,
+            conflict.summary = $summary
+        WITH conflict
+        UNWIND $requirement_pks AS requirement_pk
+        MATCH (r:Requirement {requirement_pk: requirement_pk})
+        MERGE (conflict)-[:INVOLVES_REQUIREMENT]->(r)
+        MERGE (r)-[:HAS_CONFLICT]->(conflict)
+        """,
+        payload,
+    )
 
 
 def _sentence_rows(chunk: ChunkRecord) -> list[dict[str, Any]]:
