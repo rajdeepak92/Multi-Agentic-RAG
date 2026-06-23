@@ -1022,16 +1022,28 @@ def run_task(
     console.print(state.final_response or "Workflow completed.")
 
 
+def _postgres_health_status(settings: Settings) -> tuple[bool, str]:
+    """Return PostgreSQL, lexical-backend, index, and schema readiness."""
+
+    repository = PostgresKnowledgeRepository.from_settings(settings)
+    readiness = asyncio.run(repository.check_lexical_readiness())
+
+    alembic_ready, alembic_detail = _alembic_revision_status(
+        settings.postgres_dsn
+    )
+
+    status = readiness.ready and alembic_ready
+    readiness_detail = readiness.detail.rstrip().rstrip(".;")
+    detail = f"{readiness_detail}; Alembic {alembic_detail}"
+
+    return status, detail
+
+
 @app.command("db-check")
 def db_check() -> None:
     """Check PostgreSQL, configured lexical backend, and migration readiness."""
 
-    settings = get_settings()
-    repository = PostgresKnowledgeRepository.from_settings(settings)
-    readiness = asyncio.run(repository.check_lexical_readiness())
-    alembic_ready, alembic_detail = _alembic_revision_status(settings.postgres_dsn)
-    status = readiness.ready and alembic_ready
-    detail = f"{readiness.detail}; Alembic {alembic_detail}"
+    status, detail = _postgres_health_status(get_settings())
     _print_check("PostgreSQL", status, detail)
 
 
@@ -1060,7 +1072,7 @@ def health_check() -> None:
     """Check PostgreSQL, Chroma, and Neo4j together."""
 
     settings = get_settings()
-    postgres = asyncio.run(PostgresKnowledgeRepository.from_settings(settings).check_connection())
+    postgres = _postgres_health_status(settings)
     chroma = ChromaVectorRepository.from_settings(settings).check_connection()
     graph_repo = Neo4jGraphRepository(settings)
     try:
@@ -1077,9 +1089,15 @@ def health_check() -> None:
         "Chroma": chroma,
         "Neo4j": graph,
     }.items():
-        table.add_row(service, "[green]PASS[/green]" if status else "[red]FAIL[/red]", detail)
+        table.add_row(
+            service,
+            "[green]PASS[/green]" if status else "[red]FAIL[/red]",
+            detail,
+        )
         failures += 0 if status else 1
+
     console.print(table)
+
     if failures:
         raise typer.Exit(code=1)
 
