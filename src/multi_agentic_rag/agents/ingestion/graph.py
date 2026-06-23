@@ -21,6 +21,7 @@ from multi_agentic_rag.domain import (
     IngestResult,
 )
 from multi_agentic_rag.exceptions import IngestionError
+from multi_agentic_rag.extraction.rule_extractors import extract_requirement_ledger_from_chunks
 from multi_agentic_rag.utils.hashing import stable_id
 
 
@@ -229,9 +230,14 @@ class IngestionGraphRuntime:
                     chunks=state["chunks"],
                     facts=facts,
                 )
+            requirements, requirement_evidence = extract_requirement_ledger_from_chunks(
+                state["chunks"]
+            )
             return {
                 **state,
                 "facts": facts,
+                "requirements": requirements,
+                "requirement_evidence": requirement_evidence,
                 "stage": IngestionStage.KNOWLEDGE_EXTRACTED,
             }
         except Exception as exc:
@@ -343,6 +349,8 @@ class IngestionGraphRuntime:
                 chunks=state["chunks"],
                 facts=state["facts"],
                 deltas=state.get("deltas", []),
+                requirements=state.get("requirements", []),
+                requirement_evidence=state.get("requirement_evidence", []),
             )
             await _mark_ingestion_stage(
                 self.legacy_agent.postgres_agent,

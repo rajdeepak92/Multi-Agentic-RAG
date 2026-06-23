@@ -186,6 +186,9 @@ class ChromaVectorRepository:
             strict=False,
         ):
             score = 1.0 / (1.0 + float(distance or 0.0))
+            result_metadata = dict(metadata)
+            result_metadata["vector_score"] = score
+            result_metadata["vector_distance"] = float(distance or 0.0)
             results.append(
                 RetrievalResult(
                     chunk_id=str(chunk_id),
@@ -199,7 +202,7 @@ class ChromaVectorRepository:
                     text=str(text),
                     score=score,
                     sources=["vector"],
-                    metadata=dict(metadata),
+                    metadata=result_metadata,
                 )
             )
         return results

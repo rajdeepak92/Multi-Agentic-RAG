@@ -114,6 +114,7 @@ def build_application(
         reranker=select_reranker(loaded_settings),
         artifact_audit_repository=postgres,
         graph_repository=graph,
+        requirement_repository=postgres,
     )
     return GraphRagApplication(
         settings=loaded_settings,

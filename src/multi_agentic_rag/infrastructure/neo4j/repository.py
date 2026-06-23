@@ -18,6 +18,8 @@ from multi_agentic_rag.domain import (
     DocumentVersionRecord,
     FactRecord,
     GraphMatch,
+    RequirementEvidenceRecord,
+    RequirementRecord,
 )
 from multi_agentic_rag.utils.hashing import stable_id
 
@@ -32,6 +34,14 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT passage_id IF NOT EXISTS FOR (n:Passage) REQUIRE n.passage_id IS UNIQUE",
     "CREATE CONSTRAINT sentence_id IF NOT EXISTS FOR (n:Sentence) REQUIRE n.sentence_id IS UNIQUE",
     "CREATE CONSTRAINT fact_id IF NOT EXISTS FOR (n:Fact) REQUIRE n.fact_id IS UNIQUE",
+    (
+        "CREATE CONSTRAINT requirement_pk IF NOT EXISTS "
+        "FOR (n:Requirement) REQUIRE n.requirement_pk IS UNIQUE"
+    ),
+    (
+        "CREATE CONSTRAINT evidence_span_id IF NOT EXISTS "
+        "FOR (n:EvidenceSpan) REQUIRE n.evidence_id IS UNIQUE"
+    ),
     "CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (n:Entity) REQUIRE n.entity_id IS UNIQUE",
     "CREATE CONSTRAINT delta_id IF NOT EXISTS FOR (n:Delta) REQUIRE n.delta_id IS UNIQUE",
     "CREATE CONSTRAINT artifact_id IF NOT EXISTS FOR (n:Artifact) REQUIRE n.artifact_id IS UNIQUE",
@@ -82,7 +92,9 @@ GRAPH_SYNONYM_GROUPS = (
     {"sensor", "instrument"},
 )
 REQUIREMENT_ID_PATTERN = re.compile(
-    r"\b(?:REQ|BRD|SRS|FR|NFR)[-_]?\d+(?:[._-]\d+)*\b",
+    r"\b(?:BR[-_\s]?[A-Z]{2,10}[-_\s]?\d+|AC[-_\s]?\d+|"
+    r"REQ[-_\s]?\d+|BRD[-_\s]?\d+|SRS[-_\s]?\d+|FRS[-_\s]?\d+|"
+    r"NFR[-_\s]?[A-Z0-9-]+|AUTO[-_\s]?[A-Z0-9-]+|DOD[-_\s]?[A-Z0-9-]+)\b",
     re.IGNORECASE,
 )
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
@@ -166,6 +178,8 @@ class Neo4jGraphRepository:
         chunks: list[ChunkRecord],
         facts: list[FactRecord],
         deltas: list[DeltaRecord],
+        requirements: list[RequirementRecord] | None = None,
+        requirement_evidence: list[RequirementEvidenceRecord] | None = None,
     ) -> None:
         """Project the ingestion bundle into Neo4j.
 
@@ -186,6 +200,8 @@ class Neo4jGraphRepository:
                 chunks=chunks,
                 facts=facts,
                 deltas=deltas,
+                requirements=requirements or [],
+                requirement_evidence=requirement_evidence or [],
             ):
                 session.run(query, params)
 
@@ -209,6 +225,23 @@ class Neo4jGraphRepository:
                 kb_name=kb_name,
                 version=version,
             ):
+                session.run(query, params)
+
+    def upsert_requirement_ledger(
+        self,
+        *,
+        requirements: list[RequirementRecord],
+        requirement_evidence: list[RequirementEvidenceRecord],
+    ) -> None:
+        """Project canonical requirement ledger rows into Neo4j."""
+
+        self.create_constraints()
+        with self.session() as session:
+            for requirement in requirements:
+                query, params = _requirement_statement(requirement)
+                session.run(query, params)
+            for evidence in requirement_evidence:
+                query, params = _requirement_evidence_statement(evidence)
                 session.run(query, params)
 
     def related_chunk_ids(
@@ -324,6 +357,8 @@ class Neo4jGraphRepository:
         chunks: list[ChunkRecord],
         facts: list[FactRecord],
         deltas: list[DeltaRecord],
+        requirements: list[RequirementRecord] | None = None,
+        requirement_evidence: list[RequirementEvidenceRecord] | None = None,
     ) -> list[tuple[str, dict[str, Any]]]:
         """Build idempotent Cypher statements for tests and execution.
 
@@ -499,6 +534,10 @@ class Neo4jGraphRepository:
             )
         for fact in facts:
             statements.extend(_fact_statements(fact))
+        for requirement in requirements or []:
+            statements.append(_requirement_statement(requirement))
+        for evidence in requirement_evidence or []:
+            statements.append(_requirement_evidence_statement(evidence))
         for delta in deltas:
             statements.append(
                 (
@@ -576,6 +615,20 @@ class Neo4jGraphRepository:
                     MERGE (us)-[:TRACES_TO_CHUNK]->(c)
                     MERGE (a)-[:TRACES_TO_CHUNK]->(c)
                 )
+                WITH us, a
+                UNWIND $covered_requirement_ids AS requirement_id
+                OPTIONAL MATCH (r:Requirement)
+                WHERE r.system_name = $system_name
+                  AND r.kb_name = $kb_name
+                  AND r.version = $version
+                  AND (
+                    r.canonical_id = requirement_id
+                    OR r.requirement_id = requirement_id
+                  )
+                FOREACH (_ IN CASE WHEN r IS NULL THEN [] ELSE [1] END |
+                    MERGE (us)-[:COVERS]->(r)
+                    MERGE (r)-[:COVERED_BY]->(us)
+                )
                 """,
                 {
                     **manifest.model_dump(mode="json"),
@@ -589,6 +642,7 @@ class Neo4jGraphRepository:
                     "priority": str(story_payload.get("priority") or ""),
                     "persona": str(story_payload.get("persona") or ""),
                     "user_story": str(story_payload.get("user_story") or ""),
+                    "covered_requirement_ids": _story_requirement_ids(story_payload),
                 },
             )
         ]
@@ -644,16 +698,34 @@ def _normalize_graph_query(query_text: str) -> dict[str, list[str]]:
     }
 
 
+def _story_requirement_ids(story_payload: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    direct = story_payload.get("covered_requirement_ids")
+    if isinstance(direct, list):
+        ids.extend(str(item) for item in direct if item)
+    traceability = story_payload.get("traceability")
+    if isinstance(traceability, dict):
+        for key in ("requirement_ids", "covered_requirement_ids", "requirements"):
+            value = traceability.get(key)
+            if isinstance(value, list):
+                ids.extend(str(item) for item in value if item)
+            elif isinstance(value, str) and value:
+                ids.append(value)
+    return sorted(set(ids))
+
+
 def _graph_match_cypher(*, has_version: bool, active_only: bool) -> str:
     version_vc = _version_filter("v", "c") if has_version else ""
     version_vce = _version_filter("v", "c", "e") if has_version else ""
     version_vcf = _version_filter("v", "c", "f") if has_version else ""
     version_vcfr = _version_filter("v", "c", "f", "r") if has_version else ""
+    version_vcr = _version_filter("v", "c", "r") if has_version else ""
     version_related = _version_filter("v", "c", "e", "ef", "r", "f") if has_version else ""
     active_vc = _active_filter("v", "c") if active_only else ""
     active_vce = _active_filter("v", "c", "e") if active_only else ""
     active_vcf = _active_filter("v", "c", "f") if active_only else ""
     active_vcfr = _active_filter("v", "c", "f", "r") if active_only else ""
+    active_vcr = _active_filter("v", "c", "r") if active_only else ""
     active_related = _active_filter("v", "c", "e", "ef", "r", "f") if active_only else ""
     return f"""
     WITH $terms AS terms, $requirement_ids AS requirement_ids
@@ -757,6 +829,52 @@ def _graph_match_cypher(*, has_version: bool, active_only: bool) -> str:
       UNION ALL
 
       WITH terms, requirement_ids
+      MATCH (v:DocumentVersion)-[:DECLARES]->(r:Requirement)-[:SUPPORTED_BY]->(c:Chunk)
+      WHERE v.system_name = $system_name
+        AND v.kb_name = $kb_name
+        AND c.system_name = $system_name
+        AND c.kb_name = $kb_name
+        AND r.system_name = $system_name
+        AND r.kb_name = $kb_name
+        {version_vcr}
+        {active_vcr}
+      WITH v, c, r, terms, requirement_ids,
+           toLower(coalesce(r.requirement_id, '')) AS requirement_id,
+           toLower(coalesce(r.canonical_id, '')) AS canonical_id,
+           toLower(
+             coalesce(r.requirement_id, '') + ' ' +
+             coalesce(r.canonical_id, '') + ' ' +
+             coalesce(r.requirement_type, '') + ' ' +
+             coalesce(r.category, '') + ' ' +
+             coalesce(r.title, '') + ' ' +
+             coalesce(r.text, '')
+           ) AS searchable
+      WITH v, c, r, requirement_id, canonical_id,
+           [term IN terms WHERE searchable CONTAINS term] AS matched_terms,
+           requirement_id IN requirement_ids OR canonical_id IN requirement_ids
+             AS matched_requirement_id
+      WHERE size(matched_terms) > 0 OR matched_requirement_id
+      RETURN c.chunk_id AS chunk_id,
+             2.45 + (0.25 * size(matched_terms)) +
+             CASE WHEN matched_requirement_id THEN 1.00 ELSE 0.00 END AS score,
+             'ledger requirement match: ' +
+             coalesce(r.canonical_id, r.requirement_id, '') AS reason,
+             [
+               'DocumentVersion:' + v.version,
+               'Requirement:' + coalesce(r.canonical_id, r.requirement_id, ''),
+               'Chunk:' + c.chunk_id
+             ] AS path,
+             matched_terms +
+             CASE
+               WHEN matched_requirement_id
+               THEN [coalesce(canonical_id, requirement_id)]
+               ELSE []
+             END
+               AS matched_terms
+
+      UNION ALL
+
+      WITH terms, requirement_ids
       MATCH (ef:Fact)-[]->(e:Entity)
       MATCH (ef)-[:TRACES_TO_REQUIREMENT|DESCRIBES_REQUIREMENT]->(r:Requirement)
             <-[:TRACES_TO_REQUIREMENT|DESCRIBES_REQUIREMENT]-(f:Fact)<-[:SUPPORTS_FACT]-(c:Chunk)
@@ -839,6 +957,88 @@ def _graph_match_from_record(record: Any) -> GraphMatch:
     )
 
 
+def _requirement_statement(requirement: RequirementRecord) -> tuple[str, dict[str, Any]]:
+    requirement_pk = requirement.requirement_pk or stable_id(
+        "requirement",
+        requirement.system_name,
+        requirement.kb_name,
+        requirement.version,
+        requirement.canonical_id or requirement.requirement_id,
+        requirement.document_version_id,
+    )
+    payload = {
+        **requirement.model_dump(mode="json"),
+        "requirement_pk": requirement_pk,
+        "canonical_id": requirement.canonical_id or requirement.requirement_id,
+        "requirement_type": requirement.requirement_type.value,
+        "status": requirement.status.value,
+    }
+    return (
+        """
+        MATCH (v:DocumentVersion {document_version_id: $document_version_id})
+        OPTIONAL MATCH (c:Chunk {chunk_id: $chunk_id})
+        MERGE (r:Requirement {requirement_pk: $requirement_pk})
+        SET r.system_name = $system_name,
+            r.kb_name = $kb_name,
+            r.version = $version,
+            r.status = $status,
+            r.document_id = $document_id,
+            r.document_version_id = $document_version_id,
+            r.chunk_id = $chunk_id,
+            r.requirement_id = $requirement_id,
+            r.canonical_id = $canonical_id,
+            r.requirement_type = $requirement_type,
+            r.category = $category,
+            r.title = $title,
+            r.text = $text,
+            r.normalized_text = $normalized_text,
+            r.story_driving = $story_driving,
+            r.coverage_required = $coverage_required,
+            r.extraction_method = $extraction_method,
+            r.confidence = $confidence,
+            r.semantic_key = $semantic_key,
+            r.source_name = $source_name,
+            r.page = $page,
+            r.section_title = $section_title
+        MERGE (v)-[:DECLARES]->(r)
+        FOREACH (_ IN CASE WHEN c IS NULL THEN [] ELSE [1] END |
+            MERGE (r)-[:SUPPORTED_BY]->(c)
+            MERGE (c)-[:SUPPORTS_REQUIREMENT]->(r)
+        )
+        """,
+        payload,
+    )
+
+
+def _requirement_evidence_statement(
+    evidence: RequirementEvidenceRecord,
+) -> tuple[str, dict[str, Any]]:
+    payload = evidence.model_dump(mode="json")
+    return (
+        """
+        MATCH (r:Requirement {requirement_pk: $requirement_pk})
+        OPTIONAL MATCH (c:Chunk {chunk_id: $chunk_id})
+        MERGE (ev:EvidenceSpan {evidence_id: $requirement_evidence_id})
+        SET ev.requirement_pk = $requirement_pk,
+            ev.chunk_id = $chunk_id,
+            ev.document_version_id = $document_version_id,
+            ev.source_name = $source_name,
+            ev.page = $page,
+            ev.section_title = $section_title,
+            ev.start_offset = $start_offset,
+            ev.end_offset = $end_offset,
+            ev.evidence_text = $evidence_text,
+            ev.extraction_method = $extraction_method,
+            ev.confidence = $confidence
+        MERGE (r)-[:HAS_EVIDENCE]->(ev)
+        FOREACH (_ IN CASE WHEN c IS NULL THEN [] ELSE [1] END |
+            MERGE (ev)-[:FROM_CHUNK]->(c)
+        )
+        """,
+        payload,
+    )
+
+
 def _fact_statements(fact: FactRecord) -> list[tuple[str, dict[str, Any]]]:
     payload = {**fact.model_dump(mode="json"), "status": fact.status.value}
     statements: list[tuple[str, dict[str, Any]]] = [
@@ -867,6 +1067,14 @@ def _fact_statements(fact: FactRecord) -> list[tuple[str, dict[str, Any]]]:
     ]
     linked_requirement_id = fact.value if fact.fact_type == "requirement" else fact.requirement_id
     if linked_requirement_id:
+        linked_requirement_pk = stable_id(
+            "requirement",
+            fact.system_name,
+            fact.kb_name,
+            fact.version,
+            linked_requirement_id,
+            fact.document_version_id,
+        )
         requirement_relationship = (
             "DESCRIBES_REQUIREMENT"
             if fact.fact_type == "requirement"
@@ -876,21 +1084,24 @@ def _fact_statements(fact: FactRecord) -> list[tuple[str, dict[str, Any]]]:
             (
                 f"""
                 MATCH (f:Fact {{fact_id: $fact_id}})
-                MERGE (r:Requirement {{
-                    system_name: $system_name,
-                    kb_name: $kb_name,
-                    requirement_id: $linked_requirement_id
-                }})
-                SET r.kb_name = $kb_name,
+                MERGE (r:Requirement {{requirement_pk: $linked_requirement_pk}})
+                SET r.system_name = $system_name,
+                    r.kb_name = $kb_name,
                     r.version = $version,
                     r.status = $status,
                     r.document_id = $document_id,
                     r.document_version_id = $document_version_id,
                     r.chunk_id = $chunk_id,
+                    r.requirement_id = $linked_requirement_id,
+                    r.canonical_id = coalesce(r.canonical_id, $linked_requirement_id),
                     r.text = $evidence
                 MERGE (f)-[:{requirement_relationship}]->(r)
                 """,
-                {**payload, "linked_requirement_id": linked_requirement_id},
+                {
+                    **payload,
+                    "linked_requirement_id": linked_requirement_id,
+                    "linked_requirement_pk": linked_requirement_pk,
+                },
             )
         )
     for entity in _entities_from_fact(fact):

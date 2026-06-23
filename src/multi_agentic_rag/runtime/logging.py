@@ -24,6 +24,18 @@ class RedactingFormatter(logging.Formatter):
         return redact_secret_text(super().format(record), secrets=self.secrets)
 
 
+class _Neo4jIdempotentSchemaNotificationFilter(logging.Filter):
+    """Hide only Neo4j's harmless IF NOT EXISTS schema notification."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not (
+            "Received notification from DBMS server" in message
+            and "gql_status='00NA0'" in message
+            and "index or constraint already exists" in message
+        )
+
+
 def configure_runtime_logging(
     *,
     level: str,
@@ -56,6 +68,9 @@ def configure_runtime_logging(
 
     for noisy_logger in ("httpx", "httpcore", "huggingface_hub", "sentence_transformers"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+    logging.getLogger("neo4j.notifications").addFilter(
+        _Neo4jIdempotentSchemaNotificationFilter()
+    )
 
     structlog.configure(
         processors=[

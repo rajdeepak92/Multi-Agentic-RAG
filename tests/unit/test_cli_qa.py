@@ -21,6 +21,9 @@ def test_root_help_hides_workspace_and_cuda_cleanup_flags() -> None:
     assert "ingest" in result.output
     assert "user-stories" in result.output
     assert "ingest-and-user-stories" in result.output
+    assert "requirements" in result.output
+    assert "requirements-audit" in result.output
+    assert "requirements-rebuild" in result.output
 
 
 def test_base_config_reasoning_provider_projects_to_environment(tmp_path) -> None:

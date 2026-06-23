@@ -19,6 +19,27 @@ class DocumentStatus(StrEnum):
     SUPERSEDED = "superseded"
 
 
+class RequirementType(StrEnum):
+    """Canonical requirement ledger categories."""
+
+    FUNCTIONAL = "functional"
+    NON_FUNCTIONAL = "non_functional"
+    AUTOMATION_RULE = "automation_rule"
+    ACCEPTANCE_CRITERION = "acceptance_criterion"
+    DEFINITION_OF_DONE = "definition_of_done"
+    SCOPE_CONSTRAINT = "scope_constraint"
+
+
+class RequirementCoverageStatus(StrEnum):
+    """Deterministic story coverage status for one ledger requirement."""
+
+    COVERED = "covered"
+    PARTIALLY_COVERED = "partially_covered"
+    DEFERRED = "deferred"
+    NOT_APPLICABLE = "not_applicable"
+    MISSING = "missing"
+
+
 class IngestionRunStatus(StrEnum):
     """Lifecycle status for ingestion runs."""
 
@@ -246,10 +267,18 @@ class FactRecord(BaseModel):
 
 
 class RequirementRecord(BaseModel):
-    """Requirement projection row.
+    """Canonical requirement ledger row.
 
     Attributes:
+        requirement_pk: Stable primary key. When absent, repositories derive it
+            from the scope and canonical ID.
+        canonical_id: Stable human-readable canonical ID. Numbered source
+            requirements usually use the normalized requirement ID.
         requirement_id: Requirement identifier extracted from source text.
+            For unnumbered requirements this is the generated canonical ID.
+        requirement_type: Canonical requirement category.
+        category: Source section or business category.
+        title: Short display title.
         document_version_id: Version ID where the requirement was found.
         document_id: Parent document lineage ID.
         chunk_id: Source chunk ID.
@@ -257,11 +286,26 @@ class RequirementRecord(BaseModel):
         kb_name: Knowledge-base context.
         version: Document version label.
         status: Active or superseded lifecycle status.
-        text: Evidence text for the requirement.
+        text: Canonical requirement text.
+        normalized_text: Normalized text used for deterministic de-duplication.
+        source_name: Original source filename.
+        page: One-based page number of the primary evidence span.
+        section_title: Source section title when available.
+        story_driving: Whether this item should normally drive a user story.
+        coverage_required: Whether story coverage is required before
+            publication.
+        extraction_method: Deterministic or semantic extraction method label.
+        confidence: Extractor confidence from 0.0 to 1.0.
+        semantic_key: Stable source-derived key used across chunk overlap.
         metadata: Extensible JSON metadata.
     """
 
+    requirement_pk: str | None = None
+    canonical_id: str | None = None
     requirement_id: str
+    requirement_type: RequirementType = RequirementType.FUNCTIONAL
+    category: str | None = None
+    title: str | None = None
     document_version_id: str
     document_id: str
     chunk_id: str
@@ -270,7 +314,55 @@ class RequirementRecord(BaseModel):
     version: str
     status: DocumentStatus
     text: str
+    normalized_text: str | None = None
+    source_name: str | None = None
+    page: int | None = None
+    section_title: str | None = None
+    story_driving: bool = True
+    coverage_required: bool = True
+    extraction_method: str = "deterministic"
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    semantic_key: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class RequirementEvidenceRecord(BaseModel):
+    """One source evidence span supporting a ledger requirement."""
+
+    requirement_evidence_id: str
+    requirement_pk: str
+    chunk_id: str
+    document_version_id: str
+    source_name: str
+    page: int
+    section_title: str | None = None
+    start_offset: int | None = None
+    end_offset: int | None = None
+    evidence_text: str
+    extraction_method: str = "deterministic"
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class RequirementCoverageRecord(BaseModel):
+    """Story coverage row for one ledger requirement."""
+
+    coverage_id: str
+    requirement_pk: str
+    canonical_id: str
+    story_id: str | None = None
+    coverage_status: RequirementCoverageStatus = RequirementCoverageStatus.MISSING
+    deferred_reason: str | None = None
+    validation_status: str = "pending"
+    source_chunk_ids: list[str] = Field(default_factory=list)
+    source_pages: list[int] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class EntityRecord(BaseModel):

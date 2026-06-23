@@ -18,9 +18,14 @@ from multi_agentic_rag.agents.user_stories.schemas import EvidenceAssessment, Re
 from multi_agentic_rag.app import GraphRagApplication
 from multi_agentic_rag.config import Settings
 from multi_agentic_rag.domain import (
+    DocumentStatus,
     GeneratedUserStory,
     IngestResult,
     QualityValidationReport,
+    RequirementCoverageRecord,
+    RequirementEvidenceRecord,
+    RequirementRecord,
+    RequirementType,
     RetrievalResult,
 )
 from multi_agentic_rag.exceptions import IngestionError
@@ -156,6 +161,125 @@ def test_retry_exhaustion_does_not_publish_invalid_yaml(tmp_path: Path) -> None:
     assert reasoner.task_names.count("user_story_generation") == 2
     assert state["artifact_paths"] == []
     assert not list((state["run_dir"] / "artifacts" / "user_stories").glob("*.yaml"))
+
+
+def test_user_story_graph_starts_from_requirement_ledger_and_writes_coverage(
+    tmp_path: Path,
+) -> None:
+    repository = FakeRequirementRepository([_requirement_record("REQ-1")])
+    runtime = _runtime(
+        tmp_path,
+        FakeStructuredReasoning(),
+        FakeRetriever([_retrieval_result("postgres")]),
+        FakeRetriever([_retrieval_result("chroma")]),
+        FakeRetriever([_retrieval_result("neo4j")]),
+        requirement_repository=repository,
+    )
+
+    state = asyncio.run(
+        UserStoryGenerationAgent(runtime).graph.ainvoke(
+            {"request": UserStoryGenerationRequest(system="PROJECT_1", version="v1")}
+        )
+    )
+
+    assert state["result"].status == "succeeded"
+    assert repository.enumerated_scopes == [("PROJECT_1", "default", "v1")]
+    assert [requirement.canonical_id for requirement in state["ledger_requirements"]] == [
+        "REQ-1"
+    ]
+    assert state["coverage_payload"]["counts"] == {"covered": 1}
+    assert repository.coverage_records[0].canonical_id == "REQ-1"
+    artifact_names = {Path(path).name for path in state["artifact_paths"]}
+    assert "requirements_inventory.json" in artifact_names
+    assert "requirements_inventory.md" in artifact_names
+    assert "requirement_story_coverage.json" in artifact_names
+    assert "requirement_story_coverage.csv" in artifact_names
+
+
+def test_user_story_graph_blocks_publication_when_required_coverage_is_missing(
+    tmp_path: Path,
+) -> None:
+    repository = FakeRequirementRepository(
+        [_requirement_record("REQ-1"), _requirement_record("REQ-2")]
+    )
+    runtime = _runtime(
+        tmp_path,
+        FakeStructuredReasoning(),
+        FakeRetriever([_retrieval_result("postgres")]),
+        FakeRetriever([_retrieval_result("chroma")]),
+        FakeRetriever([_retrieval_result("neo4j")]),
+        requirement_repository=repository,
+        structured_generation_retry_count=0,
+    )
+
+    state = asyncio.run(
+        UserStoryGenerationAgent(runtime).graph.ainvoke(
+            {"request": UserStoryGenerationRequest(system="PROJECT_1", version="v1")}
+        )
+    )
+
+    assert state["result"].status == "failed"
+    assert "REQ-2" in state["errors"][0]
+    assert state["coverage_payload"]["counts"] == {"covered": 1, "missing": 1}
+    assert state["artifact_paths"] == []
+    assert repository.coverage_records == []
+
+
+def test_user_story_graph_generates_in_configured_requirement_batches(
+    tmp_path: Path,
+) -> None:
+    reasoner = BatchAwareStructuredReasoning()
+    repository = FakeRequirementRepository(
+        [_requirement_record("REQ-1"), _requirement_record("REQ-2")]
+    )
+    runtime = _runtime(
+        tmp_path,
+        reasoner,
+        FakeRetriever([_retrieval_result("postgres")]),
+        FakeRetriever([_retrieval_result("chroma")]),
+        FakeRetriever([_retrieval_result("neo4j")]),
+        requirement_repository=repository,
+        user_story_requirement_batch_size=1,
+    )
+
+    state = asyncio.run(
+        UserStoryGenerationAgent(runtime).graph.ainvoke(
+            {"request": UserStoryGenerationRequest(system="PROJECT_1", version="v1")}
+        )
+    )
+
+    assert state["result"].status == "succeeded"
+    assert reasoner.batch_requirement_ids == [["REQ-1"], ["REQ-2"]]
+    assert reasoner.task_names.count("user_story_generation") == 2
+    assert state["coverage_payload"]["counts"] == {"covered": 2}
+
+
+def test_user_story_graph_uses_ledger_fallback_when_structured_generation_fails(
+    tmp_path: Path,
+) -> None:
+    repository = FakeRequirementRepository([_requirement_record("REQ-1")])
+    runtime = _runtime(
+        tmp_path,
+        FakeStructuredReasoning(generation_errors=[RuntimeError("bad json")]),
+        FakeRetriever([_retrieval_result("postgres")]),
+        FakeRetriever([_retrieval_result("chroma")]),
+        FakeRetriever([_retrieval_result("neo4j")]),
+        requirement_repository=repository,
+    )
+
+    state = asyncio.run(
+        UserStoryGenerationAgent(runtime).graph.ainvoke(
+            {"request": UserStoryGenerationRequest(system="PROJECT_1", version="v1")}
+        )
+    )
+
+    assert state["result"].status == "succeeded"
+    assert "bad json" in state["generation_fallback_reason"]
+    assert state["validated_stories"][0].traceability["generation_mode"] == (
+        "deterministic_ledger_fallback"
+    )
+    assert state["coverage_payload"]["counts"] == {"covered": 1}
+    assert repository.coverage_records[0].canonical_id == "REQ-1"
 
 
 def test_invalid_structured_output_writes_redacted_debug_and_no_yaml(tmp_path: Path) -> None:
@@ -315,6 +439,60 @@ class FakeStructuredReasoning:
         )
 
 
+class BatchAwareStructuredReasoning(FakeStructuredReasoning):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_requirement_ids: list[list[str]] = []
+
+    async def generate_structured(
+        self,
+        *,
+        prompt: str,
+        schema: type[Any],
+        generation_config: GenerationConfig,
+    ) -> Any:
+        if schema is not LLMGeneratedUserStoryBatch:
+            return await super().generate_structured(
+                prompt=prompt,
+                schema=schema,
+                generation_config=generation_config,
+            )
+        self.task_names.append(generation_config.task_name)
+        payload = json.loads(prompt.split("Batch generation scope:\n", 1)[1])
+        requirement_ids = payload["batch_requirement_ids"]
+        self.batch_requirement_ids.append(requirement_ids)
+        return LLMGeneratedUserStoryBatch.model_validate(
+            {
+                "stories": [
+                    {
+                        "id": f"US-{requirement_ids[0]}",
+                        "title": f"Cover {requirement_ids[0]}",
+                        "type": "functional",
+                        "domain": "industrial",
+                        "priority": "high",
+                        "status": "draft",
+                        "persona": "operator",
+                        "user_story": f"As an operator, I want {requirement_ids[0]}.",
+                        "business_value": "Grounded coverage.",
+                        "description": "Generated for one requirement batch.",
+                        "acceptance_criteria": ["Given evidence, then cover it."],
+                        "non_functional_requirements": [],
+                        "dependencies": [],
+                        "definition_of_ready": ["Evidence is indexed."],
+                        "definition_of_done": ["Traceability is present."],
+                        "traceability": {
+                            "chunk_ids": ["chunk-1"],
+                            "requirement_ids": requirement_ids,
+                            "fact_ids": ["fact-1"],
+                            "evidence_paths": [["Chunk:chunk-1"]],
+                        },
+                    }
+                ],
+                "reasoning_summary": "batch generation",
+            }
+        )
+
+
 class FakeRetriever:
     def __init__(
         self,
@@ -366,6 +544,7 @@ def _runtime(
     postgres: FakeRetriever,
     chroma: FakeRetriever,
     neo4j: FakeRetriever,
+    requirement_repository: FakeRequirementRepository | None = None,
     **settings_kwargs: Any,
 ) -> UserStoryGraphRuntime:
     settings = Settings(
@@ -382,6 +561,7 @@ def _runtime(
         chroma_retriever=chroma,
         neo4j_retriever=neo4j,
         reranker=NoOpRerankingService(),
+        requirement_repository=requirement_repository,
     )
 
 
@@ -428,4 +608,66 @@ def _ingest_result() -> IngestResult:
         bm25_status="ready",
         ingestion_run_id="run-1",
         warnings=[],
+    )
+
+
+class FakeRequirementRepository:
+    def __init__(self, requirements: list[RequirementRecord]) -> None:
+        self.requirements = requirements
+        self.enumerated_scopes: list[tuple[str, str, str]] = []
+        self.coverage_records: list[RequirementCoverageRecord] = []
+
+    async def list_requirements_for_scope(
+        self,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str,
+        **kwargs: Any,
+    ) -> list[RequirementRecord]:
+        self.enumerated_scopes.append((system_name, kb_name, version))
+        return self.requirements
+
+    async def list_requirement_evidence(
+        self,
+        **kwargs: Any,
+    ) -> list[RequirementEvidenceRecord]:
+        return [
+            RequirementEvidenceRecord(
+                requirement_evidence_id=f"ev-{requirement.canonical_id}",
+                requirement_pk=requirement.requirement_pk or "",
+                chunk_id=requirement.chunk_id,
+                document_version_id=requirement.document_version_id,
+                source_name=requirement.source_name or "source.md",
+                page=requirement.page or 1,
+                evidence_text=requirement.text,
+            )
+            for requirement in self.requirements
+        ]
+
+    async def upsert_requirement_coverage(
+        self,
+        records: list[RequirementCoverageRecord],
+    ) -> None:
+        self.coverage_records.extend(records)
+
+
+def _requirement_record(canonical_id: str) -> RequirementRecord:
+    return RequirementRecord(
+        requirement_pk=f"req-{canonical_id}",
+        canonical_id=canonical_id,
+        requirement_id=canonical_id,
+        requirement_type=RequirementType.FUNCTIONAL,
+        category="SEN",
+        title=canonical_id,
+        document_version_id="dv-1",
+        document_id="doc-1",
+        chunk_id="chunk-1",
+        system_name="PROJECT_1",
+        kb_name="default",
+        version="v1",
+        status=DocumentStatus.ACTIVE,
+        text=f"{canonical_id} temperature threshold maximum is 80 C.",
+        source_name="source.md",
+        page=1,
     )

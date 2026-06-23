@@ -20,6 +20,7 @@ from multi_agentic_rag.infrastructure.embeddings import (
 from multi_agentic_rag.infrastructure.neo4j import Neo4jGraphRepository
 from multi_agentic_rag.infrastructure.postgres import PostgresKnowledgeRepository
 from multi_agentic_rag.infrastructure.postgres.models import ChunkModel
+from multi_agentic_rag.infrastructure.postgres.repository import _is_transient_postgres_error
 from multi_agentic_rag.infrastructure.postgres.session import normalize_async_dsn
 from multi_agentic_rag.ingestion import chunk_pages, create_document_records
 from multi_agentic_rag.ingestion.parser import PageText
@@ -53,6 +54,7 @@ def test_hash_embedding_provider_is_deterministic() -> None:
 
 def test_default_embedding_provider_uses_bge_m3(monkeypatch) -> None:
     _clear_project_cache_env(monkeypatch)
+    monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
     provider = select_embedding_provider(
         Settings(postgres_dsn="postgresql+asyncpg://x", _env_file=None)
     )
@@ -73,6 +75,20 @@ def test_normalize_async_dsn_converts_tiger_sslmode_for_asyncpg() -> None:
     normalized = normalize_async_dsn(dsn)
 
     assert normalized == "postgresql+asyncpg://user:pass@example.com:39332/tsdb?ssl=require"
+
+
+def test_postgres_retry_classifier_rejects_non_retryable_failures() -> None:
+    assert _is_transient_postgres_error(RuntimeError("connection reset by peer")) is True
+    assert (
+        _is_transient_postgres_error(
+            RuntimeError("pg_textsearch extension is not available in this database")
+        )
+        is False
+    )
+    assert (
+        _is_transient_postgres_error(RuntimeError("password authentication failed for user"))
+        is False
+    )
 
 
 def test_project_cache_defaults_create_global_cache_tree(tmp_path, monkeypatch) -> None:

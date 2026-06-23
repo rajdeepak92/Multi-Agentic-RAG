@@ -148,6 +148,7 @@ def _env_defaults(
     reasoning = _dict(config.get("reasoning"))
     retrieval = _dict(config.get("retrieval"))
     ingestion = _dict(config.get("ingestion"))
+    user_stories = _dict(config.get("user_stories"))
     lexical = _dict(config.get("lexical"))
     logging = _dict(config.get("logging"))
 
@@ -232,6 +233,26 @@ def _env_defaults(
         ),
         "RETRIEVAL_ALLOW_DEGRADED": _string_or_none(
             retrieval.get("allow_degraded_retrieval")
+        ),
+        "RETRIEVAL_ANSWER_TOP_K": _string_or_none(retrieval.get("answer_top_k")),
+        "RETRIEVAL_ANSWER_MAX_EVIDENCE": _string_or_none(
+            retrieval.get("answer_max_evidence")
+        ),
+        "RETRIEVAL_ANSWER_MAX_SNIPPETS": _string_or_none(
+            retrieval.get("answer_max_snippets")
+        ),
+        "USER_STORY_SCHEMA_VERSION": _string_or_none(user_stories.get("schema_version")),
+        "USER_STORY_REQUIREMENT_BATCH_SIZE": _string_or_none(
+            user_stories.get("requirement_batch_size")
+        ),
+        "USER_STORY_MAX_STORIES_PER_BATCH": _string_or_none(
+            user_stories.get("max_stories_per_batch")
+        ),
+        "USER_STORY_COVERAGE_REQUIRED_TYPES": _string_or_none(
+            user_stories.get("coverage_required_types")
+        ),
+        "USER_STORY_ALLOW_PARTIAL_COVERAGE": _string_or_none(
+            user_stories.get("allow_partial_coverage")
         ),
         "CHUNK_SIZE": _string_or_none(ingestion.get("chunk_size")),
         "CHUNK_OVERLAP": _string_or_none(ingestion.get("chunk_overlap")),

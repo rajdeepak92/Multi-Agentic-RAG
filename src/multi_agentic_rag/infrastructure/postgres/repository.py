@@ -3,13 +3,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import asyncio
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from sqlalchemy import Select, bindparam, delete, func, literal_column, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import (
+    DBAPIError,
+    IntegrityError,
+    InterfaceError,
+    OperationalError,
+    ProgrammingError,
+)
+from sqlalchemy.exc import (
+    TimeoutError as SQLAlchemyTimeoutError,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from multi_agentic_rag.config import Settings
@@ -25,14 +36,19 @@ from multi_agentic_rag.domain import (
     FactRecord,
     IngestionRunRecord,
     IngestionRunStatus,
+    RequirementCoverageRecord,
+    RequirementCoverageStatus,
+    RequirementEvidenceRecord,
     RequirementRecord,
+    RequirementType,
     RetrievalResult,
     SystemRecord,
     WorkflowRunRecord,
     WorkflowStatus,
     WorkflowStepRecord,
 )
-from multi_agentic_rag.exceptions import ConfigError
+from multi_agentic_rag.exceptions import ConfigError, PersistenceError
+from multi_agentic_rag.extraction.rule_extractors import extract_requirement_ledger_from_chunks
 from multi_agentic_rag.infrastructure.postgres.models import (
     ArtifactRecordModel,
     CanonicalFactModel,
@@ -43,6 +59,8 @@ from multi_agentic_rag.infrastructure.postgres.models import (
     EntityModel,
     FactModel,
     IngestionRunModel,
+    RequirementCoverageModel,
+    RequirementEvidenceModel,
     RequirementModel,
     RetrievalMetadataModel,
     SystemModel,
@@ -53,6 +71,7 @@ from multi_agentic_rag.infrastructure.postgres.session import create_async_sessi
 from multi_agentic_rag.utils.hashing import stable_id
 
 BM25Backend = Literal["pg_textsearch", "postgres_fts"]
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -90,6 +109,8 @@ class PostgresKnowledgeRepository:
         session_factory: Callable[[], AsyncSession],
         *,
         bm25_backend: BM25Backend = "pg_textsearch",
+        retry_count: int = 0,
+        retry_backoff_seconds: float = 0.0,
     ) -> None:
         """Initialize the repository with an async session factory.
 
@@ -98,10 +119,14 @@ class PostgresKnowledgeRepository:
                 transaction-scoped async session context.
             bm25_backend: Lexical search backend. ``pg_textsearch`` uses the
                 BM25 extension and ``postgres_fts`` uses native PostgreSQL FTS.
+            retry_count: Number of retries for transient PostgreSQL failures.
+            retry_backoff_seconds: Base backoff between transient retries.
         """
 
         self.session_factory = session_factory
         self.bm25_backend = bm25_backend
+        self.retry_count = max(0, retry_count)
+        self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> PostgresKnowledgeRepository:
@@ -131,6 +156,8 @@ class PostgresKnowledgeRepository:
                 pool_pre_ping=settings.postgres_pool_pre_ping,
             ),
             bm25_backend=settings.bm25_backend,
+            retry_count=settings.postgres_retry_count,
+            retry_backoff_seconds=settings.postgres_retry_backoff_seconds,
         )
 
     async def check_connection(self) -> tuple[bool, str]:
@@ -138,6 +165,31 @@ class PostgresKnowledgeRepository:
 
         readiness = await self.check_lexical_readiness()
         return readiness.ready, readiness.detail
+
+    async def _run_with_retry(
+        self,
+        operation: Callable[[], Awaitable[T]],
+        *,
+        operation_name: str,
+    ) -> T:
+        """Run one PostgreSQL operation with bounded transient retries."""
+
+        attempt = 0
+        while True:
+            try:
+                return await operation()
+            except Exception as exc:
+                if attempt >= self.retry_count or not _is_transient_postgres_error(exc):
+                    if attempt > 0 and _is_transient_postgres_error(exc):
+                        raise PersistenceError(
+                            f"PostgreSQL operation {operation_name} failed after "
+                            f"{attempt + 1} attempts: {exc}"
+                        ) from exc
+                    raise
+                delay = self.retry_backoff_seconds * (2**attempt)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                attempt += 1
 
     async def check_lexical_readiness(self) -> PostgresLexicalReadiness:
         """Return detailed PostgreSQL lexical readiness for doctor output."""
@@ -291,6 +343,19 @@ class PostgresKnowledgeRepository:
                 delete(WorkflowRunModel).where(*workflow_filters)
             )
             counts[WorkflowRunModel.__tablename__] = int(result.rowcount or 0)
+            requirement_filters = _cleanup_filters(RequirementModel, system_name, kb_name)
+            requirement_pks = await session.execute(
+                select(RequirementModel.requirement_pk).where(*requirement_filters)
+            )
+            scoped_requirement_pks = list(requirement_pks.scalars().all())
+            for model in (RequirementCoverageModel, RequirementEvidenceModel):
+                if scoped_requirement_pks:
+                    result = await session.execute(
+                        delete(model).where(model.requirement_pk.in_(scoped_requirement_pks))
+                    )
+                    counts[model.__tablename__] = int(result.rowcount or 0)
+                else:
+                    counts[model.__tablename__] = 0
             for model in ordered_models:
                 result = await session.execute(
                     delete(model).where(*_cleanup_filters(model, system_name, kb_name))
@@ -503,6 +568,253 @@ class PostgresKnowledgeRepository:
             rows = result.scalars().all()
         return [_chunk_from_model(row) for row in rows]
 
+    async def list_requirements_for_scope(
+        self,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str,
+        requirement_types: set[RequirementType] | None = None,
+        active_only: bool = True,
+        coverage_required: bool | None = None,
+    ) -> list[RequirementRecord]:
+        """Enumerate the exact version-scoped requirement ledger."""
+
+        filters = [
+            RequirementModel.system_name == system_name,
+            RequirementModel.kb_name == kb_name,
+            RequirementModel.version == version,
+        ]
+        if active_only:
+            filters.append(RequirementModel.status == DocumentStatus.ACTIVE.value)
+        if coverage_required is not None:
+            filters.append(RequirementModel.coverage_required == coverage_required)
+        if requirement_types:
+            filters.append(
+                RequirementModel.requirement_type.in_(
+                    sorted(requirement_type.value for requirement_type in requirement_types)
+                )
+            )
+        async def load() -> list[RequirementModel]:
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(RequirementModel)
+                    .where(*filters)
+                    .order_by(
+                        RequirementModel.requirement_type.asc(),
+                        RequirementModel.category.asc().nulls_last(),
+                        RequirementModel.canonical_id.asc().nulls_last(),
+                        RequirementModel.page.asc().nulls_last(),
+                        RequirementModel.requirement_id.asc(),
+                    )
+                )
+                return list(result.scalars().all())
+
+        rows = await self._run_with_retry(
+            load,
+            operation_name="list_requirements_for_scope",
+        )
+        return [_requirement_from_model(row) for row in rows]
+
+    async def list_requirement_evidence(
+        self,
+        *,
+        requirement_pks: Sequence[str] | None = None,
+    ) -> list[RequirementEvidenceRecord]:
+        """List evidence spans for requirement primary keys."""
+
+        filters = []
+        if requirement_pks is not None:
+            if not requirement_pks:
+                return []
+            filters.append(RequirementEvidenceModel.requirement_pk.in_(list(requirement_pks)))
+
+        async def load() -> list[RequirementEvidenceModel]:
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(RequirementEvidenceModel)
+                    .where(*filters)
+                    .order_by(
+                        RequirementEvidenceModel.page.asc(),
+                        RequirementEvidenceModel.chunk_id.asc(),
+                        RequirementEvidenceModel.start_offset.asc().nulls_last(),
+                    )
+                )
+                return list(result.scalars().all())
+
+        rows = await self._run_with_retry(load, operation_name="list_requirement_evidence")
+        return [_requirement_evidence_from_model(row) for row in rows]
+
+    async def count_requirements_by_type(
+        self,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str,
+        active_only: bool = True,
+    ) -> dict[RequirementType, int]:
+        """Count ledger records by canonical requirement type."""
+
+        filters = [
+            RequirementModel.system_name == system_name,
+            RequirementModel.kb_name == kb_name,
+            RequirementModel.version == version,
+        ]
+        if active_only:
+            filters.append(RequirementModel.status == DocumentStatus.ACTIVE.value)
+        known_types = {item.value for item in RequirementType}
+
+        async def load() -> list[Any]:
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(RequirementModel.requirement_type, func.count())
+                    .where(*filters)
+                    .group_by(RequirementModel.requirement_type)
+                )
+                return list(result.all())
+
+        rows = await self._run_with_retry(load, operation_name="count_requirements_by_type")
+        return {
+            RequirementType(row[0]): int(row[1])
+            for row in rows
+            if row[0] in known_types
+        }
+
+    async def list_uncovered_requirements(
+        self,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str,
+    ) -> list[RequirementRecord]:
+        """Return coverage-required requirements without accepted coverage."""
+
+        covered_statuses = {
+            RequirementCoverageStatus.COVERED.value,
+            RequirementCoverageStatus.PARTIALLY_COVERED.value,
+            RequirementCoverageStatus.DEFERRED.value,
+            RequirementCoverageStatus.NOT_APPLICABLE.value,
+        }
+        coverage_subquery = (
+            select(RequirementCoverageModel.requirement_pk)
+            .where(RequirementCoverageModel.coverage_status.in_(covered_statuses))
+            .subquery()
+        )
+
+        async def load() -> list[RequirementModel]:
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(RequirementModel)
+                    .where(
+                        RequirementModel.system_name == system_name,
+                        RequirementModel.kb_name == kb_name,
+                        RequirementModel.version == version,
+                        RequirementModel.status == DocumentStatus.ACTIVE.value,
+                        RequirementModel.coverage_required.is_(True),
+                        RequirementModel.requirement_pk.not_in(
+                            select(coverage_subquery.c.requirement_pk)
+                        ),
+                    )
+                    .order_by(
+                        RequirementModel.requirement_type.asc(),
+                        RequirementModel.category.asc().nulls_last(),
+                        RequirementModel.canonical_id.asc().nulls_last(),
+                    )
+                )
+                return list(result.scalars().all())
+
+        rows = await self._run_with_retry(load, operation_name="list_uncovered_requirements")
+        return [_requirement_from_model(row) for row in rows]
+
+    async def upsert_requirement_coverage(
+        self,
+        records: list[RequirementCoverageRecord],
+    ) -> None:
+        """Replace and persist deterministic requirement-to-story coverage rows."""
+
+        if not records:
+            return
+
+        async def persist() -> None:
+            async with self.session_factory.begin() as session:
+                requirement_pks = sorted({record.requirement_pk for record in records})
+                await session.execute(
+                    delete(RequirementCoverageModel).where(
+                        RequirementCoverageModel.requirement_pk.in_(requirement_pks)
+                    )
+                )
+                await self._upsert_many(
+                    session,
+                    RequirementCoverageModel,
+                    [_requirement_coverage_values(record) for record in records],
+                    ["coverage_id"],
+                )
+
+        await self._run_with_retry(persist, operation_name="upsert_requirement_coverage")
+
+    async def rebuild_requirement_ledger_for_scope(
+        self,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str,
+        active_only: bool = True,
+    ) -> tuple[int, int]:
+        """Rebuild requirement ledger rows from already stored chunks."""
+
+        filters = [
+            ChunkModel.system_name == system_name,
+            ChunkModel.kb_name == kb_name,
+            ChunkModel.version == version,
+        ]
+        if active_only:
+            filters.append(ChunkModel.status == DocumentStatus.ACTIVE.value)
+
+        async def load_chunks() -> list[ChunkModel]:
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(ChunkModel)
+                    .where(*filters)
+                    .order_by(ChunkModel.page.asc(), ChunkModel.chunk_index.asc())
+                )
+                return list(result.scalars().all())
+
+        chunk_rows = await self._run_with_retry(
+            load_chunks,
+            operation_name="rebuild_requirement_ledger_for_scope.load_chunks",
+        )
+        chunks = [_chunk_from_model(row) for row in chunk_rows]
+        requirements, evidence = extract_requirement_ledger_from_chunks(chunks)
+
+        async def persist() -> None:
+            async with self.session_factory.begin() as session:
+                aligned_requirements, aligned_evidence = await _align_existing_requirement_keys(
+                    session,
+                    requirements,
+                    evidence,
+                )
+                await self._upsert_many(
+                    session,
+                    RequirementModel,
+                    [_requirement_values(requirement) for requirement in aligned_requirements],
+                    ["requirement_pk"],
+                )
+                await _delete_requirement_evidence_for_requirements(session, aligned_requirements)
+                await self._upsert_many(
+                    session,
+                    RequirementEvidenceModel,
+                    [_requirement_evidence_values(item) for item in aligned_evidence],
+                    ["requirement_evidence_id"],
+                )
+                requirements[:] = aligned_requirements
+                evidence[:] = aligned_evidence
+
+        await self._run_with_retry(
+            persist,
+            operation_name="rebuild_requirement_ledger_for_scope.persist",
+        )
+        return len(requirements), len(evidence)
+
     async def persist_ingestion(
         self,
         *,
@@ -527,7 +839,10 @@ class PostgresKnowledgeRepository:
                 if a newer valid version was ingested.
         """
 
-        requirements = _requirements_from_facts(facts)
+        requirements, requirement_evidence = extract_requirement_ledger_from_chunks(chunks)
+        if not requirements:
+            requirements = _requirements_from_facts(facts)
+            requirement_evidence = _requirement_evidence_from_requirements(requirements, chunks)
         entities = _entities_from_facts(facts)
         retrieval_metadata = [
             {
@@ -544,51 +859,67 @@ class PostgresKnowledgeRepository:
             }
             for chunk in chunks
         ]
-        async with self.session_factory.begin() as session:
-            await self._upsert_one(session, SystemModel, _system_values(system), ["system_id"])
-            await self._upsert_one(
-                session, DocumentModel, _document_values(document), ["document_id"]
-            )
-            if superseded_version_id:
-                await self._mark_version_superseded(
-                    session,
-                    superseded_version_id=superseded_version_id,
-                    superseded_by_version_id=document_version.document_version_id,
+
+        async def persist() -> None:
+            async with self.session_factory.begin() as session:
+                await self._upsert_one(session, SystemModel, _system_values(system), ["system_id"])
+                await self._upsert_one(
+                    session, DocumentModel, _document_values(document), ["document_id"]
                 )
-            await self._upsert_one(
-                session,
-                DocumentVersionModel,
-                _document_version_values(document_version),
-                ["document_version_id"],
-            )
-            await self._upsert_many(
-                session, ChunkModel, [_chunk_values(chunk) for chunk in chunks], ["chunk_id"]
-            )
-            await self._upsert_many(
-                session, FactModel, [_fact_values(fact) for fact in facts], ["fact_id"]
-            )
-            await self._upsert_canonical_facts(
-                session,
-                _canonical_facts_from_facts(facts),
-            )
-            await self._upsert_many(
-                session,
-                RequirementModel,
-                [_requirement_values(requirement) for requirement in requirements],
-                ["requirement_pk"],
-            )
-            await self._upsert_many(
-                session,
-                EntityModel,
-                [_entity_values(entity) for entity in entities],
-                ["entity_id"],
-            )
-            await self._upsert_many(
-                session, DeltaModel, [_delta_values(delta) for delta in deltas], ["delta_id"]
-            )
-            await self._upsert_many(
-                session, RetrievalMetadataModel, retrieval_metadata, ["retrieval_metadata_id"]
-            )
+                if superseded_version_id:
+                    await self._mark_version_superseded(
+                        session,
+                        superseded_version_id=superseded_version_id,
+                        superseded_by_version_id=document_version.document_version_id,
+                    )
+                await self._upsert_one(
+                    session,
+                    DocumentVersionModel,
+                    _document_version_values(document_version),
+                    ["document_version_id"],
+                )
+                await self._upsert_many(
+                    session, ChunkModel, [_chunk_values(chunk) for chunk in chunks], ["chunk_id"]
+                )
+                await self._upsert_many(
+                    session, FactModel, [_fact_values(fact) for fact in facts], ["fact_id"]
+                )
+                await self._upsert_canonical_facts(
+                    session,
+                    _canonical_facts_from_facts(facts),
+                )
+                aligned_requirements, aligned_evidence = await _align_existing_requirement_keys(
+                    session,
+                    requirements,
+                    requirement_evidence,
+                )
+                await self._upsert_many(
+                    session,
+                    RequirementModel,
+                    [_requirement_values(requirement) for requirement in aligned_requirements],
+                    ["requirement_pk"],
+                )
+                await _delete_requirement_evidence_for_requirements(session, aligned_requirements)
+                await self._upsert_many(
+                    session,
+                    RequirementEvidenceModel,
+                    [_requirement_evidence_values(item) for item in aligned_evidence],
+                    ["requirement_evidence_id"],
+                )
+                await self._upsert_many(
+                    session,
+                    EntityModel,
+                    [_entity_values(entity) for entity in entities],
+                    ["entity_id"],
+                )
+                await self._upsert_many(
+                    session, DeltaModel, [_delta_values(delta) for delta in deltas], ["delta_id"]
+                )
+                await self._upsert_many(
+                    session, RetrievalMetadataModel, retrieval_metadata, ["retrieval_metadata_id"]
+                )
+
+        await self._run_with_retry(persist, operation_name="persist_ingestion")
 
     async def search_chunks(
         self,
@@ -664,9 +995,12 @@ class PostgresKnowledgeRepository:
             .order_by(score.asc(), ChunkModel.page.asc(), ChunkModel.chunk_index.asc())
             .limit(top_k)
         )
-        async with self.session_factory() as session:
-            result = await session.execute(stmt, {"query_text": query_text})
-            rows = result.all()
+        async def search() -> list[Any]:
+            async with self.session_factory() as session:
+                result = await session.execute(stmt, {"query_text": query_text})
+                return list(result.all())
+
+        rows = await self._run_with_retry(search, operation_name="search_chunks_pg_textsearch")
         return [
             _retrieval_result_from_chunk_model(
                 chunk,
@@ -707,9 +1041,12 @@ class PostgresKnowledgeRepository:
             .order_by(rank.desc(), ChunkModel.page.asc(), ChunkModel.chunk_index.asc())
             .limit(top_k)
         )
-        async with self.session_factory() as session:
-            result = await session.execute(stmt, {"query_text": query_text})
-            rows = result.all()
+        async def search() -> list[Any]:
+            async with self.session_factory() as session:
+                result = await session.execute(stmt, {"query_text": query_text})
+                return list(result.all())
+
+        rows = await self._run_with_retry(search, operation_name="search_chunks_postgres_fts")
         return [
             _retrieval_result_from_chunk_model(chunk, score=float(score or 0.0), source="fts")
             for chunk, score in rows
@@ -776,9 +1113,12 @@ class PostgresKnowledgeRepository:
         filters = [ChunkModel.chunk_id.in_(chunk_ids)]
         if active_only:
             filters.append(ChunkModel.status == DocumentStatus.ACTIVE.value)
-        async with self.session_factory() as session:
-            result = await session.execute(select(ChunkModel).where(*filters))
-            chunks = result.scalars().all()
+        async def load() -> list[ChunkModel]:
+            async with self.session_factory() as session:
+                result = await session.execute(select(ChunkModel).where(*filters))
+                return list(result.scalars().all())
+
+        chunks = await self._run_with_retry(load, operation_name="list_chunks_by_ids")
         by_id = {chunk.chunk_id: chunk for chunk in chunks}
         return [
             _retrieval_result_from_chunk_model(by_id[chunk_id], score=1.0, source="graph")
@@ -832,7 +1172,7 @@ class PostgresKnowledgeRepository:
         update_values = {
             column.name: getattr(stmt.excluded, column.name)
             for column in table.columns
-            if column.name not in set(conflict_columns)
+            if column.name not in set(conflict_columns) and column.name != "created_at"
         }
         stmt = stmt.on_conflict_do_update(index_elements=conflict_columns, set_=update_values)
         await session.execute(stmt)
@@ -898,14 +1238,151 @@ def _fact_values(record: FactRecord) -> dict[str, Any]:
 
 def _requirement_values(record: RequirementRecord) -> dict[str, Any]:
     payload = record.model_dump(mode="python")
-    payload["requirement_pk"] = stable_id(
+    canonical_id = record.canonical_id or record.requirement_id
+    payload["requirement_pk"] = record.requirement_pk or stable_id(
         "requirement",
         record.system_name,
         record.kb_name,
-        record.requirement_id,
+        record.version,
+        canonical_id,
         record.document_version_id,
     )
+    payload["canonical_id"] = canonical_id
+    payload["requirement_type"] = record.requirement_type.value
     payload["status"] = record.status.value
+    payload["normalized_text"] = record.normalized_text or _normalize_text(record.text)
+    payload["semantic_key"] = record.semantic_key or stable_id(
+        "requirement_semantic_key",
+        record.system_name,
+        record.kb_name,
+        record.version,
+        record.requirement_type.value,
+        canonical_id,
+        payload["normalized_text"],
+    )
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
+async def _align_existing_requirement_keys(
+    session: AsyncSession,
+    requirements: list[RequirementRecord],
+    evidence: list[RequirementEvidenceRecord],
+) -> tuple[list[RequirementRecord], list[RequirementEvidenceRecord]]:
+    if not requirements:
+        return requirements, evidence
+    keys = [
+        (
+            requirement.system_name,
+            requirement.kb_name,
+            requirement.requirement_id,
+            requirement.document_version_id,
+        )
+        for requirement in requirements
+    ]
+    existing_result = await session.execute(
+        select(RequirementModel).where(
+            or_(
+                *[
+                    (
+                        (RequirementModel.system_name == system_name)
+                        & (RequirementModel.kb_name == kb_name)
+                        & (RequirementModel.requirement_id == requirement_id)
+                        & (RequirementModel.document_version_id == document_version_id)
+                    )
+                    for system_name, kb_name, requirement_id, document_version_id in keys
+                ]
+            )
+        )
+    )
+    existing_by_key = {
+        (
+            row.system_name,
+            row.kb_name,
+            row.requirement_id,
+            row.document_version_id,
+        ): row.requirement_pk
+        for row in existing_result.scalars().all()
+    }
+    pk_replacements: dict[str, str] = {}
+    pk_by_unique_key: dict[tuple[str, str, str, str], str] = {}
+    aligned_requirements: list[RequirementRecord] = []
+    for requirement in requirements:
+        unique_key = (
+            requirement.system_name,
+            requirement.kb_name,
+            requirement.requirement_id,
+            requirement.document_version_id,
+        )
+        old_pk = requirement.requirement_pk or stable_id(
+            "requirement",
+            requirement.system_name,
+            requirement.kb_name,
+            requirement.version,
+            requirement.canonical_id or requirement.requirement_id,
+            requirement.document_version_id,
+        )
+        canonical_pk = existing_by_key.get(unique_key) or pk_by_unique_key.get(unique_key) or old_pk
+        pk_by_unique_key[unique_key] = canonical_pk
+        if canonical_pk != old_pk:
+            pk_replacements[old_pk] = canonical_pk
+            aligned_requirements.append(
+                requirement.model_copy(update={"requirement_pk": canonical_pk})
+            )
+        else:
+            aligned_requirements.append(requirement)
+    requirements_by_pk: dict[str, RequirementRecord] = {}
+    for requirement in aligned_requirements:
+        if requirement.requirement_pk:
+            requirements_by_pk.setdefault(requirement.requirement_pk, requirement)
+    aligned_requirements = list(requirements_by_pk.values())
+    aligned_evidence: list[RequirementEvidenceRecord] = []
+    for item in evidence:
+        replacement_pk = pk_replacements.get(item.requirement_pk)
+        if not replacement_pk:
+            aligned_evidence.append(item)
+            continue
+        aligned_evidence.append(
+            item.model_copy(
+                update={
+                    "requirement_pk": replacement_pk,
+                    "requirement_evidence_id": stable_id(
+                        "requirement_evidence",
+                        replacement_pk,
+                        item.chunk_id,
+                        item.start_offset,
+                        item.end_offset,
+                        item.evidence_text,
+                    ),
+                }
+            )
+        )
+    return aligned_requirements, aligned_evidence
+
+
+async def _delete_requirement_evidence_for_requirements(
+    session: AsyncSession,
+    requirements: Sequence[RequirementRecord],
+) -> None:
+    requirement_pks = [record.requirement_pk for record in requirements if record.requirement_pk]
+    if not requirement_pks:
+        return
+    await session.execute(
+        delete(RequirementEvidenceModel).where(
+            RequirementEvidenceModel.requirement_pk.in_(requirement_pks)
+        )
+    )
+
+
+def _requirement_evidence_values(record: RequirementEvidenceRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["metadata"] = payload.pop("metadata")
+    return payload
+
+
+def _requirement_coverage_values(record: RequirementCoverageRecord) -> dict[str, Any]:
+    payload = record.model_dump(mode="python")
+    payload["coverage_status"] = record.coverage_status.value
     payload["metadata"] = payload.pop("metadata")
     return payload
 
@@ -1020,12 +1497,69 @@ def _chunk_from_model(row: ChunkModel) -> ChunkRecord:
     )
 
 
+def _requirement_from_model(row: RequirementModel) -> RequirementRecord:
+    return RequirementRecord(
+        requirement_pk=row.requirement_pk,
+        canonical_id=row.canonical_id or row.requirement_id,
+        requirement_id=row.requirement_id,
+        requirement_type=RequirementType(row.requirement_type),
+        category=row.category,
+        title=row.title,
+        document_version_id=row.document_version_id,
+        document_id=row.document_id,
+        chunk_id=row.chunk_id,
+        system_name=row.system_name,
+        kb_name=row.kb_name,
+        version=row.version,
+        status=DocumentStatus(row.status),
+        text=row.text,
+        normalized_text=row.normalized_text,
+        source_name=row.source_name,
+        page=row.page,
+        section_title=row.section_title,
+        story_driving=row.story_driving,
+        coverage_required=row.coverage_required,
+        extraction_method=row.extraction_method,
+        confidence=row.confidence,
+        semantic_key=row.semantic_key,
+        metadata=row.metadata_json,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _requirement_evidence_from_model(
+    row: RequirementEvidenceModel,
+) -> RequirementEvidenceRecord:
+    return RequirementEvidenceRecord(
+        requirement_evidence_id=row.requirement_evidence_id,
+        requirement_pk=row.requirement_pk,
+        chunk_id=row.chunk_id,
+        document_version_id=row.document_version_id,
+        source_name=row.source_name,
+        page=row.page,
+        section_title=row.section_title,
+        start_offset=row.start_offset,
+        end_offset=row.end_offset,
+        evidence_text=row.evidence_text,
+        extraction_method=row.extraction_method,
+        confidence=row.confidence,
+        metadata=row.metadata_json,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
 def _retrieval_result_from_chunk_model(
     row: ChunkModel,
     *,
     score: float,
     source: str,
 ) -> RetrievalResult:
+    metadata = dict(row.metadata_json)
+    metadata[f"{source}_score"] = score
+    if source in {"bm25", "fts"}:
+        metadata["lexical_score"] = score
     return RetrievalResult(
         chunk_id=row.chunk_id,
         document_id=row.document_id,
@@ -1038,7 +1572,7 @@ def _retrieval_result_from_chunk_model(
         text=row.text,
         score=score,
         sources=[source],
-        metadata=row.metadata_json,
+        metadata=metadata,
     )
 
 
@@ -1061,8 +1595,120 @@ def _requirements_from_facts(facts: list[FactRecord]) -> list[RequirementRecord]
             version=fact.version,
             status=fact.status,
             text=fact.evidence,
+            normalized_text=_normalize_text(fact.evidence),
+            source_name=None,
+            page=None,
+            section_title=None,
+            extraction_method="fact_projection",
+            metadata={"source": "facts"},
         )
     return list(requirements.values())
+
+
+def _requirement_evidence_from_requirements(
+    requirements: list[RequirementRecord],
+    chunks: list[ChunkRecord],
+) -> list[RequirementEvidenceRecord]:
+    chunks_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+    evidence: list[RequirementEvidenceRecord] = []
+    for requirement in requirements:
+        requirement_pk = requirement.requirement_pk or stable_id(
+            "requirement",
+            requirement.system_name,
+            requirement.kb_name,
+            requirement.version,
+            requirement.canonical_id or requirement.requirement_id,
+            requirement.document_version_id,
+        )
+        chunk = chunks_by_id.get(requirement.chunk_id)
+        evidence.append(
+            RequirementEvidenceRecord(
+                requirement_evidence_id=stable_id(
+                    "requirement_evidence",
+                    requirement_pk,
+                    requirement.chunk_id,
+                    _normalize_text(requirement.text),
+                ),
+                requirement_pk=requirement_pk,
+                chunk_id=requirement.chunk_id,
+                document_version_id=requirement.document_version_id,
+                source_name=chunk.source_name if chunk else requirement.source_name or "",
+                page=chunk.page if chunk else requirement.page or 1,
+                section_title=chunk.section_title if chunk else requirement.section_title,
+                evidence_text=requirement.text,
+                extraction_method=requirement.extraction_method,
+                confidence=requirement.confidence,
+                metadata={"source": "requirement_projection"},
+            )
+        )
+    return evidence
+
+
+def _normalize_text(text_value: str) -> str:
+    import re
+
+    return re.sub(r"\s+", " ", text_value).strip().lower()
+
+
+_NON_RETRYABLE_POSTGRES_MARKERS = (
+    "authentication failed",
+    "password authentication failed",
+    "invalid password",
+    "permission denied",
+    "invalid sql",
+    "syntax error",
+    "undefined table",
+    "undefined column",
+    "undefined function",
+    "relation ",
+    "column ",
+    "function ",
+    "schema ",
+    "extension ",
+    "pg_textsearch",
+    "idx_chunks_text_bm25",
+    "constraint",
+)
+_TRANSIENT_POSTGRES_MARKERS = (
+    "connection reset",
+    "connection refused",
+    "connection is closed",
+    "server closed the connection",
+    "terminating connection",
+    "timeout",
+    "timed out",
+    "temporarily unavailable",
+    "too many connections",
+    "deadlock detected",
+    "could not serialize access",
+    "serialization failure",
+)
+_TRANSIENT_ORIG_NAMES = (
+    "cannotconnectnowerror",
+    "connectiondoesnotexisterror",
+    "connectionfailureerror",
+    "deadlockdetectederror",
+    "serializationerror",
+    "toomanyconnectionserror",
+)
+
+
+def _is_transient_postgres_error(exc: Exception) -> bool:
+    """Return whether a PostgreSQL exception is safe to retry."""
+
+    if isinstance(exc, ProgrammingError | IntegrityError):
+        return False
+    message = str(exc).lower()
+    if any(marker in message for marker in _NON_RETRYABLE_POSTGRES_MARKERS):
+        return False
+    if isinstance(exc, OperationalError | InterfaceError | SQLAlchemyTimeoutError):
+        return True
+    if isinstance(exc, DBAPIError):
+        original = getattr(exc, "orig", None)
+        original_name = type(original).__name__.lower()
+        if any(marker in original_name for marker in _TRANSIENT_ORIG_NAMES):
+            return True
+    return any(marker in message for marker in _TRANSIENT_POSTGRES_MARKERS)
 
 
 def _entities_from_facts(facts: list[FactRecord]) -> list[EntityRecord]:

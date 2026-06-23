@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -21,11 +23,21 @@ from multi_agentic_rag.domain import (
     IngestResult,
     QualityValidationReport,
     RankedRetrievalResult,
+    RequirementEvidenceRecord,
+    RequirementRecord,
+    RequirementType,
     RetrievalResult,
     TaskIntent,
 )
 from multi_agentic_rag.exceptions import MultiAgenticRagError
 from multi_agentic_rag.llm import ReasoningClient
+from multi_agentic_rag.requirements_ledger import (
+    RequirementQueryIntent,
+    classify_requirement_query,
+    render_requirement_answer,
+    requirement_inventory_payload,
+    write_requirement_inventory_artifacts,
+)
 from multi_agentic_rag.retrieval.evidence import EvidenceValidator
 
 
@@ -64,6 +76,29 @@ class ArtifactGraphRepository(Protocol):
         version: str,
     ) -> None:
         """Project user-story artifact lineage into Neo4j."""
+
+
+class RequirementLedgerRepository(Protocol):
+    """Exact requirement-ledger enumeration contract."""
+
+    async def list_requirements_for_scope(
+        self,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str,
+        requirement_types: set[RequirementType] | None = None,
+        active_only: bool = True,
+        coverage_required: bool | None = None,
+    ) -> list[RequirementRecord]:
+        """Return exact requirement records for a scope."""
+
+    async def list_requirement_evidence(
+        self,
+        *,
+        requirement_pks: Sequence[str] | None = None,
+    ) -> list[RequirementEvidenceRecord]:
+        """Return evidence spans for requirement primary keys."""
 
 
 class AgentIngestDocument:
@@ -105,23 +140,88 @@ class AgentRetrieveAnswer:
         retriever: AgentRetriever,
         reasoning_client: ReasoningClient,
         *,
+        settings: Settings | None = None,
+        requirement_repository: RequirementLedgerRepository | None = None,
         evidence_validator: EvidenceValidator | None = None,
     ) -> None:
+        self.settings = settings or get_settings()
         self.retriever = retriever
         self.reasoning_client = reasoning_client
+        self.requirement_repository = requirement_repository
         self.evidence_validator = evidence_validator or EvidenceValidator()
 
-    async def run(self, intent: TaskIntent, *, question: str) -> AgentRunResult:
+    async def run(
+        self,
+        intent: TaskIntent,
+        *,
+        question: str,
+        top_k: int | None = None,
+    ) -> AgentRunResult:
         """Run hybrid retrieval and OpenAI answer synthesis."""
 
         if not intent.system:
             return _blocked("system is required for answer generation")
+        query_intent = classify_requirement_query(question)
+        if (
+            query_intent == RequirementQueryIntent.EXHAUSTIVE_REQUIREMENT_QUERY
+            and self.requirement_repository is not None
+        ):
+            if not intent.version:
+                return _blocked("version is required for exhaustive requirement enumeration")
+            requirements = await self.requirement_repository.list_requirements_for_scope(
+                system_name=intent.system,
+                kb_name=intent.kb,
+                version=intent.version,
+                active_only=True,
+            )
+            requirement_evidence = await self.requirement_repository.list_requirement_evidence(
+                requirement_pks=[
+                    requirement.requirement_pk
+                    for requirement in requirements
+                    if requirement.requirement_pk
+                ]
+            )
+            payload = requirement_inventory_payload(
+                requirements,
+                requirement_evidence,
+                system_name=intent.system,
+                kb_name=intent.kb,
+                version=intent.version,
+            )
+            timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            output_dir = (
+                self.settings.user_story_output_dir
+                / "requirements"
+                / intent.system
+                / intent.kb
+                / intent.version
+                / timestamp
+            )
+            artifact_paths = write_requirement_inventory_artifacts(
+                output_dir=output_dir,
+                payload=payload,
+            )
+            answer_text = render_requirement_answer(payload, artifact_paths)
+            return AgentRunResult(
+                status=AgentRunStatus.SUCCEEDED,
+                messages=[answer_text],
+                evidence_ids=list(
+                    dict.fromkeys(item.chunk_id for item in requirement_evidence)
+                ),
+                artifact_paths=[str(path) for path in artifact_paths],
+                payload={
+                    "answer": answer_text,
+                    "query_intent": query_intent.value,
+                    "requirements_inventory": payload,
+                    "artifacts": [str(path) for path in artifact_paths],
+                },
+            )
         results = await self.retriever.retrieve(
             question,
             system_name=intent.system,
             kb_name=intent.kb,
             version=intent.version,
-            top_k=5,
+            top_k=top_k or self.settings.retrieval_answer_top_k,
         )
         evidence = self.evidence_validator.validate(results)
         if not evidence:

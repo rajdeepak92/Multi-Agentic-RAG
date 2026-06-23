@@ -35,6 +35,9 @@ from multi_agentic_rag.domain import (
     IngestResult,
     QualityValidationReport,
     RankedRetrievalResult,
+    RequirementEvidenceRecord,
+    RequirementRecord,
+    RequirementType,
     RetrievalResult,
     TaskIntent,
     TaskIntentType,
@@ -589,6 +592,37 @@ def test_hf_reasoning_deterministic_answer_mode_does_not_load_qwen(monkeypatch) 
     assert answer.citations == ["chunk-1"]
 
 
+def test_hf_reasoning_extractive_answer_uses_configured_evidence_limits() -> None:
+    client = HuggingFaceReasoningClient(
+        Settings(
+            postgres_dsn="postgresql+asyncpg://x",
+            retrieval_answer_max_evidence=3,
+            retrieval_answer_max_snippets=3,
+        )
+    )
+
+    answer = asyncio.run(
+        client.synthesize_answer(
+            "Which requirements mention temperature?",
+            EvidenceBundle(
+                query="Which requirements mention temperature?",
+                ranked_results=[
+                    _ranked_result(
+                        f"Requirement {index} temperature evidence is documented.",
+                        rank=index,
+                        chunk_id=f"chunk-{index}",
+                    )
+                    for index in range(1, 5)
+                ],
+                source_chunk_ids=[f"chunk-{index}" for index in range(1, 5)],
+            ),
+        )
+    )
+
+    assert answer.answer.count("\n- ") == 3
+    assert answer.citations == ["chunk-1", "chunk-2", "chunk-3"]
+
+
 def test_hf_reasoning_threshold_answer_formats_requested_sensor_only() -> None:
     client = HuggingFaceReasoningClient(Settings(postgres_dsn="postgresql+asyncpg://x"))
     table_text = (
@@ -989,25 +1023,30 @@ def test_ingest_command_hf_skips_fact_review_by_default(monkeypatch, tmp_path) -
     settings = Settings(postgres_dsn="postgresql+asyncpg://x")
     source = tmp_path / "brd_v1.md"
     source.write_text("REQ-1 threshold maximum is 80 C.", encoding="utf-8")
-    captured_clients: list[object] = []
+    captured: dict[str, object] = {}
 
     def fail_reasoning_client(*args, **kwargs):
         raise AssertionError("ingest should not build a reasoning client by default")
 
-    class CapturingKnowledgeBaseStoringAgent:
-        def __init__(self, **kwargs) -> None:
-            captured_clients.append(kwargs["fact_review_client"])
+    class FakeApplication:
+        async def ingest(self, request) -> object:
+            captured["request"] = request
+            return type("IngestionResult", (), {"ingest_result": _ingest_result()})()
 
-        async def ingest(self, *args, **kwargs) -> IngestResult:
-            return _ingest_result()
+    def fake_build_application(**kwargs) -> FakeApplication:
+        captured["model_selector"] = kwargs["model_selector"]
+        captured["review_facts"] = kwargs["review_facts"]
+        return FakeApplication()
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(cli, "build_reasoning_client", fail_reasoning_client)
-    monkeypatch.setattr(cli, "KnowledgeBaseStoringAgent", CapturingKnowledgeBaseStoringAgent)
+    monkeypatch.setattr(cli, "build_application", fake_build_application)
 
     cli.ingest(source, system="PROJECT_1", version="v1", kb="default", model="hf")
 
-    assert captured_clients == [None]
+    assert captured["model_selector"] == "hf"
+    assert captured["review_facts"] is False
+    assert captured["request"].document_path == source
 
 
 def test_ingest_command_hf_review_facts_constructs_hf_reviewer(
@@ -1017,18 +1056,21 @@ def test_ingest_command_hf_review_facts_constructs_hf_reviewer(
     settings = Settings(postgres_dsn="postgresql+asyncpg://x")
     source = tmp_path / "brd_v1.md"
     source.write_text("REQ-1 threshold maximum is 80 C.", encoding="utf-8")
-    captured_clients: list[object] = []
+    captured: dict[str, object] = {}
     _patch_hf_reasoning(monkeypatch)
 
-    class CapturingKnowledgeBaseStoringAgent:
-        def __init__(self, **kwargs) -> None:
-            captured_clients.append(kwargs["fact_review_client"])
+    class FakeApplication:
+        async def ingest(self, request) -> object:
+            captured["request"] = request
+            return type("IngestionResult", (), {"ingest_result": _ingest_result()})()
 
-        async def ingest(self, *args, **kwargs) -> IngestResult:
-            return _ingest_result()
+    def fake_build_application(**kwargs) -> FakeApplication:
+        captured["model_selector"] = kwargs["model_selector"]
+        captured["review_facts"] = kwargs["review_facts"]
+        return FakeApplication()
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
-    monkeypatch.setattr(cli, "KnowledgeBaseStoringAgent", CapturingKnowledgeBaseStoringAgent)
+    monkeypatch.setattr(cli, "build_application", fake_build_application)
 
     cli.ingest(
         source,
@@ -1039,7 +1081,9 @@ def test_ingest_command_hf_review_facts_constructs_hf_reviewer(
         review_facts=True,
     )
 
-    assert isinstance(captured_clients[0], FakeHFReasoningClient)
+    assert captured["model_selector"] == "hf"
+    assert captured["review_facts"] is True
+    assert captured["request"].document_path == source
 
 
 def test_ingest_directory_hf_review_facts_reuses_one_hf_client_without_openai(
@@ -1050,21 +1094,23 @@ def test_ingest_directory_hf_review_facts_reuses_one_hf_client_without_openai(
     files = [tmp_path / "one_v1.md", tmp_path / "two_v1.md"]
     for path in files:
         path.write_text("REQ-1 threshold maximum is 80 C.", encoding="utf-8")
-    captured_clients: list[object] = []
+    captured: dict[str, object] = {}
     ingest_calls: list[object] = []
     _patch_hf_reasoning(monkeypatch)
 
-    class CapturingKnowledgeBaseStoringAgent:
-        def __init__(self, **kwargs) -> None:
-            captured_clients.append(kwargs["fact_review_client"])
+    class FakeApplication:
+        async def ingest(self, request) -> object:
+            ingest_calls.append(request)
+            return type("IngestionResult", (), {"ingest_result": _ingest_result()})()
 
-        async def ingest(self, *args, **kwargs) -> IngestResult:
-            ingest_calls.append(args)
-            return _ingest_result()
+    def fake_build_application(**kwargs) -> FakeApplication:
+        captured["model_selector"] = kwargs["model_selector"]
+        captured["review_facts"] = kwargs["review_facts"]
+        return FakeApplication()
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(cli, "_document_files", lambda directory_path, *, recursive: files)
-    monkeypatch.setattr(cli, "KnowledgeBaseStoringAgent", CapturingKnowledgeBaseStoringAgent)
+    monkeypatch.setattr(cli, "build_application", fake_build_application)
 
     cli.ingest_directory(
         tmp_path,
@@ -1075,8 +1121,8 @@ def test_ingest_directory_hf_review_facts_reuses_one_hf_client_without_openai(
         review_facts=True,
     )
 
-    assert len(captured_clients) == 1
-    assert isinstance(captured_clients[0], FakeHFReasoningClient)
+    assert captured["model_selector"] == "hf"
+    assert captured["review_facts"] is True
     assert len(ingest_calls) == 2
 
 
@@ -1253,6 +1299,45 @@ def test_answer_agent_synthesizes_from_validated_evidence() -> None:
     assert result.evidence_ids == ["chunk-1"]
     assert result.payload["answer"]["citations"] == ["chunk-1"]
     assert client.synthesized_questions == ["What is the threshold?"]
+
+
+def test_answer_agent_enumerates_ledger_for_exhaustive_requirement_query(
+    tmp_path,
+) -> None:
+    client = FakeReasoningClient()
+    retriever = RecordingRetriever()
+    repository = FakeRequirementLedgerRepository()
+
+    result = asyncio.run(
+        AgentRetrieveAnswer(
+            retriever,
+            client,
+            settings=Settings(
+                postgres_dsn="postgresql+asyncpg://x",
+                user_story_output_dir=tmp_path,
+                _env_file=None,
+            ),
+            requirement_repository=repository,
+        ).run(
+            TaskIntent(
+                intent_type=TaskIntentType.ANSWER_QUERY,
+                system="PROJECT_1",
+                kb="default",
+                version="v1",
+            ),
+            question="Summarize all requirements and business rules.",
+        )
+    )
+
+    assert result.status == AgentRunStatus.SUCCEEDED
+    assert result.payload["query_intent"] == "exhaustive_requirement_query"
+    assert result.payload["requirements_inventory"]["total_ledger_records"] == 2
+    assert "BR-SEN-001" in result.messages[0]
+    assert "NFR-RELIABILITY-ABC12345" in result.messages[0]
+    assert client.synthesized_questions == []
+    assert retriever.queries == []
+    assert repository.scopes == [("PROJECT_1", "default", "v1")]
+    assert result.artifact_paths
 
 
 def test_user_story_builder_writes_yaml_and_debug_json(tmp_path) -> None:
@@ -1630,6 +1715,15 @@ class EmptyRetriever:
         return []
 
 
+class RecordingRetriever:
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    async def retrieve(self, query_text: str, **kwargs) -> list[RetrievalResult]:
+        self.queries.append(query_text)
+        return []
+
+
 class EvidenceRetriever:
     async def retrieve(self, query_text: str, **kwargs) -> list[RetrievalResult]:
         return [
@@ -1647,6 +1741,74 @@ class EvidenceRetriever:
                 sources=["bm25"],
             )
         ]
+
+
+class FakeRequirementLedgerRepository:
+    def __init__(self) -> None:
+        self.scopes: list[tuple[str, str, str]] = []
+
+    async def list_requirements_for_scope(
+        self,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str,
+        **kwargs,
+    ) -> list[RequirementRecord]:
+        self.scopes.append((system_name, kb_name, version))
+        return [
+            _requirement_record("BR-SEN-001", RequirementType.FUNCTIONAL),
+            _requirement_record(
+                "NFR-RELIABILITY-ABC12345",
+                RequirementType.NON_FUNCTIONAL,
+            ),
+        ]
+
+    async def list_requirement_evidence(self, **kwargs) -> list[RequirementEvidenceRecord]:
+        return [
+            RequirementEvidenceRecord(
+                requirement_evidence_id="ev-1",
+                requirement_pk="req-BR-SEN-001",
+                chunk_id="chunk-1",
+                document_version_id="dv-1",
+                source_name="source.md",
+                page=1,
+                evidence_text="BR-SEN-001 The controller shall collect readings.",
+            ),
+            RequirementEvidenceRecord(
+                requirement_evidence_id="ev-2",
+                requirement_pk="req-NFR-RELIABILITY-ABC12345",
+                chunk_id="chunk-2",
+                document_version_id="dv-1",
+                source_name="source.md",
+                page=2,
+                evidence_text="Monitoring shall continue safely.",
+            ),
+        ]
+
+
+def _requirement_record(
+    canonical_id: str,
+    requirement_type: RequirementType,
+) -> RequirementRecord:
+    return RequirementRecord(
+        requirement_pk=f"req-{canonical_id}",
+        canonical_id=canonical_id,
+        requirement_id=canonical_id,
+        requirement_type=requirement_type,
+        category="SEN" if requirement_type is RequirementType.FUNCTIONAL else "Reliability",
+        title=canonical_id,
+        document_version_id="dv-1",
+        document_id="doc-1",
+        chunk_id="chunk-1",
+        system_name="PROJECT_1",
+        kb_name="default",
+        version="v1",
+        status=DocumentStatus.ACTIVE,
+        text=f"{canonical_id} shall be satisfied.",
+        source_name="source.md",
+        page=1,
+    )
 
 
 class FakeIngestAgent:

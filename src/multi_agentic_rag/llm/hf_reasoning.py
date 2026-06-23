@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import shutil
+from contextlib import suppress
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
@@ -203,6 +204,7 @@ class HuggingFaceReasoningClient:
         self.model = self.settings.hf_reason_model
         self._tokenizer = tokenizer
         self._model = model
+        self._force_cpu = False
 
     async def route_intent(
         self,
@@ -256,8 +258,15 @@ class HuggingFaceReasoningClient:
     ) -> GroundedAnswer:
         """Create a concise answer from validated evidence only."""
 
+        max_evidence = max(1, self.settings.retrieval_answer_max_evidence)
+        max_snippets = max(1, self.settings.retrieval_answer_max_snippets)
         if self.settings.hf_reason_answer_mode in {"deterministic", "extractive"}:
-            return _extractive_grounded_answer(question, evidence)
+            return _extractive_grounded_answer(
+                question,
+                evidence,
+                max_evidence=max_evidence,
+                max_snippets=max_snippets,
+            )
         try:
             return await self._structured(
                 instructions=ANSWER_SYNTHESIS_PROMPT,
@@ -269,7 +278,12 @@ class HuggingFaceReasoningClient:
                 schema_name="grounded_answer",
             )
         except MultiAgenticRagError:
-            return _extractive_grounded_answer(question, evidence)
+            return _extractive_grounded_answer(
+                question,
+                evidence,
+                max_evidence=max_evidence,
+                max_snippets=max_snippets,
+            )
 
     async def write_user_stories(
         self,
@@ -451,6 +465,30 @@ class HuggingFaceReasoningClient:
         except MultiAgenticRagError:
             raise
         except Exception as exc:
+            if self._can_retry_on_cpu(exc):
+                self._switch_to_cpu()
+                tokenizer, model = self._load_model()
+                fit = self._fit_prompt(
+                    tokenizer=tokenizer,
+                    model=model,
+                    instructions=instructions,
+                    payload=payload,
+                    schema=schema,
+                    schema_name=schema_name,
+                    previous_error=previous_error,
+                    max_new_tokens=effective_max_new_tokens,
+                )
+                try:
+                    return self._generate_text(
+                        tokenizer=tokenizer,
+                        model=model,
+                        prompt=fit.prompt,
+                        max_new_tokens=fit.max_new_tokens,
+                    )
+                except Exception as retry_exc:
+                    raise MultiAgenticRagError(
+                        f"HuggingFace request failed for {schema_name}: {retry_exc}"
+                    ) from retry_exc
             raise MultiAgenticRagError(
                 f"HuggingFace request failed for {schema_name}: {exc}"
             ) from exc
@@ -479,9 +517,13 @@ class HuggingFaceReasoningClient:
                 **self._hub_kwargs(),
                 **model_kwargs,
             )
-            if not _uses_auto_device(self.settings):
-                model = model.to(self.settings.hf_reason_device)
+            target_device = self._target_device()
+            if target_device is not None:
+                model = model.to(target_device)
         except Exception as exc:
+            if self._can_retry_on_cpu(exc):
+                self._switch_to_cpu()
+                return self._load_model()
             raise ConfigError(
                 "Hugging Face reasoning model load failed for "
                 f"{self.settings.hf_reason_model}: {exc}. "
@@ -496,9 +538,32 @@ class HuggingFaceReasoningClient:
             "trust_remote_code": True,
             "torch_dtype": self._torch_dtype(torch),
         }
-        if _uses_auto_device(self.settings):
+        if _uses_auto_device(self.settings) and not self._force_cpu:
             kwargs["device_map"] = "auto"
         return kwargs
+
+    def _target_device(self) -> str | None:
+        if self._force_cpu:
+            return "cpu"
+        if _uses_auto_device(self.settings):
+            return None
+        return self.settings.hf_reason_device
+
+    def _can_retry_on_cpu(self, exc: Exception) -> bool:
+        return (
+            _uses_auto_device(self.settings)
+            and not self._force_cpu
+            and _is_cuda_memory_error(exc)
+        )
+
+    def _switch_to_cpu(self) -> None:
+        self._force_cpu = True
+        self._model = None
+        with suppress(Exception):
+            torch = cast(Any, import_module("torch"))
+            cuda = getattr(torch, "cuda", None)
+            if cuda is not None and hasattr(cuda, "empty_cache"):
+                cuda.empty_cache()
 
     def _hub_kwargs(self) -> dict[str, Any]:
         self.settings.ensure_project_cache_paths()
@@ -809,15 +874,36 @@ def _restore_json_prefill(decoded: str) -> str:
     return "{" + decoded
 
 
-def _extractive_grounded_answer(question: str, evidence: EvidenceBundle) -> GroundedAnswer:
-    threshold_answer = _threshold_grounded_answer(question, evidence)
+def _extractive_grounded_answer(
+    question: str,
+    evidence: EvidenceBundle,
+    *,
+    max_evidence: int = 20,
+    max_snippets: int = 8,
+) -> GroundedAnswer:
+    limited_results = evidence.ranked_results[:max_evidence]
+    limited_evidence = evidence.model_copy(
+        update={
+            "ranked_results": limited_results,
+            "source_chunk_ids": [result.chunk_id for result in limited_results],
+        }
+    )
+    threshold_answer = _threshold_grounded_answer(
+        question,
+        limited_evidence,
+        max_citations=max_evidence,
+    )
     if threshold_answer is not None:
         return threshold_answer
 
-    snippets = _select_evidence_snippets(question, evidence)
+    snippets = _select_evidence_snippets(
+        question,
+        limited_evidence,
+        limit=max_snippets,
+    )
     citations = [
         result.chunk_id
-        for result in evidence.ranked_results
+        for result in limited_results
         if result.chunk_id
     ]
     citations = list(dict.fromkeys(citations))
@@ -825,19 +911,19 @@ def _extractive_grounded_answer(question: str, evidence: EvidenceBundle) -> Grou
         return GroundedAnswer(
             answer="I could not extract a concise answer from the retrieved evidence.",
             refused=True,
-            citations=citations[:5],
+            citations=citations[:max_evidence],
             validation_status="failed",
         )
     answer = "From the retrieved document evidence:\n" + "\n".join(
         f"- {snippet}" for snippet in snippets
     )
-    source = _source_line(evidence.ranked_results[0]) if evidence.ranked_results else ""
+    source = _source_line(limited_results[0]) if limited_results else ""
     if source:
         answer = f"{answer}\n\nSource: {source}"
     return GroundedAnswer(
         answer=answer,
         refused=False,
-        citations=citations[:5],
+        citations=citations[:max_evidence],
         validation_status="passed",
     )
 
@@ -845,6 +931,8 @@ def _extractive_grounded_answer(question: str, evidence: EvidenceBundle) -> Grou
 def _threshold_grounded_answer(
     question: str,
     evidence: EvidenceBundle,
+    *,
+    max_citations: int = 20,
 ) -> GroundedAnswer | None:
     if not _is_threshold_question(question):
         return None
@@ -861,7 +949,7 @@ def _threshold_grounded_answer(
                     f"Please specify one sensor: {sensors}."
                 ),
                 refused=True,
-                citations=[row.chunk_id for row in rows[:5]],
+                citations=[row.chunk_id for row in rows[:max_citations]],
                 validation_status="failed",
             )
         target = rows[0]
@@ -1221,3 +1309,12 @@ def _nvidia_smi_available() -> bool:
 
 def _uses_auto_device(settings: Settings) -> bool:
     return settings.hf_reason_device.strip().lower() == "auto"
+
+
+def _is_cuda_memory_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "cuda" in message and (
+        "out of memory" in message
+        or "cudaerrormemoryallocation" in message
+        or "memory allocation" in message
+    )

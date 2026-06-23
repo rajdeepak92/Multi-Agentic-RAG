@@ -170,6 +170,16 @@ class Settings(BaseSettings):
     retrieval_reciprocal_rank_constant: int = Field(default=60)
     retrieval_max_retrieval_rounds: int = Field(default=2)
     retrieval_allow_degraded: bool = Field(default=False)
+    retrieval_answer_top_k: int = Field(default=10)
+    retrieval_answer_max_evidence: int = Field(default=20)
+    retrieval_answer_max_snippets: int = Field(default=8)
+    user_story_schema_version: str = Field(default="enterprise-user-story-v1")
+    user_story_requirement_batch_size: int = Field(default=6)
+    user_story_max_stories_per_batch: int = Field(default=8)
+    user_story_coverage_required_types: tuple[str, ...] = Field(
+        default=("functional", "non_functional", "automation_rule")
+    )
+    user_story_allow_partial_coverage: bool = Field(default=False)
     log_level: str = Field(default="INFO")
 
     postgres_connect_timeout_seconds: float = Field(default=10.0)
@@ -214,6 +224,24 @@ class Settings(BaseSettings):
             stripped = value.strip()
             if not stripped:
                 return ("postgres", "chroma", "neo4j")
+            if stripped.startswith("["):
+                import json
+
+                parsed = json.loads(stripped)
+                if isinstance(parsed, list):
+                    return tuple(str(item).strip().lower() for item in parsed)
+            return tuple(item.strip().lower() for item in stripped.split(",") if item.strip())
+        if isinstance(value, list | tuple):
+            return tuple(str(item).strip().lower() for item in value)
+        return value
+
+    @field_validator("user_story_coverage_required_types", mode="before")
+    @classmethod
+    def _normalize_coverage_required_types(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return ("functional", "non_functional", "automation_rule")
             if stripped.startswith("["):
                 import json
 

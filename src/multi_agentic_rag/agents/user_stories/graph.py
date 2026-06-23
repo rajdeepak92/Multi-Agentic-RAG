@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from langgraph.graph import END, START, StateGraph
 
@@ -30,13 +31,25 @@ from multi_agentic_rag.domain import (
     ArtifactManifest,
     ArtifactRecord,
     EvidenceBundle,
+    GeneratedUserStory,
     QualityValidationReport,
     RankedRetrievalResult,
+    RequirementCoverageRecord,
+    RequirementEvidenceRecord,
+    RequirementRecord,
+    RequirementType,
     RetrievalResult,
 )
 from multi_agentic_rag.exceptions import ConfigError
 from multi_agentic_rag.llm import GenerationConfig, ReasoningClient
 from multi_agentic_rag.llm.structured import LLMGeneratedUserStoryBatch
+from multi_agentic_rag.requirements_ledger import (
+    build_coverage_records,
+    coverage_payload,
+    requirement_inventory_payload,
+    write_coverage_artifacts,
+    write_requirement_inventory_artifacts,
+)
 from multi_agentic_rag.retrieval.evidence import EvidenceValidator
 from multi_agentic_rag.retrieval.reranker import RerankingService
 from multi_agentic_rag.runtime.secrets import redact_secrets
@@ -80,6 +93,34 @@ class ArtifactGraphRepository(Protocol):
         """Project generated user-story lineage."""
 
 
+class RequirementLedgerRepository(Protocol):
+    """Exact requirement-ledger repository used for story discovery."""
+
+    async def list_requirements_for_scope(
+        self,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str,
+        requirement_types: set[RequirementType] | None = None,
+        active_only: bool = True,
+        coverage_required: bool | None = None,
+    ) -> list[RequirementRecord]:
+        """Return exact requirement records for a scope."""
+
+    async def list_requirement_evidence(
+        self,
+        *,
+        requirement_pks: Sequence[str] | None = None,
+    ) -> list[RequirementEvidenceRecord]:
+        """Return evidence spans for requirement primary keys."""
+
+    async def upsert_requirement_coverage(
+        self,
+        records: list[RequirementCoverageRecord],
+    ) -> None:
+        """Persist requirement-to-story coverage rows."""
+
 class UserStoryGraphRuntime:
     """Node implementation for the user-story StateGraph."""
 
@@ -95,6 +136,7 @@ class UserStoryGraphRuntime:
         writer: UserStoryArtifactWriter | None = None,
         artifact_audit_repository: ArtifactAuditRepository | None = None,
         graph_repository: ArtifactGraphRepository | None = None,
+        requirement_repository: RequirementLedgerRepository | None = None,
         log: logging.Logger | None = None,
     ) -> None:
         self.settings = settings
@@ -106,6 +148,7 @@ class UserStoryGraphRuntime:
         self.writer = writer or UserStoryArtifactWriter(settings)
         self.artifact_audit_repository = artifact_audit_repository
         self.graph_repository = graph_repository
+        self.requirement_repository = requirement_repository
         self.log = log or logging.getLogger("multi_agentic_rag.user_stories")
         self.evidence_validator = EvidenceValidator()
 
@@ -175,6 +218,55 @@ class UserStoryGraphRuntime:
         except Exception as exc:
             return _state_error(state, exc)
 
+    async def enumerate_requirement_ledger(
+        self,
+        state: UserStoryGenerationState,
+    ) -> UserStoryGenerationState:
+        """Enumerate exact active requirements before retrieval enrichment."""
+
+        if self.requirement_repository is None:
+            return {**state, "ledger_requirements": [], "ledger_evidence": []}
+        try:
+            request = state["request"]
+            requirements = await self.requirement_repository.list_requirements_for_scope(
+                system_name=request.system,
+                kb_name=request.kb,
+                version=request.version,
+                active_only=True,
+            )
+            evidence = await self.requirement_repository.list_requirement_evidence(
+                requirement_pks=[
+                    requirement.requirement_pk
+                    for requirement in requirements
+                    if requirement.requirement_pk
+                ]
+            )
+            missing_evidence = [
+                requirement.canonical_id or requirement.requirement_id
+                for requirement in requirements
+                if not any(
+                    item.requirement_pk == requirement.requirement_pk for item in evidence
+                )
+            ]
+            if missing_evidence:
+                return {
+                    **state,
+                    "ledger_requirements": requirements,
+                    "ledger_evidence": evidence,
+                    "errors": [
+                        *state.get("errors", []),
+                        "Requirement ledger has records without evidence: "
+                        + ", ".join(missing_evidence[:20]),
+                    ],
+                }
+            return {
+                **state,
+                "ledger_requirements": requirements,
+                "ledger_evidence": evidence,
+            }
+        except Exception as exc:
+            return _state_error(state, exc)
+
     async def plan_retrieval(self, state: UserStoryGenerationState) -> UserStoryGenerationState:
         """Ask the reasoning provider for source-specific retrieval queries."""
 
@@ -182,7 +274,7 @@ class UserStoryGraphRuntime:
             if state.get("retrieval_plan") and state.get("next_action") == "refine":
                 return {**state, "next_action": ""}
             request = state["request"]
-            prompt = _retrieval_plan_prompt(request)
+            prompt = _retrieval_plan_prompt(request, state.get("ledger_requirements", []))
             plan = await _generate_structured_or_default(
                 self.reasoning_client,
                 prompt=prompt,
@@ -190,7 +282,14 @@ class UserStoryGraphRuntime:
                 generation_config=_generation_config(self.settings, "retrieval_plan"),
                 fallback=_default_retrieval_plan(request),
             )
-            return {**state, "retrieval_plan": _ensure_non_empty_plan(plan, request)}
+            return {
+                **state,
+                "retrieval_plan": _ensure_non_empty_plan(
+                    plan,
+                    request,
+                    state.get("ledger_requirements", []),
+                ),
+            }
         except Exception as exc:
             return _state_error(state, exc)
 
@@ -446,9 +545,18 @@ class UserStoryGraphRuntime:
             version_scope=state["request"].version,
         )
         assessment = state.get("evidence_assessment")
+        ledger_requirements = state.get("ledger_requirements", [])
         prompt = json.dumps(
             {
                 "schema": "GeneratedUserStoryBatch",
+                "schema_version": self.settings.user_story_schema_version,
+                "requirement_batch_size": self.settings.user_story_requirement_batch_size,
+                "max_stories_per_batch": self.settings.user_story_max_stories_per_batch,
+                "allow_partial_coverage": self.settings.user_story_allow_partial_coverage,
+                "coverage_required_types": list(self.settings.user_story_coverage_required_types),
+                "requirement_ledger": _story_driving_requirement_payloads(
+                    ledger_requirements
+                ),
                 "evidence_count": len(bundle.ranked_results),
                 "source_chunk_ids": bundle.source_chunk_ids,
                 "assessment": assessment.model_dump(mode="json") if assessment else {},
@@ -464,16 +572,57 @@ class UserStoryGraphRuntime:
         """Generate structured user stories from validated evidence."""
 
         try:
-            batch_output = await self.reasoning_client.generate_structured(
-                prompt=state["prompt"],
-                schema=LLMGeneratedUserStoryBatch,
-                generation_config=_generation_config(self.settings, "user_story_generation"),
+            story_driving_requirements = [
+                requirement
+                for requirement in state.get("ledger_requirements", [])
+                if requirement.story_driving or requirement.coverage_required
+            ]
+            batches = (
+                list(
+                    _batched(
+                        story_driving_requirements,
+                        self.settings.user_story_requirement_batch_size,
+                    )
+                )
+                if story_driving_requirements
+                else [()]
             )
-            batch = batch_output.to_domain()
-            if not batch.stories:
+            stories: list[GeneratedUserStory] = []
+            for index, requirement_batch in enumerate(batches, start=1):
+                prompt = _batch_generation_prompt(
+                    state["prompt"],
+                    requirement_batch,
+                    batch_index=index,
+                    batch_count=len(batches),
+                )
+                batch_output = await self.reasoning_client.generate_structured(
+                    prompt=prompt,
+                    schema=LLMGeneratedUserStoryBatch,
+                    generation_config=_generation_config(self.settings, "user_story_generation"),
+                )
+                batch = batch_output.to_domain()
+                if len(batch.stories) > self.settings.user_story_max_stories_per_batch:
+                    raise ConfigError(
+                        "Reasoning provider returned more stories than allowed "
+                        f"for batch {index}."
+                    )
+                stories.extend(batch.stories)
+            if not stories:
                 raise ConfigError("Reasoning provider returned no user stories.")
-            return {**state, "validated_stories": batch.stories}
+            return {**state, "validated_stories": _dedupe_stories(stories)}
         except Exception as exc:
+            fallback_stories = _deterministic_stories_from_requirements(
+                state.get("ledger_requirements", [])
+            )
+            if fallback_stories:
+                return {
+                    **state,
+                    "validated_stories": fallback_stories,
+                    "generation_fallback_reason": (
+                        f"Structured provider failed for user_story_generation: "
+                        f"{type(exc).__name__}: {str(exc)[:240]}"
+                    ),
+                }
             invalid_path = _write_invalid_model_output_if_present(state, exc)
             if invalid_path is not None:
                 return _state_error(
@@ -487,13 +636,19 @@ class UserStoryGraphRuntime:
 
         try:
             reports: list[QualityValidationReport] = []
-            for story in state.get("validated_stories", []):
-                reports.append(
-                    await self.reasoning_client.validate_user_story(
-                        story,
-                        state["evidence_bundle"],
+            if state.get("generation_fallback_reason"):
+                reports = [
+                    _validate_deterministic_story(story)
+                    for story in state.get("validated_stories", [])
+                ]
+            else:
+                for story in state.get("validated_stories", []):
+                    reports.append(
+                        await self.reasoning_client.validate_user_story(
+                            story,
+                            state["evidence_bundle"],
+                        )
                     )
-                )
             failures = [
                 message
                 for report in reports
@@ -512,6 +667,49 @@ class UserStoryGraphRuntime:
                 }
             if failures:
                 return {**state, "errors": [*state.get("errors", []), *failures]}
+            ledger_requirements = state.get("ledger_requirements", [])
+            if ledger_requirements:
+                coverage_records = build_coverage_records(
+                    requirements=ledger_requirements,
+                    story_requirement_ids=_story_requirement_ids_by_story(
+                        state.get("validated_stories", [])
+                    ),
+                )
+                matrix = coverage_payload(
+                    requirements=ledger_requirements,
+                    coverage=coverage_records,
+                )
+                missing = [
+                    row
+                    for row in matrix["rows"]
+                    if row["coverage_required"] and row["coverage_status"] == "missing"
+                ]
+                if missing and retry_allowed:
+                    return {
+                        **state,
+                        "coverage_records": coverage_records,
+                        "coverage_payload": matrix,
+                        "retry_count": state.get("retry_count", 0) + 1,
+                        "errors": [],
+                        "next_action": "repair",
+                    }
+                if missing and not self.settings.user_story_allow_partial_coverage:
+                    missing_ids = ", ".join(str(row["canonical_id"]) for row in missing[:20])
+                    return {
+                        **state,
+                        "coverage_records": coverage_records,
+                        "coverage_payload": matrix,
+                        "errors": [
+                            *state.get("errors", []),
+                            "Coverage-required requirements are missing stories: "
+                            + missing_ids,
+                        ],
+                    }
+                state = {
+                    **state,
+                    "coverage_records": coverage_records,
+                    "coverage_payload": matrix,
+                }
             return {**state, "next_action": "valid"}
         except Exception as exc:
             return _state_error(state, exc)
@@ -567,6 +765,35 @@ class UserStoryGraphRuntime:
                         kb_name=request.kb,
                         version=request.version,
                     )
+            artifact_dir = state["run_dir"] / "artifacts" / "user_stories"
+            ledger_requirements = state.get("ledger_requirements", [])
+            if ledger_requirements:
+                inventory_payload = requirement_inventory_payload(
+                    ledger_requirements,
+                    state.get("ledger_evidence", []),
+                    system_name=request.system,
+                    kb_name=request.kb,
+                    version=request.version,
+                )
+                paths.extend(
+                    write_requirement_inventory_artifacts(
+                        output_dir=artifact_dir,
+                        payload=inventory_payload,
+                    )
+                )
+                coverage_records = state.get("coverage_records", [])
+                coverage_matrix = state.get("coverage_payload")
+                if coverage_matrix:
+                    paths.extend(
+                        write_coverage_artifacts(
+                            output_dir=artifact_dir,
+                            payload=coverage_matrix,
+                        )
+                    )
+                if self.requirement_repository and coverage_records:
+                    await self.requirement_repository.upsert_requirement_coverage(
+                        coverage_records
+                    )
             trace_path = state["run_dir"] / "debug" / "retrieval_trace.json"
             write_json_artifact(trace_path, redact_secrets(_trace_payload(state)))
             return {
@@ -594,10 +821,11 @@ class UserStoryGraphRuntime:
                 ],
             )
         else:
+            coverage_summary = _coverage_summary_message(state)
             result = UserStoryGenerationResult(
                 status="succeeded",
                 run_id=state["run_id"],
-                messages=["Generated user stories."],
+                messages=["Generated user stories.", coverage_summary],
                 artifact_paths=state.get("artifact_paths", []),
                 debug_trace_path=state.get("debug_trace_path"),
                 evidence_ids=state.get(
@@ -657,6 +885,7 @@ def build_user_story_graph(runtime: UserStoryGraphRuntime) -> Any:
     graph = StateGraph(UserStoryGenerationState)
     graph.add_node("validate_request", runtime.validate_request)
     graph.add_node("check_dependencies", runtime.check_dependencies)
+    graph.add_node("enumerate_requirement_ledger", runtime.enumerate_requirement_ledger)
     graph.add_node("plan_retrieval", runtime.plan_retrieval)
     graph.add_node("start_retrieval_round", runtime.start_retrieval_round)
     graph.add_node("retrieve_postgres", runtime.retrieve_postgres)
@@ -677,7 +906,8 @@ def build_user_story_graph(runtime: UserStoryGraphRuntime) -> Any:
 
     graph.add_edge(START, "validate_request")
     _guarded_edge(graph, "validate_request", "check_dependencies")
-    _guarded_edge(graph, "check_dependencies", "plan_retrieval")
+    _guarded_edge(graph, "check_dependencies", "enumerate_requirement_ledger")
+    _guarded_edge(graph, "enumerate_requirement_ledger", "plan_retrieval")
     _guarded_edge(graph, "plan_retrieval", "start_retrieval_round")
     graph.add_edge("start_retrieval_round", "retrieve_postgres")
     graph.add_edge("start_retrieval_round", "retrieve_chroma")
@@ -759,13 +989,33 @@ def _required_sources(settings: Settings) -> set[RetrievalSourceName]:
     return names
 
 
-def _retrieval_plan_prompt(request: UserStoryGenerationRequest) -> str:
+def _retrieval_plan_prompt(
+    request: UserStoryGenerationRequest,
+    requirements: list[RequirementRecord] | None = None,
+) -> str:
+    requirement_context = [
+        {
+            "canonical_id": requirement.canonical_id or requirement.requirement_id,
+            "requirement_type": requirement.requirement_type.value,
+            "category": requirement.category,
+            "text": requirement.text[:400],
+        }
+        for requirement in requirements or []
+        if requirement.story_driving or requirement.coverage_required
+    ]
     return (
         "Create source-specific retrieval queries for enterprise user-story generation. "
         "Return lexical_queries for PostgreSQL BM25/FTS, semantic_queries for Chroma, "
         "graph_entities and graph_relationships for Neo4j traversal. Do not generate SQL "
-        "or Cypher. Scope:\n"
-        + json.dumps(request.model_dump(mode="json"), indent=2)
+        "or Cypher. Use the provided requirement ledger as the complete inventory; do not "
+        "use retrieval to decide which requirements exist.\n"
+        + json.dumps(
+            {
+                "scope": request.model_dump(mode="json"),
+                "requirement_ledger": requirement_context,
+            },
+            indent=2,
+        )
     )
 
 
@@ -796,12 +1046,155 @@ def _assessment_prompt(
 
 def _generation_config(settings: Settings, task_name: str) -> GenerationConfig:
     return GenerationConfig(
-        temperature=0.1,
+        temperature=settings.hf_reason_temperature,
         max_output_tokens=settings.hf_reason_validation_max_new_tokens
         if task_name == "evidence_assessment"
         else settings.hf_reason_max_new_tokens,
         retry_count=settings.structured_generation_retry_count,
         task_name=task_name,
+    )
+
+
+def _story_driving_requirement_payloads(
+    requirements: list[RequirementRecord],
+) -> list[dict[str, Any]]:
+    return [
+        _requirement_prompt_payload(requirement)
+        for requirement in requirements
+        if requirement.story_driving or requirement.coverage_required
+    ]
+
+
+def _requirement_prompt_payload(requirement: RequirementRecord) -> dict[str, Any]:
+    return {
+        "canonical_id": requirement.canonical_id or requirement.requirement_id,
+        "requirement_type": requirement.requirement_type.value,
+        "category": requirement.category,
+        "text": requirement.text,
+        "coverage_required": requirement.coverage_required,
+        "story_driving": requirement.story_driving,
+        "source_chunk_id": requirement.chunk_id,
+        "source_page": requirement.page,
+    }
+
+
+def _batched(
+    requirements: list[RequirementRecord],
+    batch_size: int,
+) -> list[tuple[RequirementRecord, ...]]:
+    effective_size = max(1, batch_size)
+    return [
+        tuple(requirements[index : index + effective_size])
+        for index in range(0, len(requirements), effective_size)
+    ]
+
+
+def _batch_generation_prompt(
+    base_prompt: str,
+    requirements: tuple[RequirementRecord, ...],
+    *,
+    batch_index: int,
+    batch_count: int,
+) -> str:
+    if not requirements:
+        return base_prompt
+    payload = {
+        "batch_index": batch_index,
+        "batch_count": batch_count,
+        "batch_requirement_ids": [
+            requirement.canonical_id or requirement.requirement_id
+            for requirement in requirements
+        ],
+        "batch_requirements": [
+            _requirement_prompt_payload(requirement) for requirement in requirements
+        ],
+        "instruction": (
+            "Generate only stories grounded in this batch. Every coverage-required "
+            "batch requirement must be covered or explicitly deferred with a reason."
+        ),
+    }
+    return base_prompt + "\n\nBatch generation scope:\n" + json.dumps(payload, indent=2)
+
+
+def _dedupe_stories(stories: list[GeneratedUserStory]) -> list[GeneratedUserStory]:
+    deduped: dict[str, GeneratedUserStory] = {}
+    for story in stories:
+        deduped.setdefault(story.id, story)
+    return list(deduped.values())
+
+
+def _deterministic_stories_from_requirements(
+    requirements: list[RequirementRecord],
+) -> list[GeneratedUserStory]:
+    stories: list[GeneratedUserStory] = []
+    for requirement in requirements:
+        if not requirement.story_driving and not requirement.coverage_required:
+            continue
+        canonical_id = requirement.canonical_id or requirement.requirement_id
+        story_id = "US-" + stable_id("user_story", canonical_id, requirement.text)[-10:].upper()
+        category = requirement.category or requirement.requirement_type.value
+        stories.append(
+            GeneratedUserStory(
+                id=story_id,
+                title=f"Support {canonical_id}",
+                type=requirement.requirement_type.value,
+                domain=category,
+                priority="medium",
+                status="draft",
+                persona="operator",
+                user_story=(
+                    f"As an operator, I want the system to satisfy {canonical_id} "
+                    "so that documented business behavior is delivered."
+                ),
+                business_value=(
+                    "Provides traceable implementation coverage for a source "
+                    "requirement."
+                ),
+                description=requirement.text,
+                acceptance_criteria=[
+                    f"Given source requirement {canonical_id}, the implemented "
+                    "behavior is demonstrably supported by cited evidence.",
+                ],
+                non_functional_requirements=[requirement.text]
+                if requirement.requirement_type is RequirementType.NON_FUNCTIONAL
+                else [],
+                dependencies=[],
+                definition_of_ready=[
+                    "Requirement evidence is present in the Requirement Ledger.",
+                ],
+                definition_of_done=[
+                    f"Requirement {canonical_id} is covered by a validated story.",
+                ],
+                traceability={
+                    "requirement_ids": [canonical_id],
+                    "chunk_ids": [requirement.chunk_id],
+                    "source_pages": [requirement.page] if requirement.page else [],
+                    "source_documents": [requirement.source_name]
+                    if requirement.source_name
+                    else [],
+                    "generation_mode": "deterministic_ledger_fallback",
+                },
+            )
+        )
+    return stories
+
+
+def _validate_deterministic_story(story: GeneratedUserStory) -> QualityValidationReport:
+    traceability = story.traceability
+    requirement_ids = traceability.get("requirement_ids")
+    chunk_ids = traceability.get("chunk_ids")
+    messages: list[str] = []
+    if not isinstance(requirement_ids, list) or not requirement_ids:
+        messages.append("Deterministic story is missing requirement traceability.")
+    if not isinstance(chunk_ids, list) or not chunk_ids:
+        messages.append("Deterministic story is missing source chunk traceability.")
+    return QualityValidationReport(
+        status="failed" if messages else "passed",
+        messages=messages,
+        checks={
+            "requirement_traceability": not messages,
+            "deterministic_generation": True,
+        },
     )
 
 
@@ -816,11 +1209,23 @@ async def _generate_structured_or_default(
     method = getattr(reasoning_client, "generate_structured", None)
     if method is None:
         return fallback
-    return await method(
-        prompt=prompt,
-        schema=schema,
-        generation_config=generation_config,
-    )
+    try:
+        return await method(
+            prompt=prompt,
+            schema=schema,
+            generation_config=generation_config,
+        )
+    except Exception as exc:
+        if hasattr(fallback, "model_copy") and hasattr(fallback, "rationale"):
+            return fallback.model_copy(
+                update={
+                    "rationale": (
+                        f"{fallback.rationale} Structured provider fallback after "
+                        f"{type(exc).__name__}: {str(exc)[:240]}"
+                    )
+                }
+            )
+        return fallback
 
 
 def _default_retrieval_plan(request: UserStoryGenerationRequest) -> RetrievalPlan:
@@ -840,14 +1245,21 @@ def _default_retrieval_plan(request: UserStoryGenerationRequest) -> RetrievalPla
 def _ensure_non_empty_plan(
     plan: RetrievalPlan,
     request: UserStoryGenerationRequest,
+    requirements: list[RequirementRecord] | None = None,
 ) -> RetrievalPlan:
     default = _default_retrieval_plan(request)
+    target_ids = [
+        requirement.canonical_id or requirement.requirement_id
+        for requirement in requirements or []
+        if requirement.story_driving or requirement.coverage_required
+    ]
     return plan.model_copy(
         update={
             "lexical_queries": plan.lexical_queries or default.lexical_queries,
             "semantic_queries": plan.semantic_queries or default.semantic_queries,
             "graph_entities": plan.graph_entities or default.graph_entities,
             "graph_relationships": plan.graph_relationships or default.graph_relationships,
+            "target_requirement_ids": plan.target_requirement_ids or target_ids,
         }
     )
 
@@ -1006,6 +1418,56 @@ def _requirement_ids(evidence: list[EvidenceCandidate]) -> list[str]:
     return sorted({item for candidate in evidence for item in candidate.requirement_ids})
 
 
+def _story_requirement_ids_by_story(
+    stories: list[Any],
+) -> dict[str, list[str]]:
+    by_story: dict[str, list[str]] = {}
+    for story in stories:
+        story_id = str(getattr(story, "id", "") or "")
+        payload = story.model_dump(mode="json") if hasattr(story, "model_dump") else {}
+        ids: list[str] = []
+        direct = payload.get("covered_requirement_ids")
+        if isinstance(direct, list):
+            ids.extend(str(item) for item in direct if item)
+        traceability = payload.get("traceability")
+        if isinstance(traceability, dict):
+            for key in ("requirement_ids", "covered_requirement_ids", "requirements"):
+                value = traceability.get(key)
+                if isinstance(value, list):
+                    ids.extend(str(item) for item in value if item)
+                elif isinstance(value, str) and value:
+                    ids.append(value)
+        by_story[story_id] = sorted(set(ids))
+    return by_story
+
+
+def _coverage_summary_message(state: UserStoryGenerationState) -> str:
+    requirements = state.get("ledger_requirements", [])
+    matrix = state.get("coverage_payload", {})
+    rows = (
+        cast(list[dict[str, Any]], matrix.get("rows", []))
+        if isinstance(matrix, dict)
+        else []
+    )
+    story_driving = [
+        requirement
+        for requirement in requirements
+        if requirement.story_driving or requirement.coverage_required
+    ]
+    covered = [row for row in rows if row.get("coverage_status") == "covered"]
+    deferred = [row for row in rows if row.get("coverage_status") == "deferred"]
+    missing = [row for row in rows if row.get("coverage_status") == "missing"]
+    denominator = len([row for row in rows if row.get("coverage_required")])
+    percentage = (len(covered) / denominator * 100.0) if denominator else 100.0
+    return (
+        "Coverage summary: "
+        f"total ledger records={len(requirements)}, "
+        f"story-driving requirements={len(story_driving)}, "
+        f"covered={len(covered)}, deferred={len(deferred)}, missing={len(missing)}, "
+        f"coverage={percentage:.1f}%"
+    )
+
+
 def _write_invalid_model_output_if_present(
     state: UserStoryGenerationState,
     exc: Exception,
@@ -1046,6 +1508,11 @@ def _trace_payload(state: UserStoryGenerationState) -> dict[str, Any]:
         "reasoning_provider": _settings_value(state, "reasoning_provider"),
         "reasoning_model": _settings_value(state, "reasoning_model"),
         "retrieval_plan": retrieval_plan.model_dump(mode="json") if retrieval_plan else None,
+        "ledger_requirement_count": len(state.get("ledger_requirements", [])),
+        "ledger_requirement_ids": [
+            requirement.canonical_id or requirement.requirement_id
+            for requirement in state.get("ledger_requirements", [])
+        ],
         "retrieval_round": state.get("retrieval_round", 0),
         "source_responses": [
             {
@@ -1119,6 +1586,8 @@ def _trace_payload(state: UserStoryGenerationState) -> dict[str, Any]:
         else None,
         "degraded_sources": state.get("degraded_sources", []),
         "validation_retry_count": state.get("retry_count", 0),
+        "generation_fallback_reason": state.get("generation_fallback_reason"),
+        "coverage": state.get("coverage_payload", {}),
         "errors": state.get("errors", []),
     }
 

@@ -5,12 +5,12 @@
   },
   "paths": {
     "cache_dir": ".global_cache",
-    "documents_dir": "documents",
+    "documents_dir": "documents/inbox/PROJECT_1",
     "generated_dir": "generated"
   },
   "postgres": {
-    "connect_timeout_seconds": 10,
-    "command_timeout_seconds": 60,
+    "connect_timeout_seconds": 30,
+    "command_timeout_seconds": 120,
     "statement_timeout_ms": 60000,
     "pool_size": 5,
     "max_overflow": 5,
@@ -44,7 +44,10 @@
     "fusion_strategy": "preserve_current",
     "reciprocal_rank_constant": 60,
     "max_retrieval_rounds": 2,
-    "allow_degraded_retrieval": false
+    "allow_degraded_retrieval": false,
+    "answer_top_k": 10,
+    "answer_max_evidence": 20,
+    "answer_max_snippets": 8
   },
   "lexical": {
     "backend": "pg_textsearch",
@@ -100,7 +103,15 @@
     "tesseract_cmd": null
   },
   "user_stories": {
-    "schema_version": "enterprise-user-story-v1"
+    "schema_version": "enterprise-user-story-v1",
+    "requirement_batch_size": 6,
+    "max_stories_per_batch": 8,
+    "coverage_required_types": [
+      "functional",
+      "non_functional",
+      "automation_rule"
+    ],
+    "allow_partial_coverage": false
   },
   "logging": {
     "level": "INFO"

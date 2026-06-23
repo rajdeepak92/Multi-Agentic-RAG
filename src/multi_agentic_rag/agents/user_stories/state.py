@@ -13,7 +13,13 @@ from multi_agentic_rag.agents.user_stories.schemas import (
     UserStoryGenerationRequest,
     UserStoryGenerationResult,
 )
-from multi_agentic_rag.domain import EvidenceBundle, GeneratedUserStory
+from multi_agentic_rag.domain import (
+    EvidenceBundle,
+    GeneratedUserStory,
+    RequirementCoverageRecord,
+    RequirementEvidenceRecord,
+    RequirementRecord,
+)
 
 
 class UserStoryGenerationState(TypedDict, total=False):
@@ -27,6 +33,10 @@ class UserStoryGenerationState(TypedDict, total=False):
     chroma_response: SourceRetrievalResponse
     neo4j_response: SourceRetrievalResponse
     source_responses: list[SourceRetrievalResponse]
+    ledger_requirements: list[RequirementRecord]
+    ledger_evidence: list[RequirementEvidenceRecord]
+    coverage_records: list[RequirementCoverageRecord]
+    coverage_payload: dict[str, object]
     normalized_candidates: list[EvidenceCandidate]
     deduplicated_candidates: list[EvidenceCandidate]
     fused_results: list[EvidenceCandidate]
@@ -37,6 +47,7 @@ class UserStoryGenerationState(TypedDict, total=False):
     prompt: str
     raw_model_output: str
     validated_stories: list[GeneratedUserStory]
+    generation_fallback_reason: str
     artifact_paths: list[Path]
     debug_trace_path: Path
     invalid_model_output_path: Path

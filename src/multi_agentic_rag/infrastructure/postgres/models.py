@@ -6,7 +6,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -142,12 +152,16 @@ class FactModel(Base):
 
 
 class RequirementModel(Base):
-    """Requirement view derived from requirement facts and linked evidence."""
+    """Canonical requirement ledger row with primary evidence linkage."""
 
     __tablename__ = "requirements"
 
     requirement_pk: Mapped[str] = mapped_column(String, primary_key=True)
+    canonical_id: Mapped[str | None] = mapped_column(String, nullable=True)
     requirement_id: Mapped[str] = mapped_column(String, nullable=False)
+    requirement_type: Mapped[str] = mapped_column(String, nullable=False, default="functional")
+    category: Mapped[str | None] = mapped_column(String, nullable=True)
+    title: Mapped[str | None] = mapped_column(String, nullable=True)
     document_version_id: Mapped[str] = mapped_column(String, nullable=False)
     document_id: Mapped[str] = mapped_column(String, nullable=False)
     chunk_id: Mapped[str] = mapped_column(String, nullable=False)
@@ -156,9 +170,20 @@ class RequirementModel(Base):
     version: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    section_title: Mapped[str | None] = mapped_column(String, nullable=True)
+    story_driving: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    coverage_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    extraction_method: Mapped[str] = mapped_column(String, nullable=False, default="deterministic")
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    semantic_key: Mapped[str | None] = mapped_column(String, nullable=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict
     )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
         UniqueConstraint(
@@ -168,6 +193,86 @@ class RequirementModel(Base):
             "document_version_id",
             name="uq_requirement_version",
         ),
+        Index(
+            "idx_requirements_scope_type",
+            "system_name",
+            "kb_name",
+            "version",
+            "requirement_type",
+        ),
+        Index("idx_requirements_canonical", "system_name", "kb_name", "version", "canonical_id"),
+    )
+
+
+class RequirementEvidenceModel(Base):
+    """One source span supporting a canonical requirement ledger row."""
+
+    __tablename__ = "requirement_evidence"
+
+    requirement_evidence_id: Mapped[str] = mapped_column(String, primary_key=True)
+    requirement_pk: Mapped[str] = mapped_column(
+        String, ForeignKey("requirements.requirement_pk"), nullable=False
+    )
+    chunk_id: Mapped[str] = mapped_column(String, ForeignKey("chunks.chunk_id"), nullable=False)
+    document_version_id: Mapped[str] = mapped_column(
+        String, ForeignKey("document_versions.document_version_id"), nullable=False
+    )
+    source_name: Mapped[str] = mapped_column(String, nullable=False)
+    page: Mapped[int] = mapped_column(Integer, nullable=False)
+    section_title: Mapped[str | None] = mapped_column(String, nullable=True)
+    start_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    end_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    evidence_text: Mapped[str] = mapped_column(Text, nullable=False)
+    extraction_method: Mapped[str] = mapped_column(String, nullable=False, default="deterministic")
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "requirement_pk",
+            "chunk_id",
+            "start_offset",
+            "end_offset",
+            name="uq_requirement_evidence_span",
+        ),
+        Index("idx_requirement_evidence_requirement", "requirement_pk"),
+        Index("idx_requirement_evidence_version", "document_version_id"),
+    )
+
+
+class RequirementCoverageModel(Base):
+    """Generated user-story coverage state for one requirement."""
+
+    __tablename__ = "requirement_coverage"
+
+    coverage_id: Mapped[str] = mapped_column(String, primary_key=True)
+    requirement_pk: Mapped[str] = mapped_column(
+        String, ForeignKey("requirements.requirement_pk"), nullable=False
+    )
+    canonical_id: Mapped[str] = mapped_column(String, nullable=False)
+    story_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    coverage_status: Mapped[str] = mapped_column(String, nullable=False)
+    deferred_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    validation_status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    source_chunk_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    source_pages: Mapped[list[int]] = mapped_column(JSONB, nullable=False, default=list)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "requirement_pk",
+            "story_id",
+            name="uq_requirement_coverage_story",
+        ),
+        Index("idx_requirement_coverage_status", "coverage_status"),
     )
 
 

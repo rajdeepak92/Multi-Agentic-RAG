@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Protocol
 
-from multi_agentic_rag.domain import RetrievalResult
+from multi_agentic_rag.domain import RankedRetrievalResult, RetrievalResult
 from multi_agentic_rag.retrieval.evidence import rank_retrieval_results
 from multi_agentic_rag.retrieval.reranker import NoOpRerankingService, RerankingService
 
@@ -120,8 +120,22 @@ class HybridKnowledgeRetriever:
         ranked_lists = list(await asyncio.gather(*calls))
         fused = self._fuse(ranked_lists)
         reranked = self.reranker.rerank(query_text, fused[:top_k])
-        ranked: list[RetrievalResult] = list(rank_retrieval_results(reranked))
-        return ranked
+        ranked: list[RankedRetrievalResult] = list(rank_retrieval_results(reranked))
+        ranked = [
+            result.model_copy(
+                update={
+                    "metadata": {
+                        **result.metadata,
+                        "final_rank": result.rank,
+                        "final_score": result.score,
+                    }
+                }
+            )
+            for result in ranked
+        ]
+        results: list[RetrievalResult] = []
+        results.extend(ranked)
+        return results
 
     def _fuse(self, ranked_lists: list[list[RetrievalResult]]) -> list[RetrievalResult]:
         scores: dict[str, float] = {}

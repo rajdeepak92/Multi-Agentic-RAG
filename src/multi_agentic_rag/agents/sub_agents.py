@@ -19,6 +19,8 @@ from multi_agentic_rag.domain import (
     IngestionRunRecord,
     IngestionRunStatus,
     PageText,
+    RequirementEvidenceRecord,
+    RequirementRecord,
     SystemRecord,
 )
 from multi_agentic_rag.exceptions import IngestionError
@@ -188,6 +190,8 @@ class GraphRepository(Protocol):
         chunks: list[ChunkRecord],
         facts: list[FactRecord],
         deltas: list[DeltaRecord],
+        requirements: list[RequirementRecord] | None = None,
+        requirement_evidence: list[RequirementEvidenceRecord] | None = None,
     ) -> None:
         """Project graph state.
 
@@ -816,6 +820,8 @@ class Neo4jGraphAgent:
         chunks: list[ChunkRecord],
         facts: list[FactRecord],
         deltas: list[DeltaRecord],
+        requirements: list[RequirementRecord] | None = None,
+        requirement_evidence: list[RequirementEvidenceRecord] | None = None,
     ) -> None:
         """Project graph records.
 
@@ -825,6 +831,8 @@ class Neo4jGraphAgent:
             chunks: Chunk nodes to project.
             facts: Fact nodes and requirement/entity links to project.
             deltas: Delta nodes and version links to project.
+            requirements: Canonical ledger requirements to project.
+            requirement_evidence: One-to-many evidence spans for requirements.
         """
 
         self.repository.upsert_graph(
@@ -833,6 +841,8 @@ class Neo4jGraphAgent:
             chunks=chunks,
             facts=facts,
             deltas=deltas,
+            requirements=requirements or [],
+            requirement_evidence=requirement_evidence or [],
         )
 
     def check(self) -> tuple[bool, str]:

@@ -17,6 +17,8 @@ from multi_agentic_rag.domain import (
     FactRecord,
     IngestResult,
     PageText,
+    RequirementEvidenceRecord,
+    RequirementRecord,
 )
 
 
@@ -42,6 +44,8 @@ class IngestionState(TypedDict, total=False):
     old_chunks: list[ChunkRecord]
     facts: list[FactRecord]
     old_facts: list[FactRecord]
+    requirements: list[RequirementRecord]
+    requirement_evidence: list[RequirementEvidenceRecord]
     deltas: list[DeltaRecord]
     supersedes_version_id: str | None
     manifest_path: Path

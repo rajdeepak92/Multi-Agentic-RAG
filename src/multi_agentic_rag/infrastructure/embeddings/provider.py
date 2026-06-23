@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
+import warnings
 from importlib import import_module
+from pathlib import Path
 from typing import Any, Protocol
 
 from multi_agentic_rag.config import Settings
@@ -149,6 +152,7 @@ class SentenceTransformerEmbeddingProvider:
         *,
         hf_token: str | None = None,
         device: str = "auto",
+        cache_dir: Path | None = None,
     ) -> None:
         """Initialize a lazily loaded sentence-transformer provider.
 
@@ -162,16 +166,24 @@ class SentenceTransformerEmbeddingProvider:
         self.model = model
         self.hf_token = hf_token
         self.device = device
+        self.cache_dir = cache_dir
         self._model: Any | None = None
 
     def _load(self) -> Any:
         if self._model is None:
             _configure_hf_token(self.hf_token)
-            module = import_module("sentence_transformers")
-            kwargs: dict[str, str | None] = {"token": self.hf_token}
-            if not _uses_auto_device(self.device):
-                kwargs["device"] = self.device
-            self._model = module.SentenceTransformer(self.model, **kwargs)
+            with warnings.catch_warnings(), _suppress_sentence_transformers_cache_warning():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"The Transformer `cache_dir` argument is deprecated.*",
+                )
+                module = import_module("sentence_transformers")
+                kwargs: dict[str, Any] = {"token": self.hf_token}
+                if not _uses_auto_device(self.device):
+                    kwargs["device"] = self.device
+                if self.cache_dir is not None:
+                    kwargs["cache_folder"] = str(self.cache_dir)
+                self._model = module.SentenceTransformer(self.model, **kwargs)
         return self._model
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -225,6 +237,7 @@ def select_embedding_provider(settings: Settings) -> EmbeddingProvider:
             settings.embedding_model,
             hf_token=settings.hf_token,
             device=settings.embedding_device,
+            cache_dir=settings.sentence_transformers_home,
         )
     return HashEmbeddingProvider(
         dimensions=settings.embedding_dimensions,
@@ -247,3 +260,31 @@ def _configure_hf_token(hf_token: str | None) -> None:
 
 def _uses_auto_device(device: str) -> bool:
     return device.strip().lower() == "auto"
+
+
+class _SentenceTransformerCacheWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "The Transformer `cache_dir` argument is deprecated." not in record.getMessage()
+
+
+class _suppress_sentence_transformers_cache_warning:
+    """Temporarily hide the known internal cache_dir migration warning."""
+
+    _LOGGER_NAMES = (
+        "sentence_transformers.util.decorators",
+        "sentence_transformers",
+    )
+
+    def __init__(self) -> None:
+        self._filters: list[tuple[logging.Logger, logging.Filter]] = []
+
+    def __enter__(self) -> None:
+        for name in self._LOGGER_NAMES:
+            logger = logging.getLogger(name)
+            warning_filter = _SentenceTransformerCacheWarningFilter()
+            logger.addFilter(warning_filter)
+            self._filters.append((logger, warning_filter))
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        for logger, warning_filter in self._filters:
+            logger.removeFilter(warning_filter)

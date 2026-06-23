@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import json
 import os
 import shutil
 import stat
 import subprocess
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
@@ -29,9 +31,10 @@ from multi_agentic_rag.agents import (
     LangGraphWorkflowRunner,
     WorkflowPlannerAgent,
 )
+from multi_agentic_rag.agents.ingestion import IngestionRequest
 from multi_agentic_rag.app import build_application
 from multi_agentic_rag.config import Settings, get_settings, reload_settings
-from multi_agentic_rag.domain import TaskIntent, TaskIntentType
+from multi_agentic_rag.domain import RequirementType, TaskIntent, TaskIntentType
 from multi_agentic_rag.exceptions import MultiAgenticRagError
 from multi_agentic_rag.infrastructure.chroma import ChromaVectorRepository
 from multi_agentic_rag.infrastructure.neo4j import Neo4jGraphRepository
@@ -45,6 +48,10 @@ from multi_agentic_rag.llm import (
     build_reasoning_client,
     format_hf_reasoning_preflight_error,
     inspect_hf_reasoning_environment,
+)
+from multi_agentic_rag.requirements_ledger import (
+    render_requirement_inventory_markdown,
+    requirement_inventory_payload,
 )
 from multi_agentic_rag.retrieval import (
     BM25Retriever,
@@ -138,21 +145,27 @@ def ingest(
 
     try:
         settings = get_settings()
+        application = build_application(
+            settings=settings,
+            model_selector=model,
+            review_facts=review_facts,
+        )
         result = asyncio.run(
-            _build_ingestion_agent(
-                model,
-                settings=settings,
-                review_facts=review_facts,
-            ).ingest(
-                document_path,
-                kb,
-                system=system,
-                version=version,
+            application.ingest(
+                IngestionRequest(
+                    document_path=document_path,
+                    system=system,
+                    version=version,
+                    kb=kb,
+                )
             )
         )
     except MultiAgenticRagError as exc:
         _print_cli_error(exc)
-    _print_ingest_result(result.model_dump())
+    if result.ingest_result is None:
+        console.print("[red]FAIL[/red] Ingestion graph did not return an ingest result.")
+        raise typer.Exit(code=1)
+    _print_ingest_result(result.ingest_result.model_dump())
 
 
 @app.command("ingest-directory")
@@ -519,7 +532,13 @@ def retrieve(
         console.print("[yellow]No evidence found.[/yellow]")
         return
     table = Table(title="Retrieval Results")
-    table.add_column("Score")
+    table.add_column("Rank")
+    table.add_column("Final")
+    table.add_column("Lexical")
+    table.add_column("Vector")
+    table.add_column("Graph")
+    table.add_column("Fusion")
+    table.add_column("Reranker")
     table.add_column("Version")
     table.add_column("Source")
     table.add_column("Page")
@@ -527,7 +546,13 @@ def retrieve(
     table.add_column("Text")
     for result in results:
         table.add_row(
-            f"{result.score:.4f}",
+            str(result.metadata.get("final_rank") or getattr(result, "rank", "")),
+            f"{_score_value(result.metadata.get('final_score'), result.score)}",
+            _score_value(result.metadata.get("lexical_score")),
+            _score_value(result.metadata.get("vector_score")),
+            _score_value(result.metadata.get("graph_score")),
+            _score_value(result.metadata.get("fusion_score")),
+            _score_value(result.metadata.get("reranker_score")),
             result.version,
             result.source_name,
             str(result.page),
@@ -545,6 +570,16 @@ def ask(
     system: Annotated[str, typer.Option("--system", help="System name.")],
     kb: Annotated[str, typer.Option("--kb", help="Knowledge base name or context.")] = "default",
     version: Annotated[str | None, typer.Option("--version", help="Optional version.")] = None,
+    top_k: Annotated[
+        int | None,
+        typer.Option(
+            "--top-k",
+            help=(
+                "Semantic QA retrieval limit. Exhaustive ledger queries ignore "
+                "this for discovery."
+            ),
+        ),
+    ] = None,
     model: Annotated[
         ReasoningModelSelector | None,
         typer.Option("--model", help=MODEL_OPTION_HELP),
@@ -559,11 +594,151 @@ def ask(
         version=version,
         confidence=1.0,
     )
-    result = asyncio.run(_build_answer_agent(model).run(intent, question=question))
+    result = asyncio.run(_build_answer_agent(model).run(intent, question=question, top_k=top_k))
     if result.status.value in {"failed", "blocked"}:
         _print_agent_failure(result.messages)
     for message in result.messages:
-        console.print(message)
+        console.print(message, markup=False)
+
+
+@app.command("requirements")
+def requirements(
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str, typer.Option("--version", help="Document version.")],
+    kb: Annotated[str, typer.Option("--kb", help="Knowledge base name or context.")] = "default",
+    requirement_type: Annotated[
+        str | None,
+        typer.Option("--type", help="Requirement type filter."),
+    ] = None,
+    category: Annotated[
+        str | None,
+        typer.Option("--category", help="Category filter."),
+    ] = None,
+    coverage_required: Annotated[
+        bool | None,
+        typer.Option("--coverage-required/--coverage-not-required", help="Coverage filter."),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", help="Output format: table, json, or markdown."),
+    ] = "table",
+    output: Annotated[Path | None, typer.Option("--output", help="Optional output path.")] = None,
+) -> None:
+    """List exact requirement-ledger records for a version scope."""
+
+    settings = get_settings()
+    repo = PostgresKnowledgeRepository.from_settings(settings)
+    try:
+        type_filter = (
+            {RequirementType(requirement_type)}
+            if requirement_type
+            else None
+        )
+    except ValueError as exc:
+        console.print(f"[red]FAIL[/red] Unsupported requirement type: {requirement_type}")
+        raise typer.Exit(code=1) from exc
+    async def load_payload() -> dict[str, Any]:
+        records = await repo.list_requirements_for_scope(
+            system_name=system,
+            kb_name=kb,
+            version=version,
+            requirement_types=type_filter,
+            coverage_required=coverage_required,
+        )
+        if category:
+            records = [
+                record
+                for record in records
+                if (record.category or "").lower() == category.lower()
+            ]
+        evidence = await repo.list_requirement_evidence(
+            requirement_pks=[
+                record.requirement_pk for record in records if record.requirement_pk
+            ]
+        )
+        return requirement_inventory_payload(
+            records,
+            evidence,
+            system_name=system,
+            kb_name=kb,
+            version=version,
+        )
+
+    payload = asyncio.run(load_payload())
+    _emit_requirements_payload(payload, output_format=output_format, output=output)
+
+
+@app.command("requirements-audit")
+def requirements_audit(
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str, typer.Option("--version", help="Document version.")],
+    kb: Annotated[str, typer.Option("--kb", help="Knowledge base name or context.")] = "default",
+) -> None:
+    """Audit requirement-ledger completeness and coverage readiness."""
+
+    settings = get_settings()
+    repo = PostgresKnowledgeRepository.from_settings(settings)
+    async def load_audit() -> tuple[list[Any], list[Any], list[Any]]:
+        records = await repo.list_requirements_for_scope(
+            system_name=system,
+            kb_name=kb,
+            version=version,
+            active_only=True,
+        )
+        evidence = await repo.list_requirement_evidence(
+            requirement_pks=[
+                record.requirement_pk for record in records if record.requirement_pk
+            ]
+        )
+        uncovered = await repo.list_uncovered_requirements(
+            system_name=system,
+            kb_name=kb,
+            version=version,
+        )
+        return records, evidence, uncovered
+
+    records, evidence, uncovered = asyncio.run(load_audit())
+    _print_requirements_audit(records, evidence, uncovered)
+
+
+@app.command("requirements-rebuild")
+def requirements_rebuild(
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str, typer.Option("--version", help="Document version.")],
+    kb: Annotated[str, typer.Option("--kb", help="Knowledge base name or context.")] = "default",
+) -> None:
+    """Rebuild the requirement ledger from stored chunks without deleting stores."""
+
+    settings = get_settings()
+    repo = PostgresKnowledgeRepository.from_settings(settings)
+    async def rebuild_and_load() -> tuple[int, int, list[Any], list[Any]]:
+        requirement_count, evidence_count = await repo.rebuild_requirement_ledger_for_scope(
+            system_name=system,
+            kb_name=kb,
+            version=version,
+        )
+        records = await repo.list_requirements_for_scope(
+            system_name=system,
+            kb_name=kb,
+            version=version,
+        )
+        evidence = await repo.list_requirement_evidence(
+            requirement_pks=[
+                record.requirement_pk for record in records if record.requirement_pk
+            ]
+        )
+        return requirement_count, evidence_count, records, evidence
+
+    requirement_count, evidence_count, records, evidence = asyncio.run(rebuild_and_load())
+    graph = Neo4jGraphRepository(settings)
+    try:
+        graph.upsert_requirement_ledger(requirements=records, requirement_evidence=evidence)
+    finally:
+        graph.close()
+    console.print(
+        "[green]PASS[/green] rebuilt requirement ledger: "
+        f"requirements={requirement_count}, evidence_spans={evidence_count}"
+    )
 
 
 @app.command("user-stories")
@@ -588,6 +763,8 @@ def user_stories(
     result = asyncio.run(_build_user_story_agent(model).run(intent))
     if result.status.value != "succeeded":
         _print_agent_failure(result.messages)
+    for message in result.messages:
+        console.print(message, markup=False)
     for path in result.artifact_paths:
         console.print(f"artifact: {path}")
 
@@ -844,19 +1021,29 @@ async def _ingest_many(
     review_facts: bool,
 ) -> list[tuple[Path, dict[str, Any] | None, str | None]]:
     settings = get_settings()
-    agent = _build_ingestion_agent(
-        model,
+    application = build_application(
         settings=settings,
+        model_selector=model,
         review_facts=review_facts,
     )
     results: list[tuple[Path, dict[str, Any] | None, str | None]] = []
     for path in files:
         try:
-            result = await agent.ingest(path, kb, system=system, version=version)
+            result = await application.ingest(
+                IngestionRequest(
+                    document_path=path,
+                    system=system,
+                    version=version,
+                    kb=kb,
+                )
+            )
         except MultiAgenticRagError as exc:
             results.append((path, None, str(exc)))
             continue
-        results.append((path, result.model_dump(), None))
+        if result.ingest_result is None:
+            results.append((path, None, "Ingestion graph did not return an ingest result."))
+            continue
+        results.append((path, result.ingest_result.model_dump(), None))
     return results
 
 
@@ -973,6 +1160,8 @@ def _build_answer_agent(
     return AgentRetrieveAnswer(
         _build_retriever(settings),
         reasoning_client,
+        settings=settings,
+        requirement_repository=PostgresKnowledgeRepository.from_settings(settings),
     )
 
 
@@ -1020,7 +1209,12 @@ def _build_workflow_runner(
         planner=WorkflowPlannerAgent(reasoning_client),
         validator=FlowValidatorAgent(),
         ingest_agent=AgentIngestDocument(ingestion_agent),
-        answer_agent=AgentRetrieveAnswer(_build_retriever(settings), reasoning_client),
+        answer_agent=AgentRetrieveAnswer(
+            _build_retriever(settings),
+            reasoning_client,
+            settings=settings,
+            requirement_repository=PostgresKnowledgeRepository.from_settings(settings),
+        ),
         user_story_agent=_build_user_story_agent(
             model_selector,
             settings=settings,
@@ -1036,6 +1230,16 @@ def _print_agent_failure(messages: list[str]) -> None:
     if hint := _quota_hint_for_message(detail):
         console.print(f"[yellow]HINT[/yellow] {hint}")
     raise typer.Exit(code=1)
+
+
+def _score_value(value: object, fallback: float | None = None) -> str:
+    candidate: Any = value if value is not None else fallback
+    if candidate is None:
+        return "-"
+    try:
+        return f"{float(candidate):.4f}"
+    except (TypeError, ValueError):
+        return "-"
 
 
 def _print_cli_error(exc: MultiAgenticRagError) -> None:
@@ -1058,6 +1262,7 @@ def _quota_hint_for_message(message: str) -> str | None:
 
 def _print_graph_paths(results: list[Any]) -> None:
     printed = False
+    seen: set[tuple[str, str, str]] = set()
     for result in results:
         matches = result.metadata.get("graph_matches") or []
         if not matches:
@@ -1070,10 +1275,119 @@ def _print_graph_paths(results: list[Any]) -> None:
             reason = str(match.get("reason") or "graph match")
             path = " -> ".join(str(part) for part in match.get("path") or [])
             terms = ", ".join(str(term) for term in match.get("matched_terms") or [])
+            key = (str(result.chunk_id), reason, path)
+            if key in seen:
+                continue
+            seen.add(key)
             suffix = f" [{terms}]" if terms else ""
             console.print(f"- {reason}: {path}{suffix}")
     if not printed:
         console.print("\n[yellow]No graph paths attached to these results.[/yellow]")
+
+
+def _emit_requirements_payload(
+    payload: dict[str, Any],
+    *,
+    output_format: str,
+    output: Path | None,
+) -> None:
+    normalized = output_format.lower()
+    if normalized == "json":
+        content = json.dumps(payload, indent=2)
+    elif normalized == "markdown":
+        content = render_requirement_inventory_markdown(payload)
+    elif normalized == "table":
+        table = Table(title="Requirement Ledger")
+        table.add_column("Type")
+        table.add_column("Category")
+        table.add_column("ID")
+        table.add_column("Page")
+        table.add_column("Text")
+        for item in payload["requirements"]:
+            evidence = item.get("evidence", [])
+            pages = sorted({str(ev.get("page")) for ev in evidence if ev.get("page")})
+            table.add_row(
+                str(item["requirement_type"]),
+                str(item.get("category") or ""),
+                str(item["canonical_id"]),
+                ",".join(pages),
+                str(item["text"])[:140],
+            )
+        if output:
+            content = render_requirement_inventory_markdown(payload)
+        else:
+            console.print(table)
+            return
+    else:
+        console.print("[red]FAIL[/red] --format must be table, json, or markdown.")
+        raise typer.Exit(code=1)
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(content, encoding="utf-8")
+        console.print(f"artifact: {output}")
+    else:
+        console.print(content)
+
+
+def _print_requirements_audit(
+    records: list[Any],
+    evidence: list[Any],
+    uncovered: list[Any],
+) -> None:
+    counts = Counter(record.requirement_type.value for record in records)
+    evidence_by_requirement = Counter(item.requirement_pk for item in evidence)
+    duplicate_ids = [
+        requirement_id
+        for requirement_id, count in Counter(
+            record.canonical_id or record.requirement_id for record in records
+        ).items()
+        if count > 1
+    ]
+    without_evidence = [
+        record.canonical_id or record.requirement_id
+        for record in records
+        if not evidence_by_requirement.get(record.requirement_pk)
+    ]
+    table = Table(title="Requirement Ledger Audit")
+    table.add_column("Check")
+    table.add_column("Result")
+    table.add_row("total ledger records", str(len(records)))
+    for requirement_type, count in sorted(counts.items()):
+        table.add_row(f"count:{requirement_type}", str(count))
+    table.add_row("duplicate IDs", ", ".join(duplicate_ids) if duplicate_ids else "none")
+    table.add_row(
+        "requirements without evidence",
+        ", ".join(without_evidence[:20]) if without_evidence else "none",
+    )
+    table.add_row(
+        "story-driving requirements without stories",
+        ", ".join(
+            (record.canonical_id or record.requirement_id)
+            for record in uncovered[:20]
+        )
+        if uncovered
+        else "none",
+    )
+    unsupported = [
+        record.canonical_id or record.requirement_id
+        for record in records
+        if not record.text or not record.requirement_type
+    ]
+    table.add_row(
+        "unsupported or malformed extraction records",
+        ", ".join(unsupported[:20]) if unsupported else "none",
+    )
+    acceptance_without_links = [
+        record.canonical_id or record.requirement_id
+        for record in records
+        if record.requirement_type == RequirementType.ACCEPTANCE_CRITERION
+        and not record.metadata.get("linked_requirement_ids")
+    ]
+    table.add_row(
+        "acceptance criteria without links",
+        ", ".join(acceptance_without_links[:20]) if acceptance_without_links else "none",
+    )
+    console.print(table)
 
 
 def _print_check(service: str, status: bool, detail: str) -> None:
