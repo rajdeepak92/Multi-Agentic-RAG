@@ -168,10 +168,13 @@ def _env_defaults(
     postgres = _dict(config.get("postgres"))
     neo4j = _dict(config.get("neo4j"))
     chroma = _dict(config.get("chroma"))
+    azure_openai = _dict(config.get("azure_openai"))
     embeddings = _dict(config.get("embeddings"))
     reranking = _dict(config.get("reranking"))
     reasoning = _dict(config.get("reasoning"))
     retrieval = _dict(config.get("retrieval"))
+    facts = _dict(config.get("facts"))
+    quality = _dict(config.get("quality"))
     ingestion = _dict(config.get("ingestion"))
     user_stories = _dict(config.get("user_stories"))
     lexical = _dict(config.get("lexical"))
@@ -224,16 +227,74 @@ def _env_defaults(
         "BM25_BACKEND": _string_or_none(lexical.get("backend")),
         "EMBEDDING_PROVIDER": _string_or_none(embeddings.get("provider")),
         "EMBEDDING_MODEL": _string_or_none(embeddings.get("model")),
+        "EMBEDDING_DEPLOYMENT": _string_or_none(embeddings.get("deployment")),
         "EMBEDDING_MODEL_REVISION": _string_or_none(embeddings.get("revision")),
-        "EMBEDDING_DIMENSIONS": _string_or_none(embeddings.get("dimension")),
+        "EMBEDDING_DIMENSIONS": _string_or_none(
+            embeddings.get("dimension", embeddings.get("expected_dimension"))
+        ),
+        "EMBEDDING_EXPECTED_DIMENSION": _string_or_none(
+            embeddings.get("expected_dimension")
+        ),
         "EMBEDDING_DEVICE": _string_or_none(embeddings.get("device")),
         "EMBEDDING_NORMALIZE": _string_or_none(embeddings.get("normalize")),
         "EMBEDDING_DISTANCE_METRIC": _string_or_none(embeddings.get("distance_metric")),
         "EMBEDDING_PROMPT_PROFILE": _string_or_none(embeddings.get("prompt_profile")),
+        "EMBEDDING_BATCH_SIZE": _string_or_none(embeddings.get("batch_size")),
         "RERANKER_PROVIDER": _string_or_none(reranking.get("provider")),
         "RERANKER_MODEL": _string_or_none(reranking.get("model")),
+        "RERANKER_DEPLOYMENT": _string_or_none(reranking.get("deployment")),
         "RERANKER_DEVICE": _string_or_none(reranking.get("device")),
+        "RERANKER_STRATEGY": _string_or_none(reranking.get("strategy")),
+        "RERANKER_CANDIDATE_TOP_K": _string_or_none(reranking.get("candidate_top_k")),
+        "RERANKER_TOP_N": _string_or_none(reranking.get("top_n")),
+        "RERANKER_TEMPERATURE": _string_or_none(reranking.get("temperature")),
+        "RERANKER_REQUIRE_CANDIDATE_ID_INTEGRITY": _string_or_none(
+            reranking.get("require_candidate_id_integrity")
+        ),
+        "RERANKER_REQUIRE_ANSWERABILITY_ASSESSMENT": _string_or_none(
+            reranking.get("require_answerability_assessment")
+        ),
+        "AZURE_OPENAI_ENDPOINT_ENV": _string_or_none(azure_openai.get("endpoint_env")),
+        "AZURE_OPENAI_API_KEY_ENV": _string_or_none(azure_openai.get("api_key_env")),
+        "AZURE_OPENAI_API_VERSION_ENV": _string_or_none(azure_openai.get("api_version_env")),
+        "AZURE_OPENAI_BASE_URL": _string_or_none(azure_openai.get("base_url")),
+        "AZURE_OPENAI_GENERATION_DEPLOYMENT": _string_or_none(
+            azure_openai.get("generation_deployment")
+        ),
+        "AZURE_OPENAI_ANSWER_DEPLOYMENT": _string_or_none(
+            azure_openai.get("answer_deployment")
+        ),
+        "AZURE_OPENAI_ANALYSIS_DEPLOYMENT": _string_or_none(
+            azure_openai.get("analysis_deployment")
+        ),
+        "AZURE_OPENAI_UTILITY_DEPLOYMENT": _string_or_none(
+            azure_openai.get("utility_deployment")
+        ),
+        "AZURE_OPENAI_VALIDATION_DEPLOYMENT": _string_or_none(
+            azure_openai.get("validation_deployment")
+        ),
+        "AZURE_OPENAI_RERANKER_DEPLOYMENT": _string_or_none(
+            azure_openai.get("reranker_deployment")
+        ),
+        "AZURE_OPENAI_EMBEDDING_DEPLOYMENT": _string_or_none(
+            azure_openai.get("embedding_deployment")
+        ),
+        "AZURE_OPENAI_REQUEST_TIMEOUT_SECONDS": _string_or_none(
+            azure_openai.get("request_timeout_seconds")
+        ),
+        "AZURE_OPENAI_MAX_RETRIES": _string_or_none(azure_openai.get("max_retries")),
+        "AZURE_OPENAI_RETRY_BACKOFF_SECONDS": _string_or_none(
+            azure_openai.get("retry_backoff_seconds")
+        ),
+        "AZURE_OPENAI_MAX_CONCURRENT_REQUESTS": _string_or_none(
+            azure_openai.get("max_concurrent_requests")
+        ),
+        "AZURE_OPENAI_CAPABILITY_CACHE_TTL_SECONDS": _string_or_none(
+            azure_openai.get("capability_cache_ttl_seconds")
+        ),
         "REASONING_PROVIDER": _string_or_none(reasoning.get("provider")),
+        "REASONING_TEMPERATURE": _string_or_none(reasoning.get("temperature")),
+        "REASONING_STORE_RESPONSES": _string_or_none(reasoning.get("store_responses")),
         "OPENAI_REASONING_MODEL": _string_or_none(reasoning.get("openai_model")),
         "OPENAI_REASONING_EFFORT": _string_or_none(reasoning.get("openai_effort")),
         "OPENAI_STORE_RESPONSES": _string_or_none(reasoning.get("openai_store_responses")),
@@ -256,6 +317,33 @@ def _env_defaults(
         ),
         "GEMINI_REASONING_MODEL": _string_or_none(reasoning.get("gemini_model")),
         "STRUCTURED_GENERATION_RETRY_COUNT": _string_or_none(reasoning.get("structured_retries")),
+        "REASONING_ANALYSIS_MAX_OUTPUT_TOKENS": _string_or_none(
+            reasoning.get("analysis_max_output_tokens")
+        ),
+        "REASONING_GENERATION_MAX_OUTPUT_TOKENS": _string_or_none(
+            reasoning.get("generation_max_output_tokens")
+        ),
+        "REASONING_VALIDATION_MAX_OUTPUT_TOKENS": _string_or_none(
+            reasoning.get("validation_max_output_tokens")
+        ),
+        "REASONING_ANSWER_MAX_OUTPUT_TOKENS": _string_or_none(
+            reasoning.get("answer_max_output_tokens")
+        ),
+        "REASONING_FACT_REVIEW_MAX_OUTPUT_TOKENS": _string_or_none(
+            reasoning.get("fact_review_max_output_tokens")
+        ),
+        "REASONING_RERANKING_MAX_OUTPUT_TOKENS": _string_or_none(
+            reasoning.get("reranking_max_output_tokens")
+        ),
+        "REASONING_FAIL_ON_TRUNCATION": _string_or_none(
+            reasoning.get("fail_on_truncation")
+        ),
+        "REASONING_FAIL_ON_SCHEMA_ERROR": _string_or_none(
+            reasoning.get("fail_on_schema_error")
+        ),
+        "REASONING_FAIL_ON_EMPTY_OUTPUT": _string_or_none(
+            reasoning.get("fail_on_empty_output")
+        ),
         "RETRIEVAL_REQUIRED_SOURCES": _string_or_none(retrieval.get("required_sources")),
         "RETRIEVAL_LEXICAL_TOP_K": _string_or_none(retrieval.get("lexical_top_k")),
         "RETRIEVAL_VECTOR_TOP_K": _string_or_none(retrieval.get("vector_top_k")),
@@ -279,9 +367,24 @@ def _env_defaults(
         "RETRIEVAL_ANSWER_MAX_SNIPPETS": _string_or_none(
             retrieval.get("answer_max_snippets")
         ),
+        "RETRIEVAL_MINIMUM_EVIDENCE_COUNT": _string_or_none(
+            retrieval.get("minimum_evidence_count")
+        ),
+        "RETRIEVAL_MINIMUM_TARGET_REQUIREMENT_COVERAGE": _string_or_none(
+            retrieval.get("minimum_target_requirement_coverage")
+        ),
+        "RETRIEVAL_REQUIRE_QUALITY_ASSESSMENT": _string_or_none(
+            retrieval.get("require_quality_assessment")
+        ),
         "USER_STORY_SCHEMA_VERSION": _string_or_none(user_stories.get("schema_version")),
+        "USER_STORY_MINIMUM_GROUP_SIZE": _string_or_none(
+            user_stories.get("minimum_group_size")
+        ),
+        "USER_STORY_MAXIMUM_GROUP_SIZE": _string_or_none(
+            user_stories.get("maximum_group_size")
+        ),
         "USER_STORY_REQUIREMENT_BATCH_SIZE": _string_or_none(
-            user_stories.get("requirement_batch_size")
+            user_stories.get("requirement_batch_size", user_stories.get("maximum_group_size"))
         ),
         "USER_STORY_MAX_STORIES_PER_BATCH": _string_or_none(
             user_stories.get("max_stories_per_batch")
@@ -291,6 +394,82 @@ def _env_defaults(
         ),
         "USER_STORY_ALLOW_PARTIAL_COVERAGE": _string_or_none(
             user_stories.get("allow_partial_coverage")
+        ),
+        "USER_STORY_ALLOW_GENERATION_FALLBACK": _string_or_none(
+            user_stories.get("allow_generation_fallback")
+        ),
+        "USER_STORY_GROUP_RELATED_REQUIREMENTS": _string_or_none(
+            user_stories.get("group_related_requirements")
+        ),
+        "USER_STORY_MINIMUM_ACCEPTANCE_CRITERIA": _string_or_none(
+            user_stories.get("minimum_acceptance_criteria")
+        ),
+        "USER_STORY_MAXIMUM_ACCEPTANCE_CRITERIA": _string_or_none(
+            user_stories.get("maximum_acceptance_criteria")
+        ),
+        "USER_STORY_MINIMUM_QUALITY_SCORE": _string_or_none(
+            user_stories.get("minimum_quality_score")
+        ),
+        "USER_STORY_MINIMUM_TRACEABILITY_SCORE": _string_or_none(
+            user_stories.get("minimum_traceability_score")
+        ),
+        "USER_STORY_ATTACH_ACCEPTANCE_CRITERIA": _string_or_none(
+            user_stories.get("attach_acceptance_criteria")
+        ),
+        "USER_STORY_ATTACH_DEFINITION_OF_DONE": _string_or_none(
+            user_stories.get("attach_definition_of_done")
+        ),
+        "USER_STORY_ATTACH_NON_FUNCTIONAL_REQUIREMENTS": _string_or_none(
+            user_stories.get("attach_non_functional_requirements")
+        ),
+        "USER_STORY_ATTACH_SCOPE_CONSTRAINTS": _string_or_none(
+            user_stories.get("attach_scope_constraints")
+        ),
+        "USER_STORY_ATTACH_THRESHOLD_FACTS": _string_or_none(
+            user_stories.get("attach_threshold_facts")
+        ),
+        "USER_STORY_ATTACH_AUTOMATION_RULES": _string_or_none(
+            user_stories.get("attach_automation_rules")
+        ),
+        "USER_STORY_REQUIRE_EVIDENCE_EXCERPTS": _string_or_none(
+            user_stories.get("require_evidence_excerpts")
+        ),
+        "USER_STORY_REQUIRE_INDEPENDENT_VALIDATION": _string_or_none(
+            user_stories.get("require_independent_validation")
+        ),
+        "USER_STORY_FAIL_ON_GENERIC_LANGUAGE": _string_or_none(
+            user_stories.get("fail_on_generic_language")
+        ),
+        "USER_STORY_REQUIRE_HUMAN_APPROVAL_BEFORE_PUBLISHED_STATUS": _string_or_none(
+            user_stories.get("require_human_approval_before_published_status")
+        ),
+        "FACT_SEMANTIC_REVIEW_ENABLED": _string_or_none(
+            facts.get("semantic_review_enabled")
+        ),
+        "FACT_MINIMUM_CONFIDENCE": _string_or_none(facts.get("minimum_confidence")),
+        "FACT_REQUIRE_EXACT_EVIDENCE": _string_or_none(facts.get("require_exact_evidence")),
+        "FACT_REQUIRE_UNIT_VALIDATION": _string_or_none(facts.get("require_unit_validation")),
+        "FACT_REJECT_UNSUPPORTED_FACTS": _string_or_none(
+            facts.get("reject_unsupported_facts")
+        ),
+        "FACT_REJECT_CONFLICTING_FACTS": _string_or_none(
+            facts.get("reject_conflicting_facts")
+        ),
+        "FACT_REJECT_DUPLICATE_FACTS": _string_or_none(facts.get("reject_duplicate_facts")),
+        "FACT_REQUIRE_HUMAN_APPROVAL_FOR_SEMANTIC_PROMOTION": _string_or_none(
+            facts.get("require_human_approval_for_semantic_promotion")
+        ),
+        "QUALITY_OFFLINE_BENCHMARK_REQUIRED": _string_or_none(
+            quality.get("offline_benchmark_required")
+        ),
+        "QUALITY_BLOCK_ON_RETRIEVAL_REGRESSION": _string_or_none(
+            quality.get("block_on_retrieval_regression")
+        ),
+        "QUALITY_BLOCK_ON_FACT_REGRESSION": _string_or_none(
+            quality.get("block_on_fact_regression")
+        ),
+        "QUALITY_BLOCK_ON_STORY_REGRESSION": _string_or_none(
+            quality.get("block_on_story_regression")
         ),
         "CHUNK_SIZE": _string_or_none(ingestion.get("chunk_size")),
         "CHUNK_OVERLAP": _string_or_none(ingestion.get("chunk_overlap")),
@@ -316,11 +495,16 @@ def _env_defaults(
     for config_key, target_env in {
         "postgres_dsn_env": "POSTGRES_DSN",
         "openai_api_key_env": "OPENAI_API_KEY",
+        "azure_openai_endpoint_env": "AZURE_OPENAI_ENDPOINT",
+        "azure_openai_api_key_env": "AZURE_OPENAI_API_KEY",
+        "azure_openai_api_version_env": "AZURE_OPENAI_API_VERSION",
         "hf_token_env": "HF_TOKEN",
         "gemini_api_key_env": "GEMINI_API_KEY",
         "neo4j_password_env": "NEO4J_PASSWORD",
     }.items():
-        source_env_name = secrets.get(config_key)
+        source_env_name = secrets.get(config_key) or azure_openai.get(
+            config_key.removeprefix("azure_openai_")
+        )
         if isinstance(source_env_name, str) and env.get(source_env_name):
             defaults[target_env] = env[source_env_name]
     return defaults

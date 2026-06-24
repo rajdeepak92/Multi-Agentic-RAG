@@ -48,11 +48,84 @@ class UserStoryArtifactWriter:
         story_dir.mkdir(parents=True, exist_ok=True)
         debug_dir.mkdir(parents=True, exist_ok=True)
         yaml_path = story_dir / f"{story_id}.yaml"
+        json_path = story_dir / f"{story_id}.json"
         debug_path = debug_dir / f"{story_id}.json"
         trace_path = debug_dir / f"{story_id}.trace.json"
         story_payload = story.model_dump(mode="json")
         yaml_path.write_text(
             yaml.safe_dump(story_payload, sort_keys=False, allow_unicode=False),
+            encoding="utf-8",
+        )
+        production_json_payload = {
+            "schema_version": self.settings.user_story_schema_version,
+            "story": story_payload,
+            "traceability": {
+                "system": system_name,
+                "knowledge_base": kb_name,
+                "version": version,
+                "requirement_ids": story.traceability.get("requirement_ids", []),
+                "fact_ids": story.traceability.get("fact_ids", []),
+                "chunk_ids": story.traceability.get("chunk_ids", evidence.source_chunk_ids),
+                "source_documents": story.traceability.get("source_documents", []),
+                "source_pages": story.traceability.get("source_pages", []),
+                "evidence_paths": story.traceability.get("evidence_paths", []),
+            },
+            "generation": {
+                "run_id": self.settings.active_run_id,
+                "provider": self.settings.reasoning_provider,
+                "deployment": model,
+                "prompt_version": prompt_version,
+                "generation_mode": "structured",
+            },
+            "retrieval": {
+                "query": evidence.query,
+                "selected_evidence_ids": evidence.source_chunk_ids,
+                "graph_paths": evidence.graph_paths,
+                "ranked_results": [
+                    {
+                        "chunk_id": result.chunk_id,
+                        "rank": result.rank,
+                        "score": result.score,
+                        "sources": result.sources,
+                        "source_document": result.source_name,
+                        "page": result.page,
+                        "version": result.version,
+                    }
+                    for result in evidence.ranked_results
+                ],
+            },
+            "validation": {
+                "status": validation_status,
+                "messages": validation_messages,
+            },
+            "publication": {
+                "publication_allowed": validation_status == "passed",
+                "artifact_status": "published" if validation_status == "passed" else "failed",
+                "yaml_path": str(yaml_path),
+                "json_path": str(json_path),
+            },
+            "fingerprints": {
+                "configuration": stable_hash(
+                    {
+                        "schema_version": self.settings.user_story_schema_version,
+                        "retrieval_sources": self.settings.retrieval_required_sources,
+                        "embedding_model": self.settings.embedding_model,
+                        "lexical_backend": self.settings.bm25_backend,
+                    }
+                ),
+                "model": stable_hash(
+                    {
+                        "model": model,
+                        "prompt_version": prompt_version,
+                        "reasoning_provider": self.settings.reasoning_provider,
+                    }
+                ),
+            },
+            "warnings": [],
+            "errors": [],
+        }
+        json_path.write_text(
+            json.dumps(production_json_payload, indent=2, sort_keys=True),
             encoding="utf-8",
         )
         debug_payload: dict[str, Any] = {

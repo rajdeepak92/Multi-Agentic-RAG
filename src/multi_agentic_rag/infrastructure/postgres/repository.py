@@ -631,6 +631,39 @@ class PostgresKnowledgeRepository:
             rows = result.scalars().all()
         return [_fact_from_model(row) for row in rows]
 
+    async def list_facts_for_scope(
+        self,
+        *,
+        system_name: str,
+        kb_name: str,
+        version: str,
+        active_only: bool = True,
+    ) -> list[FactRecord]:
+        """List facts for one system/kb/version scope."""
+
+        filters = [
+            FactModel.system_name == system_name,
+            FactModel.kb_name == kb_name,
+            FactModel.version == version,
+        ]
+        if active_only:
+            filters.append(FactModel.status == DocumentStatus.ACTIVE.value)
+
+        async def load() -> list[FactModel]:
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(FactModel)
+                    .where(*filters)
+                    .order_by(
+                        FactModel.fact_key.asc(),
+                        FactModel.fact_id.asc(),
+                    )
+                )
+                return list(result.scalars().all())
+
+        rows = await self._run_with_retry(load, operation_name="list_facts_for_scope")
+        return [_fact_from_model(row) for row in rows]
+
     async def list_chunks_for_version(self, document_version_id: str) -> list[ChunkRecord]:
         """List chunks for one document version.
 

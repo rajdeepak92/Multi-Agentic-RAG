@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, ValidationInfo, field_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from multi_agentic_rag.exceptions import ConfigError
@@ -98,24 +98,55 @@ class Settings(BaseSettings):
     chroma_collection: str = Field(default="multi_agentic_rag_chunks_minilm_l6_v1")
     chroma_allow_legacy_without_fingerprint: bool = Field(default=False)
 
-    embedding_provider: Literal["hash", "sentence_transformers"] = Field(
+    embedding_provider: Literal["hash", "sentence_transformers", "azure_openai"] = Field(
         default="sentence_transformers"
     )
     embedding_model: str = Field(default="sentence-transformers/all-MiniLM-L6-v2")
+    embedding_deployment: str | None = Field(default=None)
     embedding_model_revision: str = Field(default="default")
     embedding_dimensions: int = Field(default=384)
+    embedding_expected_dimension: int | None = Field(default=None)
     embedding_device: str = Field(default="auto")
     embedding_normalize: bool = Field(default=True)
     embedding_distance_metric: str = Field(default="cosine")
     embedding_prompt_profile: str = Field(default="default")
+    embedding_batch_size: int = Field(default=64)
     hf_token: str | None = Field(default=None)
-    reranker_provider: Literal["none", "sentence_transformers"] = Field(default="none")
+    reranker_provider: Literal["none", "sentence_transformers", "azure_openai"] = Field(
+        default="none"
+    )
     reranker_model: str | None = Field(default=None)
+    reranker_deployment: str | None = Field(default=None)
     reranker_device: str = Field(default="auto")
+    reranker_strategy: str = Field(default="listwise")
+    reranker_candidate_top_k: int = Field(default=30)
+    reranker_top_n: int = Field(default=12)
+    reranker_temperature: float = Field(default=0.0)
+    reranker_require_candidate_id_integrity: bool = Field(default=True)
+    reranker_require_answerability_assessment: bool = Field(default=True)
 
     openai_api_key: str | None = Field(default=None)
-    reasoning_provider: Literal["openai", "hf", "huggingface", "gemini"] = Field(
-        default="openai"
+    azure_openai_endpoint: str | None = Field(default=None)
+    azure_openai_api_key: str | None = Field(default=None)
+    azure_openai_api_version: str | None = Field(default=None)
+    azure_openai_base_url: str | None = Field(default=None)
+    azure_openai_endpoint_env: str = Field(default="AZURE_OPENAI_ENDPOINT")
+    azure_openai_api_key_env: str = Field(default="AZURE_OPENAI_API_KEY")
+    azure_openai_api_version_env: str = Field(default="AZURE_OPENAI_API_VERSION")
+    azure_openai_generation_deployment: str = Field(default="gpt-5.2-chat")
+    azure_openai_answer_deployment: str = Field(default="gpt-5.2-chat")
+    azure_openai_analysis_deployment: str = Field(default="gpt-5.2-chat")
+    azure_openai_utility_deployment: str = Field(default="gpt-4o-mini")
+    azure_openai_validation_deployment: str = Field(default="gpt-4o-mini")
+    azure_openai_reranker_deployment: str = Field(default="gpt-4o-mini")
+    azure_openai_embedding_deployment: str = Field(default="text-embedding-3-large")
+    azure_openai_request_timeout_seconds: float = Field(default=180.0)
+    azure_openai_max_retries: int = Field(default=3)
+    azure_openai_retry_backoff_seconds: float = Field(default=2.0)
+    azure_openai_max_concurrent_requests: int = Field(default=4)
+    azure_openai_capability_cache_ttl_seconds: int = Field(default=3600)
+    reasoning_provider: Literal["openai", "azure_openai", "hf", "huggingface", "gemini"] = (
+        Field(default="openai")
     )
     openai_reasoning_model: str = Field(default="gpt-5.5")
     openai_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] = Field(
@@ -139,6 +170,17 @@ class Settings(BaseSettings):
     hf_reason_top_k: int = Field(default=20)
     hf_reason_cache_dir: Path = Field(default=PROJECT_CACHE_PATH_DEFAULTS["hf_reason_cache_dir"])
     hf_reason_enable_thinking: bool = Field(default=False)
+    reasoning_temperature: float = Field(default=0.0)
+    reasoning_store_responses: bool = Field(default=False)
+    reasoning_analysis_max_output_tokens: int = Field(default=8192)
+    reasoning_generation_max_output_tokens: int = Field(default=12288)
+    reasoning_validation_max_output_tokens: int = Field(default=4096)
+    reasoning_answer_max_output_tokens: int = Field(default=4096)
+    reasoning_fact_review_max_output_tokens: int = Field(default=4096)
+    reasoning_reranking_max_output_tokens: int = Field(default=2048)
+    reasoning_fail_on_truncation: bool = Field(default=True)
+    reasoning_fail_on_schema_error: bool = Field(default=True)
+    reasoning_fail_on_empty_output: bool = Field(default=True)
     user_story_output_dir: Path = Field(default=Path("generated"))
     active_run_id: str | None = Field(default=None)
     active_run_dir: Path | None = Field(default=None)
@@ -173,13 +215,46 @@ class Settings(BaseSettings):
     retrieval_answer_top_k: int = Field(default=10)
     retrieval_answer_max_evidence: int = Field(default=20)
     retrieval_answer_max_snippets: int = Field(default=8)
+    retrieval_minimum_evidence_count: int = Field(default=3)
+    retrieval_minimum_target_requirement_coverage: float = Field(default=1.0)
+    retrieval_require_quality_assessment: bool = Field(default=True)
     user_story_schema_version: str = Field(default="enterprise-user-story-v1")
+    user_story_minimum_group_size: int = Field(default=1)
+    user_story_maximum_group_size: int = Field(default=8)
     user_story_requirement_batch_size: int = Field(default=6)
     user_story_max_stories_per_batch: int = Field(default=8)
     user_story_coverage_required_types: tuple[str, ...] = Field(
         default=("business_rule", "functional", "non_functional", "automation_rule")
     )
     user_story_allow_partial_coverage: bool = Field(default=False)
+    user_story_allow_generation_fallback: bool = Field(default=False)
+    user_story_group_related_requirements: bool = Field(default=True)
+    user_story_minimum_acceptance_criteria: int = Field(default=3)
+    user_story_maximum_acceptance_criteria: int = Field(default=7)
+    user_story_minimum_quality_score: int = Field(default=85)
+    user_story_minimum_traceability_score: int = Field(default=100)
+    user_story_attach_acceptance_criteria: bool = Field(default=True)
+    user_story_attach_definition_of_done: bool = Field(default=True)
+    user_story_attach_non_functional_requirements: bool = Field(default=True)
+    user_story_attach_scope_constraints: bool = Field(default=True)
+    user_story_attach_threshold_facts: bool = Field(default=True)
+    user_story_attach_automation_rules: bool = Field(default=True)
+    user_story_require_evidence_excerpts: bool = Field(default=True)
+    user_story_require_independent_validation: bool = Field(default=True)
+    user_story_fail_on_generic_language: bool = Field(default=True)
+    user_story_require_human_approval_before_published_status: bool = Field(default=False)
+    fact_semantic_review_enabled: bool = Field(default=True)
+    fact_minimum_confidence: float = Field(default=0.85)
+    fact_require_exact_evidence: bool = Field(default=True)
+    fact_require_unit_validation: bool = Field(default=True)
+    fact_reject_unsupported_facts: bool = Field(default=True)
+    fact_reject_conflicting_facts: bool = Field(default=True)
+    fact_reject_duplicate_facts: bool = Field(default=True)
+    fact_require_human_approval_for_semantic_promotion: bool = Field(default=True)
+    quality_offline_benchmark_required: bool = Field(default=True)
+    quality_block_on_retrieval_regression: bool = Field(default=True)
+    quality_block_on_fact_regression: bool = Field(default=True)
+    quality_block_on_story_regression: bool = Field(default=True)
     log_level: str = Field(default="INFO")
 
     postgres_connect_timeout_seconds: float = Field(default=10.0)
@@ -196,15 +271,21 @@ class Settings(BaseSettings):
     @field_validator("embedding_provider", mode="before")
     @classmethod
     def _normalize_embedding_provider(cls, value: object) -> object:
-        if isinstance(value, str) and value.lower() == "huggingface":
-            return "sentence_transformers"
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized == "huggingface":
+                return "sentence_transformers"
+            return normalized
         return value
 
     @field_validator("reranker_provider", mode="before")
     @classmethod
     def _normalize_reranker_provider(cls, value: object) -> object:
-        if isinstance(value, str) and value.lower() == "huggingface":
-            return "sentence_transformers"
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized == "huggingface":
+                return "sentence_transformers"
+            return normalized
         return value
 
     @field_validator("reasoning_provider", mode="before")
@@ -214,8 +295,50 @@ class Settings(BaseSettings):
             normalized = value.strip().lower()
             if normalized in {"huggingface", "hugging_face", "local_hf"}:
                 return "hf"
+            if normalized in {"azure", "azure-openai"}:
+                return "azure_openai"
             return normalized
         return value
+
+    @model_validator(mode="after")
+    def _validate_enterprise_provider_settings(self) -> Settings:
+        prohibited_embeddings = {
+            self.embedding_model,
+            self.embedding_deployment or "",
+            self.azure_openai_embedding_deployment,
+        }
+        if any(value == "text-embedding-ada-002" for value in prohibited_embeddings):
+            raise ConfigError("text-embedding-ada-002 is not allowed for new indexing.")
+        brd_reasoning_deployments = {
+            self.openai_reasoning_model,
+            self.azure_openai_generation_deployment,
+            self.azure_openai_answer_deployment,
+            self.azure_openai_analysis_deployment,
+            self.azure_openai_utility_deployment,
+            self.azure_openai_validation_deployment,
+            self.azure_openai_reranker_deployment,
+        }
+        if "gpt-5.3-codex" in brd_reasoning_deployments:
+            raise ConfigError(
+                "gpt-5.3-codex is reserved for code tasks and cannot be used for "
+                "BRD reasoning, Ask synthesis, reranking, validation, or story generation."
+            )
+        if self.reasoning_provider == "azure_openai":
+            endpoint = self.azure_openai_endpoint or self.azure_openai_base_url
+            if not endpoint:
+                raise ConfigError(
+                    "Azure OpenAI reasoning requires AZURE_OPENAI_ENDPOINT or an "
+                    "explicit azure_openai.base_url."
+                )
+            if self.azure_openai_base_url and not self.azure_openai_base_url.startswith(
+                "https://"
+            ):
+                raise ConfigError("Azure OpenAI base_url must be a complete HTTPS URL.")
+            if self.azure_openai_endpoint and not self.azure_openai_endpoint.startswith(
+                "https://"
+            ):
+                raise ConfigError("AZURE_OPENAI_ENDPOINT must be a complete HTTPS URL.")
+        return self
 
     @field_validator("retrieval_required_sources", mode="before")
     @classmethod

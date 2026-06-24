@@ -40,7 +40,13 @@ from multi_agentic_rag.domain import (
     RequirementType,
     RetrievalResult,
 )
-from multi_agentic_rag.exceptions import ConfigError
+from multi_agentic_rag.exceptions import (
+    ConfigError,
+    GenerationTokenLimitError,
+    StructuredGenerationError,
+    UserStoryGenerationError,
+    UserStoryQualityError,
+)
 from multi_agentic_rag.llm import GenerationConfig, ReasoningClient
 from multi_agentic_rag.llm.structured import LLMGeneratedUserStoryBatch
 from multi_agentic_rag.requirements_ledger import (
@@ -458,7 +464,11 @@ class UserStoryGraphRuntime:
         fused = state.get("fused_results", [])
         domain_results = [_candidate_to_domain(candidate) for candidate in fused]
         query = _primary_query(state["retrieval_plan"], state["request"])
-        reranked_domain = self.reranker.rerank(query, domain_results)
+        async_rerank = getattr(self.reranker, "arerank", None)
+        if callable(async_rerank):
+            reranked_domain = await async_rerank(query, domain_results)
+        else:
+            reranked_domain = self.reranker.rerank(query, domain_results)
         by_id = {result.chunk_id: result for result in reranked_domain}
         reranked: list[EvidenceCandidate] = []
         for candidate in fused:
@@ -546,6 +556,13 @@ class UserStoryGraphRuntime:
         )
         assessment = state.get("evidence_assessment")
         ledger_requirements = state.get("ledger_requirements", [])
+        story_group_plan = _deterministic_story_group_plan(
+            ledger_requirements,
+            system=state["request"].system,
+            kb=state["request"].kb,
+            version=state["request"].version,
+            maximum_group_size=self.settings.user_story_maximum_group_size,
+        )
         prompt = json.dumps(
             {
                 "schema": "GeneratedUserStoryBatch",
@@ -554,6 +571,7 @@ class UserStoryGraphRuntime:
                 "max_stories_per_batch": self.settings.user_story_max_stories_per_batch,
                 "allow_partial_coverage": self.settings.user_story_allow_partial_coverage,
                 "coverage_required_types": list(self.settings.user_story_coverage_required_types),
+                "story_group_plan": story_group_plan,
                 "requirement_ledger": _story_driving_requirement_payloads(
                     ledger_requirements
                 ),
@@ -563,7 +581,12 @@ class UserStoryGraphRuntime:
             },
             indent=2,
         )
-        return {**state, "evidence_bundle": bundle, "prompt": prompt}
+        return {
+            **state,
+            "evidence_bundle": bundle,
+            "prompt": prompt,
+            "story_group_plan": story_group_plan,
+        }
 
     async def generate_structured_output(
         self,
@@ -611,50 +634,55 @@ class UserStoryGraphRuntime:
                 raise ConfigError("Reasoning provider returned no user stories.")
             return {**state, "validated_stories": _dedupe_stories(stories)}
         except Exception as exc:
-            fallback_stories = _deterministic_stories_from_requirements(
-                state.get("ledger_requirements", [])
-            )
-            if fallback_stories:
-                return {
-                    **state,
-                    "validated_stories": fallback_stories,
-                    "generation_fallback_reason": (
-                        f"Structured provider failed for user_story_generation: "
-                        f"{type(exc).__name__}: {str(exc)[:240]}"
-                    ),
-                }
+            typed_error = _generation_error_from_exception(exc)
             invalid_path = _write_invalid_model_output_if_present(state, exc)
+            provider_errors_path = _write_provider_error(
+                state,
+                typed_error,
+                original_exc=exc,
+                stage="generate_structured_output",
+                provider=self.settings.reasoning_provider,
+                deployment=self.reasoning_client.model,
+                prompt_version=self.reasoning_client.prompt_version,
+                task_name="user_story_generation",
+                requested_max_output_tokens=_generation_config(
+                    self.settings,
+                    "user_story_generation",
+                ).max_output_tokens,
+                invalid_model_output_path=invalid_path,
+            )
+            failed_state: UserStoryGenerationState = {
+                **state,
+                "provider_errors_path": provider_errors_path,
+            }
             if invalid_path is not None:
-                return _state_error(
-                    {**state, "invalid_model_output_path": invalid_path},
-                    exc,
-                )
-            return _state_error(state, exc)
+                failed_state = {**failed_state, "invalid_model_output_path": invalid_path}
+            return _state_error(failed_state, typed_error, stage="generate_structured_output")
 
     async def validate_output(self, state: UserStoryGenerationState) -> UserStoryGenerationState:
         """Validate every generated story before YAML publication."""
 
         try:
             reports: list[QualityValidationReport] = []
-            if state.get("generation_fallback_reason"):
-                reports = [
-                    _validate_deterministic_story(story)
-                    for story in state.get("validated_stories", [])
-                ]
-            else:
-                for story in state.get("validated_stories", []):
-                    reports.append(
-                        await self.reasoning_client.validate_user_story(
-                            story,
-                            state["evidence_bundle"],
-                        )
+            for story in state.get("validated_stories", []):
+                reports.append(
+                    await self.reasoning_client.validate_user_story(
+                        story,
+                        state["evidence_bundle"],
                     )
+                )
             failures = [
                 message
                 for report in reports
                 if report.status == "failed"
                 for message in report.messages
             ]
+            if self.settings.user_story_fail_on_generic_language:
+                failures.extend(
+                    message
+                    for story in state.get("validated_stories", [])
+                    for message in _generic_story_failures(story)
+                )
             retry_allowed = (
                 state.get("retry_count", 0) < self.settings.structured_generation_retry_count
             )
@@ -666,7 +694,11 @@ class UserStoryGraphRuntime:
                     "next_action": "repair",
                 }
             if failures:
-                return {**state, "errors": [*state.get("errors", []), *failures]}
+                return _state_error(
+                    state,
+                    UserStoryQualityError("; ".join(failures[:20])),
+                    stage="validate_output",
+                )
             ledger_requirements = state.get("ledger_requirements", [])
             if ledger_requirements:
                 coverage_records = build_coverage_records(
@@ -695,22 +727,24 @@ class UserStoryGraphRuntime:
                     }
                 if missing and not self.settings.user_story_allow_partial_coverage:
                     missing_ids = ", ".join(str(row["canonical_id"]) for row in missing[:20])
-                    return {
-                        **state,
-                        "coverage_records": coverage_records,
-                        "coverage_payload": matrix,
-                        "errors": [
-                            *state.get("errors", []),
+                    return _state_error(
+                        {
+                            **state,
+                            "coverage_records": coverage_records,
+                            "coverage_payload": matrix,
+                        },
+                        UserStoryQualityError(
                             "Coverage-required requirements are missing stories: "
-                            + missing_ids,
-                        ],
-                    }
+                            + missing_ids
+                        ),
+                        stage="validate_output",
+                    )
                 state = {
                     **state,
                     "coverage_records": coverage_records,
                     "coverage_payload": matrix,
                 }
-            return {**state, "next_action": "valid"}
+            return {**state, "validation_reports": reports, "next_action": "valid"}
         except Exception as exc:
             return _state_error(state, exc)
 
@@ -741,6 +775,7 @@ class UserStoryGraphRuntime:
                     validation_messages=[],
                 )
                 paths.append(Path(manifest.generated_file_path))
+                paths.append(Path(manifest.generated_file_path).with_suffix(".json"))
                 if self.artifact_audit_repository:
                     await self.artifact_audit_repository.record_artifact(
                         ArtifactRecord(
@@ -768,6 +803,11 @@ class UserStoryGraphRuntime:
             artifact_dir = state["run_dir"] / "artifacts" / "user_stories"
             ledger_requirements = state.get("ledger_requirements", [])
             if ledger_requirements:
+                story_group_plan = state.get("story_group_plan", [])
+                if story_group_plan:
+                    story_group_path = artifact_dir / "story_group_plan.json"
+                    write_json_artifact(story_group_path, {"groups": story_group_plan})
+                    paths.append(story_group_path)
                 inventory_payload = requirement_inventory_payload(
                     ledger_requirements,
                     state.get("ledger_evidence", []),
@@ -794,12 +834,50 @@ class UserStoryGraphRuntime:
                     await self.requirement_repository.upsert_requirement_coverage(
                         coverage_records
                     )
+            quality_paths = _write_story_quality_artifacts(
+                artifact_dir,
+                state.get("validated_stories", []),
+                state.get("validation_reports", []),
+                state.get("coverage_payload", {}),
+            )
+            paths.extend(quality_paths)
+            generation_trace_path = state["run_dir"] / "debug" / "generation_trace.json"
+            validation_trace_path = state["run_dir"] / "debug" / "validation_trace.json"
+            write_json_artifact(
+                generation_trace_path,
+                redact_secrets(
+                    {
+                        "run_id": state.get("run_id"),
+                        "provider": self.settings.reasoning_provider,
+                        "deployment": self.reasoning_client.model,
+                        "prompt_version": self.reasoning_client.prompt_version,
+                        "retry_count": state.get("retry_count", 0),
+                        "story_count": len(state.get("validated_stories", [])),
+                        "story_group_plan": state.get("story_group_plan", []),
+                    }
+                ),
+            )
+            write_json_artifact(
+                validation_trace_path,
+                redact_secrets(
+                    {
+                        "run_id": state.get("run_id"),
+                        "reports": [
+                            report.model_dump(mode="json")
+                            for report in state.get("validation_reports", [])
+                        ],
+                        "coverage": state.get("coverage_payload", {}),
+                    }
+                ),
+            )
             trace_path = state["run_dir"] / "debug" / "retrieval_trace.json"
             write_json_artifact(trace_path, redact_secrets(_trace_payload(state)))
             return {
                 **state,
                 "artifact_paths": paths,
                 "debug_trace_path": trace_path,
+                "generation_trace_path": generation_trace_path,
+                "validation_trace_path": validation_trace_path,
             }
         except Exception as exc:
             return _state_error(state, exc)
@@ -837,7 +915,8 @@ class UserStoryGraphRuntime:
                 ],
                 stories=state.get("validated_stories", []),
             )
-        return {**state, "result": result}
+        manifest_path = _write_run_manifest(state, result)
+        return {**state, "result": result, "run_manifest_path": manifest_path}
 
     async def _retrieve_source(
         self,
@@ -977,8 +1056,19 @@ def _route_after_validation(state: UserStoryGenerationState) -> Literal["write",
     return "write"
 
 
-def _state_error(state: UserStoryGenerationState, exc: Exception) -> UserStoryGenerationState:
-    return {**state, "errors": [*state.get("errors", []), str(exc)]}
+def _state_error(
+    state: UserStoryGenerationState,
+    exc: Exception,
+    *,
+    stage: str | None = None,
+) -> UserStoryGenerationState:
+    message = f"{type(exc).__name__}: {exc}"
+    return {
+        **state,
+        "errors": [*state.get("errors", []), message],
+        "failure_error_type": type(exc).__name__,
+        **({"failure_stage": stage} if stage else {}),
+    }
 
 
 def _required_sources(settings: Settings) -> set[RetrievalSourceName]:
@@ -1065,6 +1155,85 @@ def _story_driving_requirement_payloads(
     ]
 
 
+def _deterministic_story_group_plan(
+    requirements: list[RequirementRecord],
+    *,
+    system: str,
+    kb: str,
+    version: str,
+    maximum_group_size: int,
+) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str, str], list[RequirementRecord]] = {}
+    for requirement in requirements:
+        if not requirement.story_driving and not requirement.coverage_required:
+            continue
+        key = (
+            requirement.category or "uncategorized",
+            requirement.requirement_type.value,
+            requirement.section_title or "unknown-section",
+        )
+        grouped.setdefault(key, []).append(requirement)
+    plans: list[dict[str, object]] = []
+    for (category, requirement_type, section), records in sorted(grouped.items()):
+        records = sorted(
+            records,
+            key=lambda item: item.canonical_id or item.requirement_id,
+        )
+        for index, batch in enumerate(_batched(records, max(1, maximum_group_size)), start=1):
+            requirement_ids = [
+                record.canonical_id or record.requirement_id
+                for record in batch
+            ]
+            group_id = "GROUP-" + stable_id(
+                "story_group",
+                system,
+                kb,
+                version,
+                category,
+                requirement_type,
+                section,
+                str(index),
+                *requirement_ids,
+            )[-12:].upper()
+            plans.append(
+                {
+                    "group_id": group_id,
+                    "title": f"{category} {requirement_type} capability",
+                    "persona": _persona_hint(batch),
+                    "business_outcome": _business_outcome_hint(batch),
+                    "requirement_ids": requirement_ids,
+                    "requirement_pks": [record.requirement_pk for record in batch],
+                    "grouping_rationale": (
+                        "Grouped deterministically by category, requirement type, "
+                        "source section and version scope."
+                    ),
+                    "cohesion_score": 0.8 if len(batch) > 1 else 1.0,
+                    "grouping_method": "deterministic",
+                    "source_section": section,
+                }
+            )
+    return plans
+
+
+def _persona_hint(records: Sequence[RequirementRecord]) -> str | None:
+    for record in records:
+        persona = record.metadata.get("persona") or record.metadata.get("stakeholder")
+        if isinstance(persona, str) and persona.strip():
+            return persona.strip()
+    return None
+
+
+def _business_outcome_hint(records: Sequence[RequirementRecord]) -> str | None:
+    for record in records:
+        outcome = record.metadata.get("business_outcome")
+        if isinstance(outcome, str) and outcome.strip():
+            return outcome.strip()
+    first = next(iter(records), None)
+    if first is None:
+        return None
+    return first.title or first.category or first.requirement_type.value
+
+
 def _requirement_prompt_payload(requirement: RequirementRecord) -> dict[str, Any]:
     return {
         "canonical_id": requirement.canonical_id or requirement.requirement_id,
@@ -1123,79 +1292,39 @@ def _dedupe_stories(stories: list[GeneratedUserStory]) -> list[GeneratedUserStor
     return list(deduped.values())
 
 
-def _deterministic_stories_from_requirements(
-    requirements: list[RequirementRecord],
-) -> list[GeneratedUserStory]:
-    stories: list[GeneratedUserStory] = []
-    for requirement in requirements:
-        if not requirement.story_driving and not requirement.coverage_required:
-            continue
-        canonical_id = requirement.canonical_id or requirement.requirement_id
-        story_id = "US-" + stable_id("user_story", canonical_id, requirement.text)[-10:].upper()
-        category = requirement.category or requirement.requirement_type.value
-        stories.append(
-            GeneratedUserStory(
-                id=story_id,
-                title=f"Support {canonical_id}",
-                type=requirement.requirement_type.value,
-                domain=category,
-                priority="medium",
-                status="draft",
-                persona="operator",
-                user_story=(
-                    f"As an operator, I want the system to satisfy {canonical_id} "
-                    "so that documented business behavior is delivered."
-                ),
-                business_value=(
-                    "Provides traceable implementation coverage for a source "
-                    "requirement."
-                ),
-                description=requirement.text,
-                acceptance_criteria=[
-                    f"Given source requirement {canonical_id}, the implemented "
-                    "behavior is demonstrably supported by cited evidence.",
-                ],
-                non_functional_requirements=[requirement.text]
-                if requirement.requirement_type is RequirementType.NON_FUNCTIONAL
-                else [],
-                dependencies=[],
-                definition_of_ready=[
-                    "Requirement evidence is present in the Requirement Ledger.",
-                ],
-                definition_of_done=[
-                    f"Requirement {canonical_id} is covered by a validated story.",
-                ],
-                traceability={
-                    "requirement_ids": [canonical_id],
-                    "chunk_ids": [requirement.chunk_id],
-                    "source_pages": [requirement.page] if requirement.page else [],
-                    "source_documents": [requirement.source_name]
-                    if requirement.source_name
-                    else [],
-                    "generation_mode": "deterministic_ledger_fallback",
-                },
-            )
-        )
-    return stories
+_GENERIC_STORY_PATTERNS = (
+    "support br-",
+    "satisfy br-",
+    "implement requirement",
+    "meet the documented requirement",
+    "documented business behavior",
+    "traceable implementation coverage",
+    "feature works as expected",
+    "works as expected",
+    "system shall support the requirement",
+    "system to satisfy",
+)
 
 
-def _validate_deterministic_story(story: GeneratedUserStory) -> QualityValidationReport:
-    traceability = story.traceability
-    requirement_ids = traceability.get("requirement_ids")
-    chunk_ids = traceability.get("chunk_ids")
-    messages: list[str] = []
-    if not isinstance(requirement_ids, list) or not requirement_ids:
-        messages.append("Deterministic story is missing requirement traceability.")
-    if not isinstance(chunk_ids, list) or not chunk_ids:
-        messages.append("Deterministic story is missing source chunk traceability.")
-    return QualityValidationReport(
-        status="failed" if messages else "passed",
-        messages=messages,
-        checks={
-            "requirement_traceability": not messages,
-            "deterministic_generation": True,
-        },
-    )
+def _generic_story_failures(story: GeneratedUserStory) -> list[str]:
+    text_fields = [
+        story.title,
+        story.user_story,
+        story.business_value,
+        story.description,
+        *story.acceptance_criteria,
+        *story.definition_of_ready,
+        *story.definition_of_done,
+    ]
+    haystack = "\n".join(text_fields).lower()
+    failures = [
+        f"Story {story.id} contains prohibited generic language: {pattern}"
+        for pattern in _GENERIC_STORY_PATTERNS
+        if pattern in haystack
+    ]
+    if story.user_story.lower().startswith("as an operator, i want the system to satisfy"):
+        failures.append(f"Story {story.id} uses a generic operator fallback template.")
+    return failures
 
 
 async def _generate_structured_or_default(
@@ -1495,6 +1624,204 @@ def _write_invalid_model_output_if_present(
     return path
 
 
+def _generation_error_from_exception(exc: Exception) -> UserStoryGenerationError:
+    message = str(exc)
+    lowered = message.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "finish_reason=length",
+            "finish_reason = length",
+            '"finish_reason": "length"',
+            "truncated",
+            "token limit",
+            "max_output_tokens",
+            "maximum output",
+            "context length",
+        )
+    ):
+        return GenerationTokenLimitError(
+            f"Structured user-story generation was truncated or exceeded token limits: "
+            f"{type(exc).__name__}: {message}"
+        )
+    return StructuredGenerationError(
+        "Structured user-story generation failed and no fallback story generation is "
+        f"allowed: {type(exc).__name__}: {message}"
+    )
+
+
+def _write_provider_error(
+    state: UserStoryGenerationState,
+    typed_error: UserStoryGenerationError,
+    *,
+    original_exc: Exception,
+    stage: str,
+    provider: str,
+    deployment: str,
+    prompt_version: str,
+    task_name: str,
+    requested_max_output_tokens: int,
+    invalid_model_output_path: Path | None = None,
+) -> Path:
+    run_dir = state.get("run_dir")
+    if run_dir is None:
+        raise typed_error
+    path = run_dir / "debug" / "provider_errors.json"
+    existing_errors: list[dict[str, Any]] = []
+    if path.exists():
+        try:
+            existing_payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing_payload, dict) and isinstance(
+                existing_payload.get("errors"),
+                list,
+            ):
+                existing_errors = [
+                    item
+                    for item in existing_payload["errors"]
+                    if isinstance(item, dict)
+                ]
+        except json.JSONDecodeError:
+            existing_errors = []
+    request = state.get("request")
+    existing_errors.append(
+        cast(
+            dict[str, Any],
+            redact_secrets(
+                {
+                    "run_id": state.get("run_id"),
+                    "stage": stage,
+                    "task_name": task_name,
+                    "error_type": type(typed_error).__name__,
+                    "error": str(typed_error),
+                    "original_error_type": type(original_exc).__name__,
+                    "original_error": str(original_exc),
+                    "provider": provider,
+                    "deployment": deployment,
+                    "prompt_version": prompt_version,
+                    "request_id": getattr(original_exc, "request_id", None),
+                    "finish_reason": getattr(original_exc, "finish_reason", None),
+                    "token_usage": getattr(original_exc, "usage", None),
+                    "retry_count": state.get("retry_count", 0),
+                    "requested_max_output_tokens": requested_max_output_tokens,
+                    "redacted_request_metadata": {
+                        "system": request.system if request else None,
+                        "kb": request.kb if request else None,
+                        "version": request.version if request else None,
+                    },
+                    "invalid_model_output_path": str(invalid_model_output_path)
+                    if invalid_model_output_path
+                    else None,
+                    "captured_at": datetime.now(UTC).isoformat(),
+                }
+            ),
+        )
+    )
+    write_json_artifact(path, {"errors": existing_errors})
+    return path
+
+
+def _write_story_quality_artifacts(
+    artifact_dir: Path,
+    stories: list[GeneratedUserStory],
+    reports: list[QualityValidationReport],
+    coverage: dict[str, object],
+) -> list[Path]:
+    report_entries: list[dict[str, Any]] = [
+        {
+            "story_id": story.id,
+            "validation": report.model_dump(mode="json"),
+        }
+        for story, report in zip(stories, reports, strict=False)
+    ]
+    report_payload = {
+        "schema_version": "story-quality-report-v1",
+        "story_count": len(stories),
+        "reports": report_entries,
+        "coverage": coverage,
+    }
+    json_path = artifact_dir / "story_quality_report.json"
+    md_path = artifact_dir / "story_quality_report.md"
+    write_json_artifact(json_path, report_payload)
+    md_lines = [
+        "# Story Quality Report",
+        "",
+        f"- Story count: {len(stories)}",
+        f"- Validation reports: {len(reports)}",
+    ]
+    counts = coverage.get("counts") if isinstance(coverage, dict) else None
+    if isinstance(counts, dict):
+        md_lines.append(f"- Coverage counts: {json.dumps(counts, sort_keys=True)}")
+    for item in report_entries:
+        validation = item["validation"]
+        md_lines.append(
+            f"- {item['story_id']}: {validation.get('status')} "
+            f"({'; '.join(validation.get('messages', [])) or 'no messages'})"
+        )
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    return [json_path, md_path]
+
+
+def _write_run_manifest(
+    state: UserStoryGenerationState,
+    result: UserStoryGenerationResult,
+) -> Path | None:
+    run_dir = state.get("run_dir")
+    if run_dir is None:
+        return None
+    manifest_path = run_dir / "run_manifest.json"
+    request = state.get("request")
+    payload = {
+        "run_id": state.get("run_id"),
+        "run_status": result.status,
+        "publication_status": "failed" if result.status == "failed" else "published",
+        "scope": {
+            "system": request.system if request else None,
+            "kb": request.kb if request else None,
+            "version": request.version if request else None,
+        },
+        "requirement_counts": (
+            state.get("coverage_payload", {}).get("counts")
+            if isinstance(state.get("coverage_payload"), dict)
+            else {}
+        ),
+        "story_groups": state.get("story_group_plan", []),
+        "generation_attempts": {
+            "retry_count": state.get("retry_count", 0),
+            "failure_error_type": state.get("failure_error_type"),
+            "failure_stage": state.get("failure_stage"),
+        },
+        "validation_results": [
+            report.model_dump(mode="json") for report in state.get("validation_reports", [])
+        ],
+        "coverage_results": state.get("coverage_payload", {}),
+        "published_artifacts": [str(path) for path in state.get("artifact_paths", [])],
+        "errors": state.get("errors", []),
+        "warnings": [],
+        "redacted_provider_configuration": {
+            "provider": _settings_value(state, "reasoning_provider"),
+            "model": _settings_value(state, "reasoning_model"),
+        },
+        "debug_artifacts": {
+            "retrieval_trace": str(state.get("debug_trace_path"))
+            if state.get("debug_trace_path")
+            else None,
+            "generation_trace": str(state.get("generation_trace_path"))
+            if state.get("generation_trace_path")
+            else None,
+            "validation_trace": str(state.get("validation_trace_path"))
+            if state.get("validation_trace_path")
+            else None,
+            "provider_errors": str(state.get("provider_errors_path"))
+            if state.get("provider_errors_path")
+            else None,
+        },
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    write_json_artifact(manifest_path, redact_secrets(payload))
+    return manifest_path
+
+
 def _trace_payload(state: UserStoryGenerationState) -> dict[str, Any]:
     retrieval_plan = state.get("retrieval_plan")
     evidence_assessment = state.get("evidence_assessment")
@@ -1586,7 +1913,6 @@ def _trace_payload(state: UserStoryGenerationState) -> dict[str, Any]:
         else None,
         "degraded_sources": state.get("degraded_sources", []),
         "validation_retry_count": state.get("retry_count", 0),
-        "generation_fallback_reason": state.get("generation_fallback_reason"),
         "coverage": state.get("coverage_payload", {}),
         "errors": state.get("errors", []),
     }

@@ -655,6 +655,226 @@ class EvidencePackModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class SemanticUnitModel(Base):
+    """Version-scoped retrievable semantic unit."""
+
+    __tablename__ = "semantic_units"
+
+    semantic_unit_id: Mapped[str] = mapped_column(String, primary_key=True)
+    record_type: Mapped[str] = mapped_column(String, nullable=False)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    document_id: Mapped[str] = mapped_column(String, nullable=False)
+    document_version_id: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    source_name: Mapped[str] = mapped_column(String, nullable=False)
+    page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    section_title: Mapped[str | None] = mapped_column(String, nullable=True)
+    exact_evidence: Mapped[str] = mapped_column(Text, nullable=False)
+    requirement_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    fact_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    evidence_hash: Mapped[str] = mapped_column(String, nullable=False)
+    lifecycle_status: Mapped[str] = mapped_column(String, nullable=False)
+    embedding_fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("idx_semantic_units_scope", "system_name", "kb_name", "version"),
+        Index("idx_semantic_units_record_type", "record_type"),
+        Index("idx_semantic_units_embedding", "embedding_fingerprint"),
+    )
+
+
+class StoryGroupModel(Base):
+    """Deterministic story grouping plan."""
+
+    __tablename__ = "story_groups"
+
+    story_group_id: Mapped[str] = mapped_column(String, primary_key=True)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    persona: Mapped[str | None] = mapped_column(String, nullable=True)
+    business_outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    requirement_pks: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    requirement_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    grouping_rationale: Mapped[str] = mapped_column(Text, nullable=False)
+    cohesion_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    grouping_method: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("idx_story_groups_scope", "system_name", "kb_name", "version"),
+    )
+
+
+class StoryQualityEvaluationModel(Base):
+    """Independent story quality evaluation."""
+
+    __tablename__ = "story_quality_evaluations"
+
+    story_quality_evaluation_id: Mapped[str] = mapped_column(String, primary_key=True)
+    story_id: Mapped[str] = mapped_column(String, nullable=False)
+    story_group_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    provider: Mapped[str] = mapped_column(String, nullable=False)
+    deployment: Mapped[str] = mapped_column(String, nullable=False)
+    overall_score: Mapped[float] = mapped_column(Float, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    dimension_scores: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    critical_failures: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    warnings: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index("idx_story_quality_story", "story_id"),)
+
+
+class FactQualityEvaluationModel(Base):
+    """Fact quality benchmark/audit result."""
+
+    __tablename__ = "fact_quality_evaluations"
+
+    fact_quality_evaluation_id: Mapped[str] = mapped_column(String, primary_key=True)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    golden_dataset: Mapped[str | None] = mapped_column(Text, nullable=True)
+    precision: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recall: Mapped[float | None] = mapped_column(Float, nullable=True)
+    f1: Mapped[float | None] = mapped_column(Float, nullable=True)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("idx_fact_quality_scope", "system_name", "kb_name", "version"),
+    )
+
+
+class RetrievalMetricModel(Base):
+    """Labelled retrieval benchmark metric row."""
+
+    __tablename__ = "retrieval_metrics"
+
+    retrieval_metric_id: Mapped[str] = mapped_column(String, primary_key=True)
+    retrieval_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    query_id: Mapped[str] = mapped_column(String, nullable=False)
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index("idx_retrieval_metrics_query", "query_id", "source"),)
+
+
+class GenerationAttemptModel(Base):
+    """Provider generation attempt audit row."""
+
+    __tablename__ = "generation_attempts"
+
+    generation_attempt_id: Mapped[str] = mapped_column(String, primary_key=True)
+    run_id: Mapped[str] = mapped_column(String, nullable=False)
+    story_group_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    task_name: Mapped[str] = mapped_column(String, nullable=False)
+    provider: Mapped[str] = mapped_column(String, nullable=False)
+    deployment: Mapped[str] = mapped_column(String, nullable=False)
+    prompt_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    requested_max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finish_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    error_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    redacted_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index("idx_generation_attempts_run", "run_id", "task_name"),)
+
+
+class ProviderUsageRecordModel(Base):
+    """Provider usage, latency and cost telemetry."""
+
+    __tablename__ = "provider_usage_records"
+
+    provider_usage_id: Mapped[str] = mapped_column(String, primary_key=True)
+    run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    provider: Mapped[str] = mapped_column(String, nullable=False)
+    deployment: Mapped[str] = mapped_column(String, nullable=False)
+    task_name: Mapped[str] = mapped_column(String, nullable=False)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    estimated_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
+    error_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    finish_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PublicationDecisionModel(Base):
+    """Atomic publication decision and idempotency record."""
+
+    __tablename__ = "publication_decisions"
+
+    publication_decision_id: Mapped[str] = mapped_column(String, primary_key=True)
+    run_id: Mapped[str] = mapped_column(String, nullable=False)
+    artifact_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    publication_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    artifact_status: Mapped[str] = mapped_column(String, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_publication_decision_idempotency"),
+        Index("idx_publication_decisions_run", "run_id"),
+    )
+
+
+class StoryPayloadModel(Base):
+    """Published story JSON payload and lineage."""
+
+    __tablename__ = "story_payloads"
+
+    story_payload_id: Mapped[str] = mapped_column(String, primary_key=True)
+    story_id: Mapped[str] = mapped_column(String, nullable=False)
+    run_id: Mapped[str] = mapped_column(String, nullable=False)
+    story_group_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    system_name: Mapped[str] = mapped_column(String, nullable=False)
+    kb_name: Mapped[str] = mapped_column(String, nullable=False)
+    version: Mapped[str] = mapped_column(String, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    yaml_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    json_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("story_id", "run_id", name="uq_story_payload_story_run"),
+        Index("idx_story_payloads_scope", "system_name", "kb_name", "version"),
+    )
+
+
 class ReviewEventModel(Base):
     """Typed review event emitted by graph nodes and services."""
 

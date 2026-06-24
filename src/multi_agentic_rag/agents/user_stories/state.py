@@ -16,6 +16,7 @@ from multi_agentic_rag.agents.user_stories.schemas import (
 from multi_agentic_rag.domain import (
     EvidenceBundle,
     GeneratedUserStory,
+    QualityValidationReport,
     RequirementCoverageRecord,
     RequirementEvidenceRecord,
     RequirementRecord,
@@ -45,12 +46,19 @@ class UserStoryGenerationState(TypedDict, total=False):
     evidence_bundle: EvidenceBundle
     retrieval_round: int
     prompt: str
+    story_group_plan: list[dict[str, object]]
     raw_model_output: str
     validated_stories: list[GeneratedUserStory]
-    generation_fallback_reason: str
+    validation_reports: list[QualityValidationReport]
     artifact_paths: list[Path]
     debug_trace_path: Path
+    generation_trace_path: Path
+    validation_trace_path: Path
+    run_manifest_path: Path | None
     invalid_model_output_path: Path
+    provider_errors_path: Path
+    failure_error_type: str
+    failure_stage: str
     trace_metadata: dict[str, str]
     retry_count: int
     next_action: str

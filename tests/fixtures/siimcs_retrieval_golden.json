@@ -1,0 +1,82 @@
+{
+  "queries": [
+    {
+      "query_id": "Q-001",
+      "query": "What are the minimum and maximum temperature sensor thresholds?",
+      "intent": "numeric_threshold",
+      "expected_requirement_ids": [],
+      "expected_fact_ids": [
+        "temperature-min-threshold",
+        "temperature-max-threshold"
+      ],
+      "expected_pages": [
+        5
+      ],
+      "expected_sections": [
+        "6.9 Sensor and Actuator Data Sheet"
+      ],
+      "acceptable_chunk_ids": [],
+      "must_include_values": [
+        "5-10°C",
+        "50-70°C"
+      ]
+    },
+    {
+      "query_id": "Q-002",
+      "query": "Which requirements describe continued polling when one sensor fails?",
+      "intent": "sensor_failure",
+      "expected_requirement_ids": [
+        "BR-COM-003",
+        "BR-COM-004",
+        "BR-COM-005",
+        "BR-HLT-002"
+      ],
+      "expected_fact_ids": [],
+      "expected_pages": [
+        3,
+        4
+      ],
+      "expected_sections": [
+        "6 Functional Requirements"
+      ],
+      "acceptable_chunk_ids": [],
+      "must_include_values": []
+    },
+    {
+      "query_id": "Q-003",
+      "query": "What automatic action is required for gas leakage?",
+      "intent": "automation_rule",
+      "expected_requirement_ids": [],
+      "expected_fact_ids": [
+        "gas-leakage-emergency-shutdown"
+      ],
+      "expected_pages": [
+        5
+      ],
+      "expected_sections": [
+        "6.10 Automatic System Control Actions"
+      ],
+      "acceptable_chunk_ids": [],
+      "must_include_values": [
+        "Emergency shutdown"
+      ]
+    },
+    {
+      "query_id": "Q-004",
+      "query": "Which acceptance criteria cover sensor failure monitoring continuity?",
+      "intent": "acceptance_criteria",
+      "expected_requirement_ids": [
+        "AC-003"
+      ],
+      "expected_fact_ids": [],
+      "expected_pages": [
+        7
+      ],
+      "expected_sections": [
+        "Acceptance Criteria"
+      ],
+      "acceptable_chunk_ids": [],
+      "must_include_values": []
+    }
+  ]
+}
