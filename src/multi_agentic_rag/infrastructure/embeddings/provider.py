@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
+import time
 import warnings
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from multi_agentic_rag.config import Settings
+from multi_agentic_rag.exceptions import ConfigError, ProviderCapabilityError
 from multi_agentic_rag.runtime.device import resolve_device
 
 
@@ -220,6 +223,129 @@ class SentenceTransformerEmbeddingProvider:
         return self.embed_documents(input)
 
 
+class AzureOpenAIEmbeddingProvider:
+    """Azure OpenAI embedding provider with strict vector validation."""
+
+    name = "azure_openai"
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        client: Any | None = None,
+    ) -> None:
+        self.settings = settings
+        self.model = settings.embedding_deployment or settings.azure_openai_embedding_deployment
+        self.deployment = self.model
+        self.batch_size = settings.embedding_batch_size
+        self.expected_dimension = settings.embedding_expected_dimension
+        self.validated_dimension: int | None = None
+        self._client = client
+        self.request_diagnostics: list[dict[str, Any]] = []
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Embed documents through Azure OpenAI while preserving input order."""
+
+        if not texts:
+            return []
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start : start + self.batch_size]
+            vectors.extend(self._embed_batch(batch, batch_start=start))
+        return vectors
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed one retrieval query through Azure OpenAI."""
+
+        return self.embed_documents([text])[0]
+
+    def __call__(self, input: list[str]) -> list[list[float]]:  # noqa: A002 - Chroma API
+        """Expose the Chroma embedding-function protocol."""
+
+        return self.embed_documents(input)
+
+    def _embed_batch(self, texts: list[str], *, batch_start: int) -> list[list[float]]:
+        client = self._get_client()
+        kwargs: dict[str, Any] = {
+            "model": self.deployment,
+            "input": texts,
+        }
+        if self.expected_dimension is not None:
+            kwargs["dimensions"] = self.expected_dimension
+        started = time.perf_counter()
+        try:
+            response = client.embeddings.create(**kwargs)
+        except Exception as exc:
+            raise ProviderCapabilityError(
+                f"Azure embedding request failed for deployment {self.deployment}: {exc}"
+            ) from exc
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        data = list(getattr(response, "data", []) or [])
+        if len(data) != len(texts):
+            raise ProviderCapabilityError(
+                f"Azure embedding response count {len(data)} did not match input count "
+                f"{len(texts)}."
+            )
+        indexed_vectors: list[tuple[int, list[float]]] = []
+        for offset, item in enumerate(data):
+            index = int(getattr(item, "index", offset))
+            vector = _as_float_vector(getattr(item, "embedding", []))
+            self._validate_vector(vector)
+            indexed_vectors.append((index, vector))
+        indexed_vectors.sort(key=lambda item: item[0])
+        self.request_diagnostics.append(
+            {
+                "deployment": self.deployment,
+                "batch_start": batch_start,
+                "batch_size": len(texts),
+                "duration_ms": duration_ms,
+                "usage": _usage_payload(getattr(response, "usage", None)),
+            }
+        )
+        return [vector for _, vector in indexed_vectors]
+
+    def _validate_vector(self, vector: list[float]) -> None:
+        if not vector:
+            raise ProviderCapabilityError("Azure embedding response contained an empty vector.")
+        dimension = len(vector)
+        expected = self.expected_dimension or self.validated_dimension
+        if expected is not None and dimension != expected:
+            raise ProviderCapabilityError(
+                f"Azure embedding dimension mismatch: expected {expected}, got {dimension}."
+            )
+        if self.validated_dimension is None:
+            self.validated_dimension = dimension
+        if any(math.isnan(value) or math.isinf(value) for value in vector):
+            raise ProviderCapabilityError("Azure embedding vector contained NaN or infinity.")
+
+    def _get_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        if not self.settings.azure_openai_api_key:
+            raise ConfigError("AZURE_OPENAI_API_KEY is required for Azure embeddings.")
+        module = import_module("openai")
+        if self.settings.azure_openai_base_url:
+            self._client = module.OpenAI(
+                api_key=self.settings.azure_openai_api_key,
+                base_url=self.settings.azure_openai_base_url,
+                timeout=self.settings.azure_openai_request_timeout_seconds,
+                max_retries=self.settings.azure_openai_max_retries,
+            )
+            return self._client
+        if not self.settings.azure_openai_endpoint:
+            raise ConfigError("AZURE_OPENAI_ENDPOINT is required for Azure embeddings.")
+        if not self.settings.azure_openai_api_version:
+            raise ConfigError("AZURE_OPENAI_API_VERSION is required for Azure embeddings.")
+        self._client = module.AzureOpenAI(
+            api_key=self.settings.azure_openai_api_key,
+            azure_endpoint=self.settings.azure_openai_endpoint,
+            api_version=self.settings.azure_openai_api_version,
+            timeout=self.settings.azure_openai_request_timeout_seconds,
+            max_retries=self.settings.azure_openai_max_retries,
+        )
+        return self._client
+
+
 def select_embedding_provider(settings: Settings) -> EmbeddingProvider:
     """Select the configured embedding provider.
 
@@ -233,6 +359,8 @@ def select_embedding_provider(settings: Settings) -> EmbeddingProvider:
     """
 
     settings.ensure_project_cache_paths()
+    if settings.embedding_provider == "azure_openai":
+        return AzureOpenAIEmbeddingProvider(settings)
     if settings.embedding_provider == "sentence_transformers":
         return SentenceTransformerEmbeddingProvider(
             settings.embedding_model,
@@ -250,6 +378,20 @@ def _as_float_vector(vector: Any) -> list[float]:
     if hasattr(vector, "tolist"):
         vector = vector.tolist()
     return [float(value) for value in vector]
+
+
+def _usage_payload(usage: Any) -> dict[str, Any] | None:
+    if usage is None:
+        return None
+    if hasattr(usage, "model_dump"):
+        return cast(dict[str, Any], usage.model_dump(mode="json"))
+    if isinstance(usage, dict):
+        return cast(dict[str, Any], usage)
+    return {
+        name: getattr(usage, name)
+        for name in ("prompt_tokens", "total_tokens", "input_tokens")
+        if getattr(usage, name, None) is not None
+    }
 
 
 def _configure_hf_token(hf_token: str | None) -> None:

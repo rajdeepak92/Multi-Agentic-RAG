@@ -1,0 +1,125 @@
+{
+  "facts": [
+    {
+      "fact_id": "temperature-normal-range",
+      "fact_key": "threshold:temperature:normal",
+      "fact_type": "threshold",
+      "subject": "Temperature Sensor",
+      "predicate": "has_normal_range",
+      "value": "10-50",
+      "unit": "°C",
+      "page": 5,
+      "section": "6.9 Sensor and Actuator Data Sheet"
+    },
+    {
+      "fact_id": "temperature-min-threshold",
+      "fact_key": "threshold:temperature:min",
+      "fact_type": "threshold",
+      "subject": "Temperature Sensor",
+      "predicate": "has_min_threshold",
+      "value": "5-10",
+      "unit": "°C",
+      "page": 5,
+      "section": "6.9 Sensor and Actuator Data Sheet"
+    },
+    {
+      "fact_id": "temperature-max-threshold",
+      "fact_key": "threshold:temperature:max",
+      "fact_type": "threshold",
+      "subject": "Temperature Sensor",
+      "predicate": "has_max_threshold",
+      "value": "50-70",
+      "unit": "°C",
+      "page": 5,
+      "section": "6.9 Sensor and Actuator Data Sheet"
+    },
+    {
+      "fact_id": "temperature-critical-level",
+      "fact_key": "threshold:temperature:critical",
+      "fact_type": "critical_value",
+      "subject": "Temperature Sensor",
+      "predicate": "has_critical_level",
+      "value": ">70",
+      "unit": "°C",
+      "page": 5,
+      "section": "6.9 Sensor and Actuator Data Sheet"
+    },
+    {
+      "fact_id": "vibration-threshold",
+      "fact_key": "threshold:vibration:max",
+      "fact_type": "threshold",
+      "subject": "Vibration Sensor",
+      "predicate": "has_max_threshold",
+      "value": "50-70",
+      "unit": "mm/s",
+      "page": 5,
+      "section": "6.9 Sensor and Actuator Data Sheet"
+    },
+    {
+      "fact_id": "gas-threshold",
+      "fact_key": "threshold:gas:max",
+      "fact_type": "threshold",
+      "subject": "Gas Sensor",
+      "predicate": "has_max_threshold",
+      "value": "600-800",
+      "unit": "ppm",
+      "page": 5,
+      "section": "6.9 Sensor and Actuator Data Sheet"
+    },
+    {
+      "fact_id": "pressure-threshold",
+      "fact_key": "threshold:pressure:max",
+      "fact_type": "threshold",
+      "subject": "Pressure Sensor",
+      "predicate": "has_max_threshold",
+      "value": "8-10",
+      "unit": "bar",
+      "page": 5,
+      "section": "6.9 Sensor and Actuator Data Sheet"
+    },
+    {
+      "fact_id": "gas-leakage-emergency-shutdown",
+      "fact_key": "automation:gas:emergency_shutdown",
+      "fact_type": "automation_action",
+      "subject": "Gas leakage",
+      "predicate": "triggers",
+      "value": "Emergency shutdown",
+      "unit": null,
+      "page": 5,
+      "section": "6.10 Automatic System Control Actions"
+    },
+    {
+      "fact_id": "temperature-vibration-combined-action",
+      "fact_key": "automation:temperature_vibration:combined_action",
+      "fact_type": "automation_action",
+      "subject": "Temperature and vibration",
+      "predicate": "triggers",
+      "value": "Trip motor and send alert",
+      "unit": null,
+      "page": 5,
+      "section": "6.10 Automatic System Control Actions"
+    },
+    {
+      "fact_id": "offline-retention-value",
+      "fact_key": "retention:offline:latest_good_data",
+      "fact_type": "retention_period",
+      "subject": "Offline synchronization",
+      "predicate": "retains",
+      "value": "latest good data",
+      "unit": null,
+      "page": 6,
+      "section": "7 Non-Functional Requirements"
+    },
+    {
+      "fact_id": "sensor-polling-count",
+      "fact_key": "polling:sensor:count",
+      "fact_type": "polling_count",
+      "subject": "Modbus polling",
+      "predicate": "polls_sensors",
+      "value": "three sensors",
+      "unit": null,
+      "page": 3,
+      "section": "6 Functional Requirements"
+    }
+  ]
+}

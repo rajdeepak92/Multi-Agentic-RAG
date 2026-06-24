@@ -6,12 +6,13 @@ from typing import Literal
 
 from multi_agentic_rag.config import Settings, get_settings
 from multi_agentic_rag.exceptions import ConfigError
+from multi_agentic_rag.llm.azure_openai import AzureOpenAIReasoningClient
 from multi_agentic_rag.llm.gemini_reasoning import GeminiReasoningClient
 from multi_agentic_rag.llm.hf_reasoning import HuggingFaceReasoningClient
 from multi_agentic_rag.llm.openai_reasoning import OpenAIReasoningClient
 from multi_agentic_rag.llm.structured import ReasoningClient
 
-ReasoningModelSelector = Literal["openai", "hf", "huggingface", "gemini"]
+ReasoningModelSelector = Literal["openai", "azure_openai", "hf", "huggingface", "gemini"]
 
 
 def build_reasoning_client(
@@ -27,6 +28,8 @@ def build_reasoning_client(
         model_selector = "hf"
     if model_selector == "openai":
         return OpenAIReasoningClient(loaded_settings)
+    if model_selector == "azure_openai":
+        return AzureOpenAIReasoningClient(loaded_settings)
     if model_selector == "hf":
         return HuggingFaceReasoningClient(loaded_settings)
     if model_selector == "gemini":

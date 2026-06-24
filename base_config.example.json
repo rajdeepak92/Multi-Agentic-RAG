@@ -21,8 +21,25 @@
     "ssl_mode": "require"
   },
   "chroma": {
-    "collection": "multi_agentic_rag_chunks_minilm_l6_v1",
+    "collection": "multi_agentic_rag_azure_enterprise_v3",
     "allow_legacy_without_fingerprint": false
+  },
+  "azure_openai": {
+    "endpoint_env": "AZURE_OPENAI_ENDPOINT",
+    "api_key_env": "AZURE_OPENAI_API_KEY",
+    "api_version_env": "AZURE_OPENAI_API_VERSION",
+    "generation_deployment": "gpt-5.2-chat",
+    "answer_deployment": "gpt-5.2-chat",
+    "analysis_deployment": "gpt-5.2-chat",
+    "utility_deployment": "gpt-4o-mini",
+    "validation_deployment": "gpt-4o-mini",
+    "reranker_deployment": "gpt-4o-mini",
+    "embedding_deployment": "text-embedding-3-large",
+    "request_timeout_seconds": 180,
+    "max_retries": 3,
+    "retry_backoff_seconds": 2.0,
+    "max_concurrent_requests": 4,
+    "capability_cache_ttl_seconds": 3600
   },
   "neo4j": {
     "uri": "bolt://127.0.0.1:7687",
@@ -47,14 +64,19 @@
     "allow_degraded_retrieval": false,
     "answer_top_k": 10,
     "answer_max_evidence": 20,
-    "answer_max_snippets": 8
+    "answer_max_snippets": 8,
+    "minimum_evidence_count": 3,
+    "minimum_target_requirement_coverage": 1.0,
+    "require_quality_assessment": true
   },
   "lexical": {
     "backend": "postgres_fts",
     "native_fts_allowed": true
   },
   "reasoning": {
-    "provider": "openai",
+    "provider": "azure_openai",
+    "temperature": 0.0,
+    "store_responses": false,
     "openai_model": "gpt-5.5",
     "openai_effort": "medium",
     "openai_store_responses": false,
@@ -70,22 +92,48 @@
     "hf_top_p": 0.8,
     "hf_top_k": 20,
     "hf_enable_thinking": false,
-    "structured_retries": 1
+    "structured_retries": 2,
+    "analysis_max_output_tokens": 8192,
+    "generation_max_output_tokens": 12288,
+    "validation_max_output_tokens": 4096,
+    "answer_max_output_tokens": 4096,
+    "fact_review_max_output_tokens": 4096,
+    "reranking_max_output_tokens": 2048,
+    "fail_on_truncation": true,
+    "fail_on_schema_error": true,
+    "fail_on_empty_output": true
   },
   "embeddings": {
-    "provider": "sentence_transformers",
-    "model": "sentence-transformers/all-MiniLM-L6-v2",
-    "revision": "default",
-    "dimension": 384,
+    "provider": "azure_openai",
+    "model": "text-embedding-3-large",
+    "deployment": "text-embedding-3-large",
+    "revision": "azure-v1",
+    "expected_dimension": null,
     "device": "auto",
     "normalize": true,
     "distance_metric": "cosine",
-    "prompt_profile": "default"
+    "prompt_profile": "enterprise_requirements_v3",
+    "batch_size": 64
   },
   "reranking": {
-    "provider": "none",
-    "model": null,
-    "device": "auto"
+    "provider": "azure_openai",
+    "deployment": "gpt-4o-mini",
+    "strategy": "listwise",
+    "candidate_top_k": 30,
+    "top_n": 12,
+    "temperature": 0.0,
+    "require_candidate_id_integrity": true,
+    "require_answerability_assessment": true
+  },
+  "facts": {
+    "semantic_review_enabled": true,
+    "minimum_confidence": 0.85,
+    "require_exact_evidence": true,
+    "require_unit_validation": true,
+    "reject_unsupported_facts": true,
+    "reject_conflicting_facts": true,
+    "reject_duplicate_facts": true,
+    "require_human_approval_for_semantic_promotion": true
   },
   "ingestion": {
     "chunk_size": 1200,
@@ -103,16 +151,40 @@
     "tesseract_cmd": null
   },
   "user_stories": {
-    "schema_version": "enterprise-user-story-v1",
+    "schema_version": "enterprise-user-story-v3",
+    "minimum_group_size": 1,
+    "maximum_group_size": 8,
     "requirement_batch_size": 6,
-    "max_stories_per_batch": 8,
+    "max_stories_per_batch": 3,
     "coverage_required_types": [
       "business_rule",
       "functional",
       "non_functional",
       "automation_rule"
     ],
-    "allow_partial_coverage": false
+    "minimum_acceptance_criteria": 3,
+    "maximum_acceptance_criteria": 7,
+    "minimum_quality_score": 85,
+    "minimum_traceability_score": 100,
+    "allow_partial_coverage": false,
+    "allow_generation_fallback": false,
+    "group_related_requirements": true,
+    "attach_acceptance_criteria": true,
+    "attach_definition_of_done": true,
+    "attach_non_functional_requirements": true,
+    "attach_scope_constraints": true,
+    "attach_threshold_facts": true,
+    "attach_automation_rules": true,
+    "require_evidence_excerpts": true,
+    "require_independent_validation": true,
+    "fail_on_generic_language": true,
+    "require_human_approval_before_published_status": false
+  },
+  "quality": {
+    "offline_benchmark_required": true,
+    "block_on_retrieval_regression": true,
+    "block_on_fact_regression": true,
+    "block_on_story_regression": true
   },
   "logging": {
     "level": "INFO"
@@ -120,6 +192,9 @@
   "secrets": {
     "postgres_dsn_env": "POSTGRES_DSN",
     "openai_api_key_env": "OPENAI_API_KEY",
+    "azure_openai_endpoint_env": "AZURE_OPENAI_ENDPOINT",
+    "azure_openai_api_key_env": "AZURE_OPENAI_API_KEY",
+    "azure_openai_api_version_env": "AZURE_OPENAI_API_VERSION",
     "gemini_api_key_env": "GEMINI_API_KEY",
     "hf_token_env": "HF_TOKEN",
     "neo4j_password_env": "NEO4J_PASSWORD"

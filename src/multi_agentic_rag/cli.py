@@ -33,10 +33,13 @@ from multi_agentic_rag.agents import (
 )
 from multi_agentic_rag.agents.ingestion import IngestionRequest
 from multi_agentic_rag.app import build_application
+from multi_agentic_rag.base_operations import create_run_directory, write_json_artifact
 from multi_agentic_rag.config import Settings, get_settings, reload_settings
 from multi_agentic_rag.domain import RequirementType, TaskIntent, TaskIntentType
 from multi_agentic_rag.exceptions import MultiAgenticRagError
 from multi_agentic_rag.infrastructure.chroma import ChromaVectorRepository
+from multi_agentic_rag.infrastructure.chroma.fingerprint import EmbeddingSpaceFingerprint
+from multi_agentic_rag.infrastructure.embeddings.provider import select_embedding_provider
 from multi_agentic_rag.infrastructure.neo4j import Neo4jGraphRepository
 from multi_agentic_rag.infrastructure.postgres import PostgresKnowledgeRepository
 from multi_agentic_rag.llm import (
@@ -45,9 +48,20 @@ from multi_agentic_rag.llm import (
     HuggingFaceReasoningClient,
     ReasoningClient,
     ReasoningModelSelector,
+    azure_preflight,
     build_reasoning_client,
     format_hf_reasoning_preflight_error,
     inspect_hf_reasoning_environment,
+)
+from multi_agentic_rag.quality.facts import (
+    evaluate_fact_quality,
+    render_fact_quality_markdown,
+    validate_facts,
+)
+from multi_agentic_rag.quality.retrieval import (
+    evaluate_retrieval_results,
+    render_retrieval_quality_markdown,
+    runtime_retrieval_proxies,
 )
 from multi_agentic_rag.requirements_ledger import (
     render_requirement_inventory_markdown,
@@ -541,6 +555,13 @@ def retrieve(
         bool,
         typer.Option("--show-graph-paths", help="Print graph traversal paths for graph hits."),
     ] = False,
+    show_quality_metrics: Annotated[
+        bool,
+        typer.Option(
+            "--show-quality-metrics",
+            help="Print runtime retrieval-quality proxies, not labelled precision/recall.",
+        ),
+    ] = False,
 ) -> None:
     """Retrieve ranked evidence chunks.
 
@@ -602,6 +623,8 @@ def retrieve(
     console.print(table)
     if show_graph_paths:
         _print_graph_paths(results)
+    if show_quality_metrics:
+        _print_runtime_retrieval_proxies(results)
 
 
 @app.command("ask")
@@ -627,6 +650,17 @@ def ask(
     review: Annotated[
         bool,
         typer.Option("--review/--no-review", help=REVIEW_OPTION_HELP),
+    ] = False,
+    explain_retrieval: Annotated[
+        bool,
+        typer.Option("--explain-retrieval", help="Print retrieval lineage details when available."),
+    ] = False,
+    show_quality_metrics: Annotated[
+        bool,
+        typer.Option(
+            "--show-quality-metrics",
+            help="Print runtime retrieval-quality proxy details when available.",
+        ),
     ] = False,
 ) -> None:
     """Answer a question using validated hybrid evidence and model synthesis."""
@@ -658,6 +692,22 @@ def ask(
                     },
                 }
             ],
+        )
+    if explain_retrieval or show_quality_metrics:
+        console.print(
+            json.dumps(
+                redact_secrets(
+                    {
+                        "query_intent": result.payload.get("query_intent"),
+                        "evidence_ids": result.evidence_ids,
+                        "runtime_quality_proxies": result.payload.get(
+                            "runtime_quality_proxies"
+                        ),
+                    }
+                ),
+                indent=2,
+                sort_keys=True,
+            )
         )
 
 
@@ -759,6 +809,151 @@ def requirements_audit(
 
     records, evidence, uncovered = asyncio.run(load_audit())
     _print_requirements_audit(records, evidence, uncovered)
+
+
+@app.command("facts-audit")
+def facts_audit(
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str, typer.Option("--version", help="Document version.")],
+    kb: Annotated[str, typer.Option("--kb", help="Knowledge base name or context.")] = "default",
+) -> None:
+    """Audit deterministic fact quality for a version scope."""
+
+    settings = get_settings()
+    repo = PostgresKnowledgeRepository.from_settings(settings)
+    facts = asyncio.run(
+        repo.list_facts_for_scope(
+            system_name=system,
+            kb_name=kb,
+            version=version,
+            active_only=True,
+        )
+    )
+    summary = validate_facts(facts)
+    run_id, run_dir = create_run_directory(settings.user_story_output_dir)
+    report = {
+        "run_id": run_id,
+        "scope": {"system": system, "kb": kb, "version": version},
+        "validation": summary.model_dump(mode="json"),
+    }
+    paths = _write_fact_quality_report(run_dir, report)
+    console.print(
+        "[green]PASS[/green] fact audit written: "
+        f"facts={summary.fact_count}, failed={summary.failed_count}"
+    )
+    for path in paths:
+        console.print(f"artifact: {path}")
+
+
+@app.command("facts-evaluate")
+def facts_evaluate(
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str, typer.Option("--version", help="Document version.")],
+    kb: Annotated[str, typer.Option("--kb", help="Knowledge base name or context.")] = "default",
+    golden_file: Annotated[
+        Path,
+        typer.Option("--golden-file", help="Labelled golden fact dataset."),
+    ] = Path("tests/fixtures/siimcs_facts_golden.json"),
+) -> None:
+    """Evaluate facts against a labelled golden dataset."""
+
+    settings = get_settings()
+    repo = PostgresKnowledgeRepository.from_settings(settings)
+    facts = asyncio.run(
+        repo.list_facts_for_scope(
+            system_name=system,
+            kb_name=kb,
+            version=version,
+            active_only=True,
+        )
+    )
+    golden_payload = _load_json_file(golden_file)
+    golden_records = (
+        golden_payload.get("facts", [])
+        if isinstance(golden_payload, dict)
+        else golden_payload
+    )
+    if not isinstance(golden_records, list):
+        raise typer.BadParameter("Golden fact file must contain a list or {'facts': [...]} object.")
+    report = evaluate_fact_quality(facts, golden_records)
+    run_id, run_dir = create_run_directory(settings.user_story_output_dir)
+    report = {
+        "run_id": run_id,
+        "scope": {"system": system, "kb": kb, "version": version},
+        "golden_file": str(golden_file),
+        **report,
+    }
+    paths = _write_fact_quality_report(run_dir, report)
+    console.print(
+        "[green]PASS[/green] fact evaluation written: "
+        f"precision={report['precision']:.3f}, recall={report['recall']:.3f}"
+    )
+    for path in paths:
+        console.print(f"artifact: {path}")
+
+
+@app.command("retrieval-evaluate")
+def retrieval_evaluate(
+    dataset: Annotated[Path, typer.Option("--dataset", help="Golden retrieval dataset.")],
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str, typer.Option("--version", help="Document version.")],
+    kb: Annotated[str, typer.Option("--kb", help="Knowledge base name or context.")] = "default",
+) -> None:
+    """Evaluate hybrid retrieval against a labelled golden dataset."""
+
+    settings = get_settings()
+    payload = _load_json_file(dataset)
+    records = payload.get("queries", payload) if isinstance(payload, dict) else payload
+    if not isinstance(records, list):
+        raise typer.BadParameter("Retrieval dataset must contain a list or {'queries': [...]}.")
+
+    async def run_queries() -> dict[str, list[dict[str, Any]]]:
+        retriever = _build_retriever(settings)
+        output: dict[str, list[dict[str, Any]]] = {}
+        for record in records:
+            query_id = str(record["query_id"])
+            results = await retriever.retrieve(
+                str(record["query"]),
+                system_name=system,
+                kb_name=kb,
+                version=version,
+                top_k=settings.retrieval_rerank_top_k,
+            )
+            output[query_id] = [
+                {
+                    "chunk_id": result.chunk_id,
+                    "requirement_ids": result.metadata.get("requirement_ids", []),
+                    "fact_ids": result.metadata.get("fact_ids", []),
+                    "page": result.page,
+                    "section": result.metadata.get("section"),
+                    "text": result.text,
+                    "sources": result.sources,
+                }
+                for result in results
+            ]
+        return output
+
+    results_by_query_id = asyncio.run(run_queries())
+    report = evaluate_retrieval_results(
+        records,
+        results_by_query_id,
+        k=settings.retrieval_rerank_top_k,
+    )
+    run_id, run_dir = create_run_directory(settings.user_story_output_dir)
+    report = {
+        "run_id": run_id,
+        "scope": {"system": system, "kb": kb, "version": version},
+        "dataset": str(dataset),
+        "results_by_query_id": results_by_query_id,
+        **report,
+    }
+    paths = _write_retrieval_quality_report(run_dir, report)
+    console.print(
+        "[green]PASS[/green] retrieval evaluation written: "
+        f"queries={report['summary'].get('query_count', 0)}"
+    )
+    for path in paths:
+        console.print(f"artifact: {path}")
 
 
 @app.command("requirements-rebuild")
@@ -865,6 +1060,53 @@ def chroma_reindex(
     )
 
 
+@app.command("reindex-chroma")
+def reindex_chroma(
+    system: Annotated[str, typer.Option("--system", help="System name.")],
+    version: Annotated[str, typer.Option("--version", help="Document version.")],
+    kb: Annotated[str, typer.Option("--kb", help="Knowledge base name or context.")] = "default",
+    target_collection: Annotated[
+        str | None,
+        typer.Option("--target-collection", help="Target Chroma collection name."),
+    ] = None,
+) -> None:
+    """Compatibility alias for enterprise Chroma re-indexing."""
+
+    settings = get_settings()
+    if target_collection:
+        settings.chroma_collection = target_collection
+    chroma_reindex(system=system, version=version, kb=kb, requirements=True)
+
+
+@app.command("validate-index")
+def validate_index(
+    collection: Annotated[str, typer.Option("--collection", help="Chroma collection name.")],
+) -> None:
+    """Validate a Chroma collection against the current embedding fingerprint."""
+
+    settings = get_settings()
+    settings.chroma_collection = collection
+    status, detail = ChromaVectorRepository.from_settings(settings).check_connection()
+    _print_check("Chroma index", status, detail)
+
+
+@app.command("activate-index")
+def activate_index(
+    collection: Annotated[str, typer.Option("--collection", help="Chroma collection name.")],
+) -> None:
+    """Validate a collection and print the explicit config cutover instruction."""
+
+    settings = get_settings()
+    settings.chroma_collection = collection
+    status, detail = ChromaVectorRepository.from_settings(settings).check_connection()
+    _print_check("Chroma index", status, detail)
+    console.print(
+        "[yellow]ACTION[/yellow] Update base_config.json chroma.collection to "
+        f"{collection!r} after retrieval benchmarks pass. This command does not "
+        "rewrite configuration automatically."
+    )
+
+
 @app.command("user-stories")
 def user_stories(
     system: Annotated[str, typer.Option("--system", help="System name.")],
@@ -877,6 +1119,14 @@ def user_stories(
     review: Annotated[
         bool,
         typer.Option("--review/--no-review", help=REVIEW_OPTION_HELP),
+    ] = False,
+    explain_generation: Annotated[
+        bool,
+        typer.Option("--explain-generation", help="Print generation run metadata."),
+    ] = False,
+    show_quality_metrics: Annotated[
+        bool,
+        typer.Option("--show-quality-metrics", help="Print validation and coverage metadata."),
     ] = False,
 ) -> None:
     """Generate user-story YAML artifacts from an already ingested version."""
@@ -909,6 +1159,21 @@ def user_stories(
                     },
                 }
             ],
+        )
+    if explain_generation or show_quality_metrics:
+        console.print(
+            json.dumps(
+                redact_secrets(
+                    {
+                        "run_id": result.payload.get("run_id"),
+                        "artifact_count": len(result.artifact_paths),
+                        "evidence_ids": result.evidence_ids,
+                        "messages": result.messages,
+                    }
+                ),
+                indent=2,
+                sort_keys=True,
+            )
         )
 
 
@@ -1100,6 +1365,81 @@ def health_check() -> None:
 
     if failures:
         raise typer.Exit(code=1)
+
+
+@app.command("azure-check")
+def azure_check() -> None:
+    """Validate redacted Azure OpenAI configuration and deployment routing."""
+
+    settings = get_settings()
+    try:
+        manifest = azure_preflight(settings)
+    except MultiAgenticRagError as exc:
+        _print_cli_error(exc)
+    table = Table(title="Azure OpenAI Preflight")
+    table.add_column("Field")
+    table.add_column("Value")
+    redacted = manifest.redacted_manifest()
+    table.add_row("endpoint", str(redacted["endpoint"]))
+    table.add_row("api key", "present" if redacted["api_key_configured"] else "missing")
+    table.add_row(
+        "api version",
+        "configured" if redacted["api_version_configured"] else "missing",
+    )
+    for name, record in redacted["deployments"].items():
+        table.add_row(
+            f"{name} deployment",
+            f"{record['deployment']} ({record['api_style']}, reachable={record['reachable']})",
+        )
+    embedding_record = redacted["embedding_deployment"]
+    table.add_row("embedding deployment", str(embedding_record["deployment"]))
+    table.add_row("timeout seconds", str(redacted["request_timeout_seconds"]))
+    table.add_row("max retries", str(redacted["max_retries"]))
+    console.print(table)
+
+
+@app.command("embedding-check")
+def embedding_check() -> None:
+    """Check configured embedding provider metadata and fingerprint."""
+
+    settings = get_settings()
+    try:
+        provider = select_embedding_provider(settings)
+        fingerprint = EmbeddingSpaceFingerprint.from_settings(settings)
+    except MultiAgenticRagError as exc:
+        _print_cli_error(exc)
+    table = Table(title="Embedding Provider")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("provider", getattr(provider, "name", settings.embedding_provider))
+    table.add_row("model/deployment", getattr(provider, "model", settings.embedding_model))
+    table.add_row("fingerprint_hash", fingerprint.hash)
+    table.add_row("dimension", str(fingerprint.dimension))
+    table.add_row("distance_metric", fingerprint.distance_metric)
+    console.print(table)
+
+
+@app.command("reranker-check")
+def reranker_check() -> None:
+    """Check configured reranking provider construction."""
+
+    settings = get_settings()
+    try:
+        reranker = select_reranker(settings)
+    except MultiAgenticRagError as exc:
+        _print_cli_error(exc)
+    table = Table(title="Reranker Provider")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("provider", settings.reranker_provider)
+    table.add_row("class", type(reranker).__name__)
+    table.add_row(
+        "deployment/model",
+        settings.reranker_deployment or settings.reranker_model or "-",
+    )
+    table.add_row("strategy", settings.reranker_strategy)
+    table.add_row("top_n", str(settings.reranker_top_n))
+    console.print(table)
 
 
 @app.command("hf-check")
@@ -1475,6 +1815,22 @@ def _print_graph_paths(results: list[Any]) -> None:
         console.print("\n[yellow]No graph paths attached to these results.[/yellow]")
 
 
+def _print_runtime_retrieval_proxies(results: list[Any]) -> None:
+    payload = runtime_retrieval_proxies(
+        [
+            {
+                "chunk_id": result.chunk_id,
+                "source_name": result.source_name,
+                "page": result.page,
+                "sources": result.sources,
+                "metadata": result.metadata,
+            }
+            for result in results
+        ]
+    )
+    console.print(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def _emit_requirements_payload(
     payload: dict[str, Any],
     *,
@@ -1584,6 +1940,35 @@ def _print_check(service: str, status: bool, detail: str) -> None:
     console.print(f"{service}: {'PASS' if status else 'FAIL'} - {detail}")
     if not status:
         raise typer.Exit(code=1)
+
+
+def _load_json_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(f"JSON file does not exist: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"Invalid JSON in {path}: {exc}") from exc
+
+
+def _write_fact_quality_report(run_dir: Path, report: dict[str, Any]) -> list[Path]:
+    artifact_dir = run_dir / "artifacts"
+    json_path = write_json_artifact(artifact_dir / "fact_quality_report.json", report)
+    markdown = render_fact_quality_markdown(report)
+    md_path = artifact_dir / "fact_quality_report.md"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text(markdown, encoding="utf-8")
+    return [json_path, md_path]
+
+
+def _write_retrieval_quality_report(run_dir: Path, report: dict[str, Any]) -> list[Path]:
+    artifact_dir = run_dir / "artifacts"
+    json_path = write_json_artifact(artifact_dir / "retrieval_quality_report.json", report)
+    markdown = render_retrieval_quality_markdown(report)
+    md_path = artifact_dir / "retrieval_quality_report.md"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text(markdown, encoding="utf-8")
+    return [json_path, md_path]
 
 
 def _print_hf_reasoning_report(report: HFReasoningEnvironmentReport) -> None:

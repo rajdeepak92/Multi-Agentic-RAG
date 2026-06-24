@@ -67,12 +67,16 @@ def test_user_story_graph_uses_structured_provider_and_preserves_provenance(
     assert state["fused_results"][0].fused_score is not None
     assert state["reranked_evidence"][0].final_rank == 1
     trace = json.loads(state["debug_trace_path"].read_text(encoding="utf-8"))
+    run_manifest = json.loads(state["run_manifest_path"].read_text(encoding="utf-8"))
     assert trace["reasoning_provider"] == "hf"
     assert trace["reasoning_model"] == "fake-structured-model"
     assert {item["status"] for item in trace["source_responses"]} == {"success"}
     assert trace["source_responses"][0]["candidates"][0]["score"] in {-4.0, 0.82, 3.0}
     assert "password" not in state["debug_trace_path"].read_text(encoding="utf-8")
+    assert run_manifest["run_status"] == "succeeded"
+    assert run_manifest["publication_status"] == "published"
     assert state["artifact_paths"]
+    assert any(Path(path).suffix == ".json" for path in state["artifact_paths"])
 
 
 def test_user_story_graph_distinguishes_empty_failed_and_degraded_sources(
@@ -254,7 +258,7 @@ def test_user_story_graph_generates_in_configured_requirement_batches(
     assert state["coverage_payload"]["counts"] == {"covered": 2}
 
 
-def test_user_story_graph_uses_ledger_fallback_when_structured_generation_fails(
+def test_user_story_graph_fails_without_fallback_when_structured_generation_fails(
     tmp_path: Path,
 ) -> None:
     repository = FakeRequirementRepository([_requirement_record("REQ-1")])
@@ -273,13 +277,21 @@ def test_user_story_graph_uses_ledger_fallback_when_structured_generation_fails(
         )
     )
 
-    assert state["result"].status == "succeeded"
-    assert "bad json" in state["generation_fallback_reason"]
-    assert state["validated_stories"][0].traceability["generation_mode"] == (
-        "deterministic_ledger_fallback"
-    )
-    assert state["coverage_payload"]["counts"] == {"covered": 1}
-    assert repository.coverage_records[0].canonical_id == "REQ-1"
+    provider_errors_path = state["provider_errors_path"]
+    provider_errors_text = provider_errors_path.read_text(encoding="utf-8")
+    run_manifest = json.loads(state["run_manifest_path"].read_text(encoding="utf-8"))
+    assert state["result"].status == "failed"
+    assert state["failure_error_type"] == "StructuredGenerationError"
+    assert "bad json" in state["errors"][0]
+    assert "generation_fallback_reason" not in state
+    assert "validated_stories" not in state
+    assert state["artifact_paths"] == []
+    assert repository.coverage_records == []
+    assert provider_errors_path.exists()
+    assert "StructuredGenerationError" in provider_errors_text
+    assert "bad json" in provider_errors_text
+    assert run_manifest["run_status"] == "failed"
+    assert run_manifest["publication_status"] == "failed"
 
 
 def test_invalid_structured_output_writes_redacted_debug_and_no_yaml(tmp_path: Path) -> None:
@@ -312,6 +324,31 @@ def test_invalid_structured_output_writes_redacted_debug_and_no_yaml(tmp_path: P
     assert "password" not in invalid_text
     assert "***" in invalid_text
     assert state["artifact_paths"] == []
+
+
+def test_generic_story_language_blocks_publication(tmp_path: Path) -> None:
+    repository = FakeRequirementRepository([_requirement_record("BR-001")])
+    runtime = _runtime(
+        tmp_path,
+        GenericStoryReasoning(),
+        FakeRetriever([_retrieval_result("postgres")]),
+        FakeRetriever([_retrieval_result("chroma")]),
+        FakeRetriever([_retrieval_result("neo4j")]),
+        requirement_repository=repository,
+        structured_generation_retry_count=0,
+    )
+
+    state = asyncio.run(
+        UserStoryGenerationAgent(runtime).graph.ainvoke(
+            {"request": UserStoryGenerationRequest(system="PROJECT_1", version="v1")}
+        )
+    )
+
+    assert state["result"].status == "failed"
+    assert state["failure_error_type"] == "UserStoryQualityError"
+    assert "prohibited generic language" in state["errors"][0]
+    assert state["artifact_paths"] == []
+    assert repository.coverage_records == []
 
 
 def test_application_composition_invokes_two_agents_in_sequence(tmp_path: Path) -> None:
@@ -489,6 +526,55 @@ class BatchAwareStructuredReasoning(FakeStructuredReasoning):
                     }
                 ],
                 "reasoning_summary": "batch generation",
+            }
+        )
+
+
+class GenericStoryReasoning(FakeStructuredReasoning):
+    async def generate_structured(
+        self,
+        *,
+        prompt: str,
+        schema: type[Any],
+        generation_config: GenerationConfig,
+    ) -> Any:
+        if schema is not LLMGeneratedUserStoryBatch:
+            return await super().generate_structured(
+                prompt=prompt,
+                schema=schema,
+                generation_config=generation_config,
+            )
+        return LLMGeneratedUserStoryBatch.model_validate(
+            {
+                "stories": [
+                    {
+                        "id": "US-GENERIC",
+                        "title": "Support BR-001",
+                        "type": "functional",
+                        "domain": "industrial",
+                        "priority": "medium",
+                        "status": "draft",
+                        "persona": "operator",
+                        "user_story": (
+                            "As an operator, I want the system to satisfy BR-001 "
+                            "so that documented business behavior is delivered."
+                        ),
+                        "business_value": "Provides traceable implementation coverage.",
+                        "description": "Implement requirement BR-001.",
+                        "acceptance_criteria": ["The feature works as expected."],
+                        "non_functional_requirements": [],
+                        "dependencies": [],
+                        "definition_of_ready": ["Requirement evidence is present."],
+                        "definition_of_done": ["Requirement BR-001 is covered."],
+                        "traceability": {
+                            "chunk_ids": ["chunk-1"],
+                            "requirement_ids": ["BR-001"],
+                            "fact_ids": [],
+                            "evidence_paths": [["Chunk:chunk-1"]],
+                        },
+                    }
+                ],
+                "reasoning_summary": "generic story",
             }
         )
 

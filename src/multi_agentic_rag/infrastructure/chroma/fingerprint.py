@@ -31,9 +31,14 @@ class EmbeddingSpaceFingerprint(BaseModel):
 
         fingerprint = cls(
             provider=settings.embedding_provider,
-            model=settings.embedding_model,
+            model=settings.embedding_deployment
+            or (
+                settings.azure_openai_embedding_deployment
+                if settings.embedding_provider == "azure_openai"
+                else settings.embedding_model
+            ),
             revision=settings.embedding_model_revision,
-            dimension=settings.embedding_dimensions,
+            dimension=settings.embedding_expected_dimension or settings.embedding_dimensions,
             normalization="l2" if settings.embedding_normalize else "none",
             distance_metric=settings.embedding_distance_metric,
             prompt_profile=settings.embedding_prompt_profile,
