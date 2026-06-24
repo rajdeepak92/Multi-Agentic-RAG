@@ -21,7 +21,7 @@
     "ssl_mode": "require"
   },
   "chroma": {
-    "collection": "multi_agentic_rag_azure_enterprise_v3",
+    "collection": "multi_agentic_rag_chunks_minilm_l6_v1",
     "allow_legacy_without_fingerprint": false
   },
   "azure_openai": {
@@ -74,7 +74,7 @@
     "native_fts_allowed": true
   },
   "reasoning": {
-    "provider": "azure_openai",
+    "provider": "hf",
     "temperature": 0.0,
     "store_responses": false,
     "openai_model": "gpt-5.5",
@@ -104,26 +104,28 @@
     "fail_on_empty_output": true
   },
   "embeddings": {
-    "provider": "azure_openai",
-    "model": "text-embedding-3-large",
-    "deployment": "text-embedding-3-large",
-    "revision": "azure-v1",
-    "expected_dimension": null,
+    "provider": "sentence_transformers",
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
+    "deployment": null,
+    "revision": "default",
+    "expected_dimension": 384,
     "device": "auto",
     "normalize": true,
     "distance_metric": "cosine",
-    "prompt_profile": "enterprise_requirements_v3",
+    "prompt_profile": "default",
     "batch_size": 64
   },
   "reranking": {
-    "provider": "azure_openai",
-    "deployment": "gpt-4o-mini",
+    "provider": "sentence_transformers",
+    "deployment": null,
     "strategy": "listwise",
     "candidate_top_k": 30,
     "top_n": 12,
     "temperature": 0.0,
     "require_candidate_id_integrity": true,
-    "require_answerability_assessment": true
+    "require_answerability_assessment": true,
+    "model": "cross-encoder/ms-marco-MiniLM-L6-v2",
+    "device": "auto"
   },
   "facts": {
     "semantic_review_enabled": true,
