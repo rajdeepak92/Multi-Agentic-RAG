@@ -780,116 +780,233 @@ class UserStoryGraphRuntime:
                 stage="generate_structured_output",
             )
 
-    async def validate_output(self, state: UserStoryGenerationState) -> UserStoryGenerationState:
-        """Validate every generated story before YAML publication."""
+    async def validate_output(
+        self,
+        state: UserStoryGenerationState,
+    ) -> UserStoryGenerationState:
+        """Validate generated stories before publication."""
 
         try:
-            reports: list[QualityValidationReport] = []
+            validated_stories = state.get(
+                "validated_stories",
+                [],
+            )
+            ledger_backed = bool(state.get("ledger_requirements"))
+
+            reports_by_story = dict(
+                state.get(
+                    "validation_reports_by_story",
+                    {},
+                )
+            )
+            story_validation_failures: dict[
+                str,
+                list[str],
+            ] = {}
+
+            pending_story_ids = set(
+                state.get(
+                    "pending_validation_story_ids",
+                    [],
+                )
+            )
+            validate_all_stories = not pending_story_ids
+
             story_evidence_bundles = state.get(
                 "story_evidence_bundles",
                 {},
             )
+            story_batch_requirement_ids = state.get(
+                "story_batch_requirement_ids",
+                {},
+            )
+            requirement_evidence_map = state.get(
+                "requirement_evidence_map",
+                {},
+            )
 
-            for story in state.get("validated_stories", []):
+            for story in validated_stories:
+                local_failures: list[str] = []
+
                 story_evidence = story_evidence_bundles.get(story.id)
 
-                if story_evidence is None:
-                    if state.get("ledger_requirements"):
-                        reports.append(
-                            QualityValidationReport(
-                                status="failed",
-                                messages=[
-                                    (
-                                        f"Story {story.id} has no associated "
-                                        "authoritative requirement evidence "
-                                        "bundle."
-                                    )
-                                ],
-                                checks={
-                                    "evidence_traceable": False,
-                                    "citations_supported": False,
-                                    "schema_complete": True,
-                                    "unsupported_claims_absent": False,
-                                },
-                            )
+                if ledger_backed:
+                    if story_evidence is None:
+                        local_failures = [
+                            f"Story {story.id}: no authoritative "
+                            "evidence bundle is associated with "
+                            "the story."
+                        ]
+                    else:
+                        local_failures = _deterministic_traceability_failures(
+                            story,
+                            allowed_requirement_ids=(
+                                story_batch_requirement_ids.get(
+                                    story.id,
+                                    [],
+                                )
+                            ),
+                            requirement_evidence_map=(requirement_evidence_map),
+                            evidence_bundle=story_evidence,
                         )
-                        continue
+                else:
+                    # Compatibility path for workflows that do not use
+                    # the PostgreSQL requirement ledger.
+                    story_evidence = story_evidence or state["evidence_bundle"]
 
-                    # Compatibility path for non-ledger workflows.
-                    story_evidence = state["evidence_bundle"]
-                reports.append(
-                    await self.reasoning_client.validate_user_story(
+                if local_failures:
+                    report = _local_traceability_report(local_failures)
+                    reports_by_story[story.id] = report
+                    story_validation_failures[story.id] = local_failures
+                    continue
+
+                if story_evidence is None:
+                    local_failures = [
+                        f"Story {story.id}: no evidence bundle is available for validation."
+                    ]
+                    report = _local_traceability_report(local_failures)
+                    reports_by_story[story.id] = report
+                    story_validation_failures[story.id] = local_failures
+                    continue
+
+                should_call_provider = (
+                    validate_all_stories
+                    or story.id in pending_story_ids
+                    or story.id not in reports_by_story
+                )
+
+                if should_call_provider:
+                    report = await self.reasoning_client.validate_user_story(
                         story,
                         story_evidence,
                     )
-                )
+                    reports_by_story[story.id] = report
+                else:
+                    report = reports_by_story[story.id]
+
+                if report.status == "failed":
+                    story_validation_failures[story.id] = list(report.messages)
+
+            if self.settings.user_story_fail_on_generic_language:
+                for story in validated_stories:
+                    generic_failures = _generic_story_failures(story)
+
+                    if not generic_failures:
+                        continue
+
+                    story_validation_failures.setdefault(
+                        story.id,
+                        [],
+                    ).extend(generic_failures)
+
+                    existing_report = reports_by_story.get(story.id)
+
+                    existing_messages = list(existing_report.messages) if existing_report else []
+                    existing_checks = dict(existing_report.checks) if existing_report else {}
+
+                    existing_checks["generic_language_absent"] = False
+
+                    reports_by_story[story.id] = QualityValidationReport(
+                        status="failed",
+                        messages=[
+                            *existing_messages,
+                            *generic_failures,
+                        ],
+                        checks=existing_checks,
+                    )
+
+            reports = [
+                reports_by_story[story.id]
+                for story in validated_stories
+                if story.id in reports_by_story
+            ]
+
             failures = [
                 message
-                for report in reports
-                if report.status == "failed"
-                for message in report.messages
+                for story_id in sorted(story_validation_failures)
+                for message in story_validation_failures[story_id]
             ]
-            if self.settings.user_story_fail_on_generic_language:
-                failures.extend(
-                    message
-                    for story in state.get("validated_stories", [])
-                    for message in _generic_story_failures(story)
-                )
 
             state = {
                 **state,
                 "validation_reports": reports,
+                "validation_reports_by_story": (reports_by_story),
                 "validation_failures": failures,
+                "story_validation_failures": (story_validation_failures),
             }
 
             retry_allowed = (
                 state.get("retry_count", 0) < self.settings.structured_generation_retry_count
             )
+
             if failures and retry_allowed:
                 return {
                     **state,
-                    "retry_count": state.get("retry_count", 0) + 1,
+                    "retry_count": (state.get("retry_count", 0) + 1),
+                    "repair_story_ids": sorted(story_validation_failures),
+                    "repair_requirement_ids": [],
+                    "pending_validation_story_ids": [],
                     "errors": [],
                     "next_action": "repair",
                 }
+
             if failures:
                 return _state_error(
                     state,
                     UserStoryQualityError("; ".join(failures[:20])),
                     stage="validate_output",
                 )
-            ledger_requirements = state.get("ledger_requirements", [])
+
+            ledger_requirements = state.get(
+                "ledger_requirements",
+                [],
+            )
+
             if ledger_requirements:
                 coverage_records = build_coverage_records(
                     requirements=ledger_requirements,
-                    story_requirement_ids=_story_requirement_ids_by_story(
-                        state.get("validated_stories", [])
-                    ),
+                    story_requirement_ids=(_story_requirement_ids_by_story(validated_stories)),
                 )
+
                 matrix = coverage_payload(
                     requirements=ledger_requirements,
                     coverage=coverage_records,
                 )
+
                 missing = [
                     row
                     for row in matrix["rows"]
-                    if row["coverage_required"] and row["coverage_status"] == "missing"
+                    if (row["coverage_required"] and row["coverage_status"] == "missing")
                 ]
+
                 if missing and retry_allowed:
+                    missing_requirement_ids = [str(row["canonical_id"]) for row in missing]
+
                     return {
                         **state,
-                        "coverage_records": coverage_records,
+                        "coverage_records": (coverage_records),
                         "coverage_payload": matrix,
-                        "retry_count": state.get("retry_count", 0) + 1,
+                        "retry_count": (
+                            state.get(
+                                "retry_count",
+                                0,
+                            )
+                            + 1
+                        ),
+                        "repair_story_ids": [],
+                        "repair_requirement_ids": (missing_requirement_ids),
+                        "pending_validation_story_ids": [],
                         "errors": [],
                         "next_action": "repair",
                     }
+
                 if missing and not self.settings.user_story_allow_partial_coverage:
                     missing_ids = ", ".join(str(row["canonical_id"]) for row in missing[:20])
+
                     return _state_error(
                         {
                             **state,
-                            "coverage_records": coverage_records,
+                            "coverage_records": (coverage_records),
                             "coverage_payload": matrix,
                         },
                         UserStoryQualityError(
@@ -897,27 +1014,283 @@ class UserStoryGraphRuntime:
                         ),
                         stage="validate_output",
                     )
+
                 state = {
                     **state,
                     "coverage_records": coverage_records,
                     "coverage_payload": matrix,
                 }
+
             return {
                 **state,
                 "validation_reports": reports,
                 "validation_failures": [],
+                "story_validation_failures": {},
+                "repair_story_ids": [],
+                "repair_requirement_ids": [],
+                "pending_validation_story_ids": [],
                 "next_action": "valid",
             }
+
         except Exception as exc:
-            return _state_error(state, exc)
+            return _state_error(
+                state,
+                exc,
+                stage="validate_output",
+            )
 
     async def repair_structured_output(
         self,
         state: UserStoryGenerationState,
     ) -> UserStoryGenerationState:
-        """Bounded structured-output repair by regenerating against the same evidence."""
+        """Regenerate only affected requirement batches."""
 
-        return await self.generate_structured_output(state)
+        try:
+            # Compatibility path for workflows that do not use the
+            # PostgreSQL requirement ledger. Without ledger requirements,
+            # there is no deterministic requirement batch to target, so
+            # perform one bounded full regeneration using the same provider.
+            if not state.get("ledger_requirements"):
+                return await self.generate_structured_output(
+                    {
+                        **state,
+                        "validation_reports": [],
+                        "validation_reports_by_story": {},
+                        "validation_failures": [],
+                        "story_validation_failures": {},
+                        "repair_story_ids": [],
+                        "repair_requirement_ids": [],
+                        "pending_validation_story_ids": [],
+                        "errors": [],
+                        "next_action": "",
+                    }
+                )
+
+            affected_batches = _repair_requirement_batches(
+                state,
+                batch_size=(self.settings.user_story_requirement_batch_size),
+            )
+
+            if not affected_batches:
+                return _state_error(
+                    state,
+                    UserStoryQualityError(
+                        "Repair was requested but no affected requirement batch could be resolved."
+                    ),
+                    stage="repair_structured_output",
+                )
+
+            affected_requirement_ids = {
+                (requirement.canonical_id or requirement.requirement_id)
+                for requirement_batch in affected_batches
+                for requirement in requirement_batch
+            }
+
+            existing_stories = state.get(
+                "validated_stories",
+                [],
+            )
+            existing_story_batches = state.get(
+                "story_batch_requirement_ids",
+                {},
+            )
+
+            unaffected_stories = [
+                story
+                for story in existing_stories
+                if not (
+                    set(
+                        existing_story_batches.get(
+                            story.id,
+                            [],
+                        )
+                    )
+                    & affected_requirement_ids
+                )
+            ]
+
+            unaffected_story_ids = {story.id for story in unaffected_stories}
+
+            story_evidence_bundles = {
+                story_id: evidence_bundle
+                for story_id, evidence_bundle in (
+                    state.get(
+                        "story_evidence_bundles",
+                        {},
+                    ).items()
+                )
+                if story_id in unaffected_story_ids
+            }
+
+            story_batch_requirement_ids = {
+                story_id: requirement_ids
+                for story_id, requirement_ids in (
+                    state.get(
+                        "story_batch_requirement_ids",
+                        {},
+                    ).items()
+                )
+                if story_id in unaffected_story_ids
+            }
+
+            repaired_stories: list[GeneratedUserStory] = []
+            repaired_story_ids: list[str] = []
+
+            for batch_index, requirement_batch in enumerate(
+                affected_batches,
+                start=1,
+            ):
+                batch_requirement_ids = [
+                    (requirement.canonical_id or requirement.requirement_id)
+                    for requirement in requirement_batch
+                ]
+
+                batch_evidence = _build_batch_evidence_bundle(
+                    requirement_batch,
+                    state["requirement_evidence_map"],
+                    query=(
+                        "Repair grounded user stories "
+                        "for requirements: " + ", ".join(batch_requirement_ids)
+                    ),
+                    version_scope=(state["request"].version),
+                )
+
+                batch_story_group_plan = _deterministic_story_group_plan(
+                    list(requirement_batch),
+                    system=(state["request"].system),
+                    kb=state["request"].kb,
+                    version=(state["request"].version),
+                    maximum_group_size=(self.settings.user_story_maximum_group_size),
+                )
+
+                prompt = _batch_generation_prompt(
+                    state["prompt"],
+                    requirement_batch,
+                    state["requirement_evidence_map"],
+                    batch_story_group_plan,
+                    batch_index=batch_index,
+                    batch_count=len(affected_batches),
+                )
+
+                related_failures = {
+                    story_id: messages
+                    for story_id, messages in (
+                        state.get(
+                            "story_validation_failures",
+                            {},
+                        ).items()
+                    )
+                    if (
+                        set(
+                            state.get(
+                                "story_batch_requirement_ids",
+                                {},
+                            ).get(story_id, [])
+                        )
+                        & set(batch_requirement_ids)
+                    )
+                }
+
+                repair_context = {
+                    "repair_attempt": state.get(
+                        "retry_count",
+                        0,
+                    ),
+                    "requirements_to_repair": (batch_requirement_ids),
+                    "previous_validation_failures": (related_failures),
+                    "allowed_source_chunk_ids": (batch_evidence.source_chunk_ids),
+                    "instruction": (
+                        "Regenerate only this requirement "
+                        "batch. Correct every listed "
+                        "traceability failure. Use only "
+                        "the supplied requirement IDs, "
+                        "authorized chunk IDs, and exact "
+                        "evidence paths."
+                    ),
+                }
+
+                prompt += "\n\nRepair context:\n" + json.dumps(
+                    repair_context,
+                    indent=2,
+                )
+
+                batch_output = await self.reasoning_client.generate_structured(
+                    prompt=prompt,
+                    schema=(LLMGeneratedUserStoryBatch),
+                    generation_config=(
+                        _generation_config(
+                            self.settings,
+                            "user_story_generation",
+                        )
+                    ),
+                )
+
+                batch = batch_output.to_domain()
+
+                if not batch.stories:
+                    raise ConfigError(
+                        "Repair provider returned no "
+                        "stories for requirements: " + ", ".join(batch_requirement_ids)
+                    )
+
+                if len(batch.stories) > self.settings.user_story_max_stories_per_batch:
+                    raise ConfigError(
+                        "Repair provider returned more "
+                        "stories than allowed for batch "
+                        f"{batch_index}."
+                    )
+
+                for story in batch.stories:
+                    repaired_stories.append(story)
+                    repaired_story_ids.append(story.id)
+
+                    story_evidence_bundles[story.id] = batch_evidence
+
+                    story_batch_requirement_ids[story.id] = list(batch_requirement_ids)
+
+            combined_stories = _dedupe_stories(
+                [
+                    *unaffected_stories,
+                    *repaired_stories,
+                ]
+            )
+
+            retained_story_ids = {story.id for story in combined_stories}
+            repaired_story_id_set = set(repaired_story_ids)
+
+            reports_by_story = {
+                story_id: report
+                for story_id, report in (
+                    state.get(
+                        "validation_reports_by_story",
+                        {},
+                    ).items()
+                )
+                if (story_id in retained_story_ids and story_id not in repaired_story_id_set)
+            }
+
+            return {
+                **state,
+                "validated_stories": combined_stories,
+                "story_evidence_bundles": (story_evidence_bundles),
+                "story_batch_requirement_ids": (story_batch_requirement_ids),
+                "validation_reports_by_story": (reports_by_story),
+                "validation_reports": list(reports_by_story.values()),
+                "validation_failures": [],
+                "story_validation_failures": {},
+                "repair_story_ids": [],
+                "repair_requirement_ids": [],
+                "pending_validation_story_ids": (sorted(repaired_story_id_set)),
+                "errors": [],
+                "next_action": "",
+            }
+
+        except Exception as exc:
+            return _state_error(
+                state,
+                exc,
+                stage="repair_structured_output",
+            )
 
     async def write_artifacts(self, state: UserStoryGenerationState) -> UserStoryGenerationState:
         """Write YAML and retrieval trace only after validation passes."""
@@ -931,7 +1304,13 @@ class UserStoryGraphRuntime:
                     system_name=request.system,
                     kb_name=request.kb,
                     version=request.version,
-                    evidence=state["evidence_bundle"],
+                    evidence=state.get(
+                        "story_evidence_bundles",
+                        {},
+                    ).get(
+                        story.id,
+                        state["evidence_bundle"],
+                    ),
                     model=self.reasoning_client.model,
                     prompt_version=self.reasoning_client.prompt_version,
                     validation_status="passed",
@@ -1753,6 +2132,21 @@ def _batch_generation_prompt(
             "allowed_source_chunk_ids": allowed_source_chunk_ids,
             "rules": [
                 (
+                    "For each acceptance criterion, add one claims entry with "
+                    "claim_type='acceptance_criterion', the criterion index, "
+                    "the exact criterion text, related requirement IDs, authorized "
+                    "chunk IDs, and copied evidence paths."
+                ),
+                (
+                    "Add claims entries for the user_story, business_value, "
+                    "description, non-functional requirements, definition of ready, "
+                    "and definition of done when those fields contain source-grounded claims."
+                ),
+                (
+                    "The aggregate traceability requirement_ids, chunk_ids, and "
+                    "evidence_paths must contain the union of all claims entries."
+                ),
+                (
                     "Each generated story must cite only requirement IDs "
                     "listed in allowed_requirement_ids."
                 ),
@@ -1802,6 +2196,353 @@ _GENERIC_STORY_PATTERNS = (
     "system shall support the requirement",
     "system to satisfy",
 )
+
+
+def _traceability_string_list(
+    traceability: dict[str, Any],
+    key: str,
+) -> list[str]:
+    """Return one normalized unique string list from traceability."""
+
+    value = traceability.get(key, [])
+
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[str] = []
+
+    for item in value:
+        text = str(item).strip()
+
+        if text and text not in normalized:
+            normalized.append(text)
+
+    return normalized
+
+
+def _traceability_paths(
+    traceability: dict[str, Any],
+) -> list[list[str]]:
+    """Return valid normalized traceability evidence paths."""
+
+    value = traceability.get("evidence_paths", [])
+
+    if not isinstance(value, list):
+        return []
+
+    normalized_paths: list[list[str]] = []
+
+    for path in value:
+        if not isinstance(path, list):
+            continue
+
+        normalized_path = [str(item).strip() for item in path if str(item).strip()]
+
+        if normalized_path:
+            normalized_paths.append(normalized_path)
+
+    return normalized_paths
+
+
+def _path_contains(
+    paths: Sequence[Sequence[str]],
+    expected: str,
+) -> bool:
+    """Return whether at least one path contains the expected node."""
+
+    return any(expected in path for path in paths)
+
+
+def _claim_traceability_failures(
+    story: GeneratedUserStory,
+    *,
+    allowed_requirement_ids: Sequence[str],
+    requirement_evidence_map: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Validate optional claim-level traceability entries."""
+
+    traceability = story.traceability
+
+    if not isinstance(traceability, dict):
+        return []
+
+    claims = traceability.get("claims", [])
+
+    # Claims remain optional for backward compatibility.
+    if not claims:
+        return []
+
+    if not isinstance(claims, list):
+        return [f"Story {story.id}: traceability.claims must be a list."]
+
+    failures: list[str] = []
+    allowed_requirement_set = set(allowed_requirement_ids)
+
+    for claim_index, claim in enumerate(claims):
+        if not isinstance(claim, dict):
+            failures.append(
+                f"Story {story.id}: traceability claim {claim_index} must be an object."
+            )
+            continue
+
+        claim_text = str(claim.get("claim_text") or "").strip()
+
+        if not claim_text:
+            failures.append(
+                f"Story {story.id}: traceability claim {claim_index} has empty claim_text."
+            )
+
+        raw_requirement_ids = claim.get(
+            "requirement_ids",
+            [],
+        )
+        raw_chunk_ids = claim.get("chunk_ids", [])
+
+        if not isinstance(raw_requirement_ids, list):
+            raw_requirement_ids = []
+
+        if not isinstance(raw_chunk_ids, list):
+            raw_chunk_ids = []
+
+        claim_requirement_ids = {
+            str(item).strip() for item in raw_requirement_ids if str(item).strip()
+        }
+        claim_chunk_ids = {str(item).strip() for item in raw_chunk_ids if str(item).strip()}
+
+        if not claim_requirement_ids:
+            failures.append(
+                f"Story {story.id}: traceability claim {claim_index} has no requirement IDs."
+            )
+            continue
+
+        out_of_batch = sorted(claim_requirement_ids - allowed_requirement_set)
+
+        if out_of_batch:
+            failures.append(
+                f"Story {story.id}: traceability claim "
+                f"{claim_index} contains out-of-batch "
+                "requirements: " + ", ".join(out_of_batch)
+            )
+
+        for requirement_id in claim_requirement_ids:
+            evidence_entry = requirement_evidence_map.get(requirement_id)
+
+            if evidence_entry is None:
+                failures.append(
+                    f"Story {story.id}: traceability claim "
+                    f"{claim_index} references unknown "
+                    f"requirement {requirement_id}."
+                )
+                continue
+
+            authorized_chunks = {
+                str(chunk_id).strip()
+                for chunk_id in evidence_entry.get(
+                    "source_chunk_ids",
+                    [],
+                )
+                if str(chunk_id).strip()
+            }
+
+            if not claim_chunk_ids & authorized_chunks:
+                failures.append(
+                    f"Story {story.id}: traceability claim "
+                    f"{claim_index} for requirement "
+                    f"{requirement_id} has no authorized "
+                    "source chunk."
+                )
+
+    return failures
+
+
+def _deterministic_traceability_failures(
+    story: GeneratedUserStory,
+    *,
+    allowed_requirement_ids: Sequence[str],
+    requirement_evidence_map: dict[str, dict[str, Any]],
+    evidence_bundle: EvidenceBundle,
+) -> list[str]:
+    """Validate story traceability without calling an LLM."""
+
+    failures: list[str] = []
+    traceability = story.traceability
+
+    if not isinstance(traceability, dict):
+        return [f"Story {story.id}: traceability must be an object."]
+
+    requirement_ids = _traceability_string_list(
+        traceability,
+        "requirement_ids",
+    )
+    chunk_ids = _traceability_string_list(
+        traceability,
+        "chunk_ids",
+    )
+    evidence_paths = _traceability_paths(traceability)
+
+    allowed_requirement_set = set(allowed_requirement_ids)
+    allowed_bundle_chunks = set(evidence_bundle.source_chunk_ids)
+
+    if not requirement_ids:
+        failures.append(f"Story {story.id}: traceability.requirement_ids is empty.")
+
+    if not chunk_ids:
+        failures.append(f"Story {story.id}: traceability.chunk_ids is empty.")
+
+    if not evidence_paths:
+        failures.append(f"Story {story.id}: traceability.evidence_paths is empty.")
+
+    unknown_requirements = sorted(set(requirement_ids) - allowed_requirement_set)
+
+    if unknown_requirements:
+        failures.append(
+            f"Story {story.id}: requirement IDs are outside "
+            "its generation batch: " + ", ".join(unknown_requirements) + "."
+        )
+
+    unknown_chunks = sorted(set(chunk_ids) - allowed_bundle_chunks)
+
+    if unknown_chunks:
+        failures.append(
+            f"Story {story.id}: chunk IDs are not authorized "
+            "for its generation batch: " + ", ".join(unknown_chunks) + "."
+        )
+
+    for requirement_id in requirement_ids:
+        evidence_entry = requirement_evidence_map.get(requirement_id)
+
+        if evidence_entry is None:
+            failures.append(
+                f"Story {story.id}: requirement "
+                f"{requirement_id} does not exist in the "
+                "authoritative requirement map."
+            )
+            continue
+
+        authorized_chunks = {
+            str(chunk_id).strip()
+            for chunk_id in evidence_entry.get(
+                "source_chunk_ids",
+                [],
+            )
+            if str(chunk_id).strip()
+        }
+
+        cited_authorized_chunks = sorted(authorized_chunks & set(chunk_ids))
+
+        if not cited_authorized_chunks:
+            expected = ", ".join(sorted(authorized_chunks)) or "<none>"
+
+            failures.append(
+                f"Story {story.id}: requirement "
+                f"{requirement_id} has no authorized source "
+                "chunk citation. Expected one of: "
+                f"{expected}."
+            )
+            continue
+
+        requirement_path_node = f"Requirement:{requirement_id}"
+
+        if not _path_contains(
+            evidence_paths,
+            requirement_path_node,
+        ):
+            failures.append(f"Story {story.id}: no evidence path contains {requirement_path_node}.")
+
+        for chunk_id in cited_authorized_chunks:
+            chunk_path_node = f"Chunk:{chunk_id}"
+
+            matching_path_exists = any(
+                requirement_path_node in path and chunk_path_node in path for path in evidence_paths
+            )
+
+            if not matching_path_exists:
+                failures.append(
+                    f"Story {story.id}: requirement "
+                    f"{requirement_id} and chunk {chunk_id} "
+                    "do not appear together in an evidence path."
+                )
+
+    failures.extend(
+        _claim_traceability_failures(
+            story,
+            allowed_requirement_ids=(allowed_requirement_ids),
+            requirement_evidence_map=(requirement_evidence_map),
+        )
+    )
+
+    return failures
+
+
+def _local_traceability_report(
+    messages: Sequence[str],
+) -> QualityValidationReport:
+    """Create a deterministic failed validation report."""
+
+    return QualityValidationReport(
+        status="failed",
+        messages=list(messages),
+        checks={
+            "schema_complete": True,
+            "evidence_traceable": False,
+            "citations_supported": False,
+            "unsupported_claims_absent": False,
+            "deterministic_traceability": False,
+        },
+    )
+
+
+def _repair_requirement_batches(
+    state: UserStoryGenerationState,
+    *,
+    batch_size: int,
+) -> list[tuple[RequirementRecord, ...]]:
+    """Return only batches affected by failed stories or coverage."""
+
+    story_driving_requirements = [
+        requirement
+        for requirement in state.get(
+            "ledger_requirements",
+            [],
+        )
+        if (requirement.story_driving or requirement.coverage_required)
+    ]
+
+    all_batches = list(
+        _batched(
+            story_driving_requirements,
+            batch_size,
+        )
+    )
+
+    repair_story_ids = set(state.get("repair_story_ids", []))
+    repair_requirement_ids = set(state.get("repair_requirement_ids", []))
+
+    story_batch_requirement_ids = state.get(
+        "story_batch_requirement_ids",
+        {},
+    )
+
+    for story_id in repair_story_ids:
+        repair_requirement_ids.update(
+            story_batch_requirement_ids.get(
+                story_id,
+                [],
+            )
+        )
+
+    affected_batches: list[tuple[RequirementRecord, ...]] = []
+
+    for requirement_batch in all_batches:
+        batch_requirement_ids = {
+            (requirement.canonical_id or requirement.requirement_id)
+            for requirement in requirement_batch
+        }
+
+        if batch_requirement_ids & repair_requirement_ids:
+            affected_batches.append(requirement_batch)
+
+    return affected_batches
 
 
 def _generic_story_failures(story: GeneratedUserStory) -> list[str]:

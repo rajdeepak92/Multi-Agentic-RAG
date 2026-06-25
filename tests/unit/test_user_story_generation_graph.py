@@ -14,6 +14,9 @@ from multi_agentic_rag.agents.user_stories import (
     UserStoryGraphRuntime,
 )
 from multi_agentic_rag.agents.user_stories.agent import UserStoryGenerationAgent
+from multi_agentic_rag.agents.user_stories.graph import (
+    _deterministic_traceability_failures,
+)
 from multi_agentic_rag.agents.user_stories.schemas import EvidenceAssessment, RetrievalPlan
 from multi_agentic_rag.app import GraphRagApplication
 from multi_agentic_rag.config import Settings
@@ -642,7 +645,12 @@ class FakeStructuredReasoning:
                                 "chunk_ids": ["chunk-1"],
                                 "requirement_ids": ["REQ-1"],
                                 "fact_ids": ["fact-1"],
-                                "evidence_paths": [["Chunk:chunk-1"]],
+                                "evidence_paths": [
+                                    [
+                                        "Requirement:REQ-1",
+                                        "Chunk:chunk-1",
+                                    ]
+                                ],
                             },
                         }
                     ],
@@ -692,6 +700,21 @@ class BatchAwareStructuredReasoning(FakeStructuredReasoning):
 
         payload = json.loads(prompt.split("Batch generation scope:\n", 1)[1])
         requirement_ids = payload["batch_requirement_ids"]
+        batch_requirements = payload["batch_requirements"]
+
+        authorized_chunk_ids = sorted(
+            {
+                chunk_id
+                for requirement in batch_requirements
+                for chunk_id in requirement["source_chunk_ids"]
+            }
+        )
+
+        authorized_evidence_paths = [
+            evidence_row["evidence_path"]
+            for requirement in batch_requirements
+            for evidence_row in requirement["source_evidence"]
+        ]
         self.batch_requirement_ids.append(requirement_ids)
         return LLMGeneratedUserStoryBatch.model_validate(
             {
@@ -713,10 +736,10 @@ class BatchAwareStructuredReasoning(FakeStructuredReasoning):
                         "definition_of_ready": ["Evidence is indexed."],
                         "definition_of_done": ["Traceability is present."],
                         "traceability": {
-                            "chunk_ids": ["chunk-1"],
+                            "chunk_ids": authorized_chunk_ids,
                             "requirement_ids": requirement_ids,
                             "fact_ids": ["fact-1"],
-                            "evidence_paths": [["Chunk:chunk-1"]],
+                            "evidence_paths": (authorized_evidence_paths),
                         },
                     }
                 ],
@@ -971,3 +994,102 @@ def _requirement_record(canonical_id: str) -> RequirementRecord:
         source_name="source.md",
         page=1,
     )
+
+
+def test_deterministic_traceability_rejects_wrong_chunk() -> None:
+    requirement_id = "REQ-1"
+    authorized_chunk_id = "chunk-1"
+
+    story = GeneratedUserStory(
+        id="US-REQ-1",
+        title="Temperature threshold",
+        type="functional",
+        domain="monitoring",
+        priority="high",
+        status="draft",
+        persona="operator",
+        user_story=("As an operator, I want threshold monitoring."),
+        business_value="Protects equipment.",
+        description="Implement REQ-1.",
+        acceptance_criteria=[
+            "The threshold is monitored.",
+        ],
+        traceability={
+            "requirement_ids": [requirement_id],
+            "chunk_ids": ["wrong-chunk"],
+            "fact_ids": [],
+            "evidence_paths": [
+                [
+                    f"Requirement:{requirement_id}",
+                    "Chunk:wrong-chunk",
+                ]
+            ],
+        },
+    )
+
+    evidence_bundle = EvidenceBundle(
+        query="REQ-1",
+        ranked_results=[],
+        source_chunk_ids=[authorized_chunk_id],
+        graph_paths=[],
+        version_scope="v1",
+    )
+
+    failures = _deterministic_traceability_failures(
+        story,
+        allowed_requirement_ids=[requirement_id],
+        requirement_evidence_map={requirement_id: {"source_chunk_ids": [authorized_chunk_id]}},
+        evidence_bundle=evidence_bundle,
+    )
+
+    assert any("not authorized" in failure for failure in failures)
+    assert any("has no authorized source chunk citation" in failure for failure in failures)
+
+
+def test_deterministic_traceability_accepts_valid_mapping() -> None:
+    requirement_id = "REQ-1"
+    chunk_id = "chunk-1"
+
+    story = GeneratedUserStory(
+        id="US-REQ-1",
+        title="Temperature threshold",
+        type="functional",
+        domain="monitoring",
+        priority="high",
+        status="draft",
+        persona="operator",
+        user_story=("As an operator, I want threshold monitoring."),
+        business_value="Protects equipment.",
+        description="Implement REQ-1.",
+        acceptance_criteria=[
+            "The threshold is monitored.",
+        ],
+        traceability={
+            "requirement_ids": [requirement_id],
+            "chunk_ids": [chunk_id],
+            "fact_ids": [],
+            "evidence_paths": [
+                [
+                    f"Requirement:{requirement_id}",
+                    f"Chunk:{chunk_id}",
+                ]
+            ],
+        },
+    )
+
+    evidence_bundle = EvidenceBundle(
+        query="REQ-1",
+        ranked_results=[],
+        source_chunk_ids=[chunk_id],
+        graph_paths=[],
+        version_scope="v1",
+    )
+
+    failures = _deterministic_traceability_failures(
+        story,
+        allowed_requirement_ids=[requirement_id],
+        requirement_evidence_map={requirement_id: {"source_chunk_ids": [chunk_id]}},
+        evidence_bundle=evidence_bundle,
+    )
+
+    assert failures == []

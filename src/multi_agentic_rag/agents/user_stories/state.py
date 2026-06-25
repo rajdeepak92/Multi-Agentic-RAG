@@ -53,7 +53,18 @@ class UserStoryGenerationState(TypedDict, total=False):
     raw_model_output: str
     validated_stories: list[GeneratedUserStory]
     validation_reports: list[QualityValidationReport]
+    validation_reports_by_story: dict[
+        str,
+        QualityValidationReport,
+    ]
     validation_failures: list[str]
+    story_validation_failures: dict[
+        str,
+        list[str],
+    ]
+    repair_story_ids: list[str]
+    repair_requirement_ids: list[str]
+    pending_validation_story_ids: list[str]
     artifact_paths: list[Path]
     debug_trace_path: Path
     generation_trace_path: Path

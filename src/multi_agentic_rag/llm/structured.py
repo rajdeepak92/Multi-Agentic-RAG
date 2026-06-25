@@ -77,6 +77,25 @@ class ReasoningClient(Protocol):
         """Review ambiguous facts without replacing the canonical set."""
 
 
+class LLMClaimTraceability(BaseModel):
+    """Traceability for one generated story claim."""
+
+    claim_type: Literal[
+        "user_story",
+        "business_value",
+        "description",
+        "acceptance_criterion",
+        "non_functional_requirement",
+        "definition_of_ready",
+        "definition_of_done",
+    ]
+    claim_index: int | None = None
+    claim_text: str
+    requirement_ids: list[str] = Field(default_factory=list)
+    chunk_ids: list[str] = Field(default_factory=list)
+    evidence_paths: list[list[str]] = Field(default_factory=list)
+
+
 class LLMTraceability(BaseModel):
     """Closed traceability object used by reasoning structured-output DTOs."""
 
@@ -84,6 +103,7 @@ class LLMTraceability(BaseModel):
     requirement_ids: list[str] = Field(default_factory=list)
     fact_ids: list[str] = Field(default_factory=list)
     evidence_paths: list[list[str]] = Field(default_factory=list)
+    claims: list[LLMClaimTraceability] = Field(default_factory=list)
 
     def to_domain(self) -> dict[str, Any]:
         return self.model_dump(mode="json")
@@ -231,8 +251,7 @@ def _close_json_schema(node: Any) -> Any:
             continue
         if key in {"properties", "$defs", "definitions"} and isinstance(value, dict):
             closed[key] = {
-                str(child_key): _close_json_schema(child)
-                for child_key, child in value.items()
+                str(child_key): _close_json_schema(child) for child_key, child in value.items()
             }
             continue
         if key in {"items", "anyOf", "allOf", "oneOf", "not"}:
