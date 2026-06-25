@@ -638,8 +638,7 @@ def ask(
         typer.Option(
             "--top-k",
             help=(
-                "Semantic QA retrieval limit. Exhaustive ledger queries ignore "
-                "this for discovery."
+                "Semantic QA retrieval limit. Exhaustive ledger queries ignore this for discovery."
             ),
         ),
     ] = None,
@@ -700,9 +699,7 @@ def ask(
                     {
                         "query_intent": result.payload.get("query_intent"),
                         "evidence_ids": result.evidence_ids,
-                        "runtime_quality_proxies": result.payload.get(
-                            "runtime_quality_proxies"
-                        ),
+                        "runtime_quality_proxies": result.payload.get("runtime_quality_proxies"),
                     }
                 ),
                 indent=2,
@@ -739,14 +736,11 @@ def requirements(
     settings = get_settings()
     repo = PostgresKnowledgeRepository.from_settings(settings)
     try:
-        type_filter = (
-            {RequirementType(requirement_type)}
-            if requirement_type
-            else None
-        )
+        type_filter = {RequirementType(requirement_type)} if requirement_type else None
     except ValueError as exc:
         console.print(f"[red]FAIL[/red] Unsupported requirement type: {requirement_type}")
         raise typer.Exit(code=1) from exc
+
     async def load_payload() -> dict[str, Any]:
         records = await repo.list_requirements_for_scope(
             system_name=system,
@@ -757,14 +751,10 @@ def requirements(
         )
         if category:
             records = [
-                record
-                for record in records
-                if (record.category or "").lower() == category.lower()
+                record for record in records if (record.category or "").lower() == category.lower()
             ]
         evidence = await repo.list_requirement_evidence(
-            requirement_pks=[
-                record.requirement_pk for record in records if record.requirement_pk
-            ]
+            requirement_pks=[record.requirement_pk for record in records if record.requirement_pk]
         )
         return requirement_inventory_payload(
             records,
@@ -788,6 +778,7 @@ def requirements_audit(
 
     settings = get_settings()
     repo = PostgresKnowledgeRepository.from_settings(settings)
+
     async def load_audit() -> tuple[list[Any], list[Any], list[Any]]:
         records = await repo.list_requirements_for_scope(
             system_name=system,
@@ -796,9 +787,7 @@ def requirements_audit(
             active_only=True,
         )
         evidence = await repo.list_requirement_evidence(
-            requirement_pks=[
-                record.requirement_pk for record in records if record.requirement_pk
-            ]
+            requirement_pks=[record.requirement_pk for record in records if record.requirement_pk]
         )
         uncovered = await repo.list_uncovered_requirements(
             system_name=system,
@@ -869,9 +858,7 @@ def facts_evaluate(
     )
     golden_payload = _load_json_file(golden_file)
     golden_records = (
-        golden_payload.get("facts", [])
-        if isinstance(golden_payload, dict)
-        else golden_payload
+        golden_payload.get("facts", []) if isinstance(golden_payload, dict) else golden_payload
     )
     if not isinstance(golden_records, list):
         raise typer.BadParameter("Golden fact file must contain a list or {'facts': [...]} object.")
@@ -966,6 +953,7 @@ def requirements_rebuild(
 
     settings = get_settings()
     repo = PostgresKnowledgeRepository.from_settings(settings)
+
     async def rebuild_and_load() -> tuple[int, int, list[Any], list[Any]]:
         requirement_count, evidence_count = await repo.rebuild_requirement_ledger_for_scope(
             system_name=system,
@@ -978,9 +966,7 @@ def requirements_rebuild(
             version=version,
         )
         evidence = await repo.list_requirement_evidence(
-            requirement_pks=[
-                record.requirement_pk for record in records if record.requirement_pk
-            ]
+            requirement_pks=[record.requirement_pk for record in records if record.requirement_pk]
         )
         return requirement_count, evidence_count, records, evidence
 
@@ -1044,11 +1030,7 @@ def chroma_reindex(
             )
             raise typer.Exit(code=1)
         chunk_count = chroma.index_chunks(chunks)
-        requirement_count = (
-            chroma.index_requirements(requirement_records)
-            if requirements
-            else 0
-        )
+        requirement_count = chroma.index_requirements(requirement_records) if requirements else 0
     except MultiAgenticRagError as exc:
         _print_cli_error(exc)
     finally:
@@ -1293,9 +1275,7 @@ def _postgres_health_status(settings: Settings) -> tuple[bool, str]:
     repository = PostgresKnowledgeRepository.from_settings(settings)
     readiness = asyncio.run(repository.check_lexical_readiness())
 
-    alembic_ready, alembic_detail = _alembic_revision_status(
-        settings.postgres_dsn
-    )
+    alembic_ready, alembic_detail = _alembic_revision_status(settings.postgres_dsn)
 
     status = readiness.ready and alembic_ready
     readiness_detail = readiness.detail.rstrip().rstrip(".;")
@@ -1380,11 +1360,13 @@ def azure_check() -> None:
     table.add_column("Field")
     table.add_column("Value")
     redacted = manifest.redacted_manifest()
+    table.add_row("client class", str(redacted["client_class"]))
     table.add_row("endpoint", str(redacted["endpoint"]))
-    table.add_row("api key", "present" if redacted["api_key_configured"] else "missing")
+    table.add_row("reasoning api style", str(redacted["reasoning_api_style"]))
+    table.add_row("api key configured", "true" if redacted["api_key_configured"] else "false")
     table.add_row(
-        "api version",
-        "configured" if redacted["api_version_configured"] else "missing",
+        "api version configured",
+        "true" if redacted["api_version_configured"] else "false",
     )
     for name, record in redacted["deployments"].items():
         table.add_row(
@@ -1433,11 +1415,19 @@ def reranker_check() -> None:
     table.add_column("Value")
     table.add_row("provider", settings.reranker_provider)
     table.add_row("class", type(reranker).__name__)
+    deployment_or_model = (
+        settings.azure_openai_reranker_deployment
+        if settings.reranker_provider == "azure_openai"
+        else settings.reranker_deployment or settings.reranker_model or "-"
+    )
     table.add_row(
         "deployment/model",
-        settings.reranker_deployment or settings.reranker_model or "-",
+        deployment_or_model,
     )
-    table.add_row("strategy", settings.reranker_strategy)
+    table.add_row(
+        "strategy",
+        "listwise" if settings.reranker_provider == "azure_openai" else settings.reranker_strategy,
+    )
     table.add_row("top_n", str(settings.reranker_top_n))
     console.print(table)
 
@@ -1907,10 +1897,7 @@ def _print_requirements_audit(
     )
     table.add_row(
         "story-driving requirements without stories",
-        ", ".join(
-            (record.canonical_id or record.requirement_id)
-            for record in uncovered[:20]
-        )
+        ", ".join((record.canonical_id or record.requirement_id) for record in uncovered[:20])
         if uncovered
         else "none",
     )
@@ -2034,8 +2021,6 @@ def _format_optional_bool(value: bool | None) -> str:
     if value is None:
         return "unknown"
     return "yes" if value else "no"
-
-
 
 
 if __name__ == "__main__":

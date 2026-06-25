@@ -11,6 +11,7 @@ from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from multi_agentic_rag.exceptions import ConfigError
+from multi_agentic_rag.infrastructure.azure_openai_client import normalize_azure_endpoint
 
 PROJECT_CACHE_PATH_DEFAULTS = {
     "project_root": Path("."),
@@ -133,6 +134,9 @@ class Settings(BaseSettings):
     azure_openai_endpoint_env: str = Field(default="AZURE_OPENAI_ENDPOINT")
     azure_openai_api_key_env: str = Field(default="AZURE_OPENAI_API_KEY")
     azure_openai_api_version_env: str = Field(default="AZURE_OPENAI_API_VERSION")
+    azure_openai_reasoning_api_style: Literal["chat_completions", "responses"] = Field(
+        default="chat_completions"
+    )
     azure_openai_generation_deployment: str = Field(default="gpt-5.2-chat")
     azure_openai_answer_deployment: str = Field(default="gpt-5.2-chat")
     azure_openai_analysis_deployment: str = Field(default="gpt-5.2-chat")
@@ -145,8 +149,8 @@ class Settings(BaseSettings):
     azure_openai_retry_backoff_seconds: float = Field(default=2.0)
     azure_openai_max_concurrent_requests: int = Field(default=4)
     azure_openai_capability_cache_ttl_seconds: int = Field(default=3600)
-    reasoning_provider: Literal["openai", "azure_openai", "hf", "huggingface", "gemini"] = (
-        Field(default="openai")
+    reasoning_provider: Literal["openai", "azure_openai", "hf", "huggingface", "gemini"] = Field(
+        default="openai"
     )
     openai_reasoning_model: str = Field(default="gpt-5.5")
     openai_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] = Field(
@@ -200,9 +204,7 @@ class Settings(BaseSettings):
     tesseract_cmd: str | None = Field(default=None)
 
     bm25_backend: Literal["pg_textsearch", "postgres_fts"] = Field(default="postgres_fts")
-    retrieval_required_sources: tuple[str, ...] = Field(
-        default=("postgres", "chroma", "neo4j")
-    )
+    retrieval_required_sources: tuple[str, ...] = Field(default=("postgres", "chroma", "neo4j"))
     retrieval_lexical_top_k: int = Field(default=20)
     retrieval_vector_top_k: int = Field(default=20)
     retrieval_graph_top_k: int = Field(default=20)
@@ -302,6 +304,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_enterprise_provider_settings(self) -> Settings:
+        azure_provider_selected = any(
+            provider == "azure_openai"
+            for provider in (
+                self.reasoning_provider,
+                self.embedding_provider,
+                self.reranker_provider,
+            )
+        )
         prohibited_embeddings = {
             self.embedding_model,
             self.embedding_deployment or "",
@@ -323,21 +333,42 @@ class Settings(BaseSettings):
                 "gpt-5.3-codex is reserved for code tasks and cannot be used for "
                 "BRD reasoning, Ask synthesis, reranking, validation, or story generation."
             )
-        if self.reasoning_provider == "azure_openai":
-            endpoint = self.azure_openai_endpoint or self.azure_openai_base_url
-            if not endpoint:
+        if azure_provider_selected:
+            if self.azure_openai_base_url:
                 raise ConfigError(
-                    "Azure OpenAI reasoning requires AZURE_OPENAI_ENDPOINT or an "
-                    "explicit azure_openai.base_url."
+                    "azure_openai.base_url is deprecated for native Azure OpenAI "
+                    "providers; set AZURE_OPENAI_ENDPOINT instead."
                 )
-            if self.azure_openai_base_url and not self.azure_openai_base_url.startswith(
-                "https://"
+            if not self.azure_openai_endpoint:
+                raise ConfigError("AZURE_OPENAI_ENDPOINT is required for Azure OpenAI workflows.")
+            if not self.azure_openai_api_key:
+                raise ConfigError("AZURE_OPENAI_API_KEY is required for Azure OpenAI workflows.")
+            if not self.azure_openai_api_version:
+                raise ConfigError(
+                    "AZURE_OPENAI_API_VERSION is required for Azure OpenAI workflows."
+                )
+            normalize_azure_endpoint(self.azure_openai_endpoint)
+        if self.reasoning_provider == "azure_openai":
+            for deployment in (
+                self.azure_openai_generation_deployment,
+                self.azure_openai_answer_deployment,
+                self.azure_openai_analysis_deployment,
+                self.azure_openai_utility_deployment,
+                self.azure_openai_validation_deployment,
+                self.azure_openai_reranker_deployment,
             ):
-                raise ConfigError("Azure OpenAI base_url must be a complete HTTPS URL.")
-            if self.azure_openai_endpoint and not self.azure_openai_endpoint.startswith(
-                "https://"
-            ):
-                raise ConfigError("AZURE_OPENAI_ENDPOINT must be a complete HTTPS URL.")
+                if not deployment.strip():
+                    raise ConfigError("Azure OpenAI reasoning requires deployment names.")
+        if (
+            self.embedding_provider == "azure_openai"
+            and not self.azure_openai_embedding_deployment.strip()
+        ):
+            raise ConfigError("Azure OpenAI embeddings require a deployment name.")
+        if (
+            self.reranker_provider == "azure_openai"
+            and not self.azure_openai_reranker_deployment.strip()
+        ):
+            raise ConfigError("Azure OpenAI reranking requires a deployment name.")
         return self
 
     @field_validator("retrieval_required_sources", mode="before")
@@ -416,9 +447,7 @@ class Settings(BaseSettings):
         for field_name in PROJECT_CACHE_PATH_DEFAULTS:
             raw_path = getattr(self, field_name)
             resolved = (
-                root
-                if field_name == "project_root"
-                else self._resolve_project_path(raw_path)
+                root if field_name == "project_root" else self._resolve_project_path(raw_path)
             )
             setattr(self, field_name, resolved)
             resolved_paths[field_name] = resolved

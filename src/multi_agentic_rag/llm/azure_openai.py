@@ -8,9 +8,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from importlib import import_module
 from typing import Any, TypeVar, cast
-from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -30,6 +28,10 @@ from multi_agentic_rag.exceptions import (
     GenerationTokenLimitError,
     ProviderCapabilityError,
     StructuredGenerationError,
+)
+from multi_agentic_rag.infrastructure.azure_openai_client import (
+    build_azure_openai_client,
+    normalize_azure_endpoint,
 )
 from multi_agentic_rag.llm.prompts import (
     ANSWER_SYNTHESIS_PROMPT,
@@ -115,8 +117,9 @@ class AzureOpenAICapabilityManifest(BaseModel):
     """Redacted preflight result for configured Azure OpenAI deployments."""
 
     provider: str = "azure_openai"
+    client_class: str = "AzureOpenAI"
     endpoint: str
-    base_url: str | None = None
+    reasoning_api_style: str
     api_version_configured: bool
     api_key_configured: bool
     checked_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -144,6 +147,7 @@ class AzureOpenAIReasoningClient:
         self.settings = settings or get_settings()
         self.router = AzureDeploymentRouter(self.settings)
         self.model = self.settings.azure_openai_generation_deployment
+        self.api_style = self.settings.azure_openai_reasoning_api_style
         self._client = client
         self._last_response_metadata: dict[str, Any] = {}
 
@@ -334,39 +338,47 @@ class AzureOpenAIReasoningClient:
         started = time.perf_counter()
         client = self._get_client()
         try:
-            if hasattr(client, "responses"):
+            if self.api_style == "responses":
                 response = client.responses.create(
                     model=deployment,
                     instructions=instructions,
                     input=json.dumps(payload, ensure_ascii=False),
-                    temperature=self.settings.reasoning_temperature,
                     max_output_tokens=max_output_tokens,
                     store=self.settings.reasoning_store_responses,
                     text=_response_text_format(schema, schema_name, strict_schema),
                 )
-            elif hasattr(client, "chat"):
-                response = client.chat.completions.create(
-                    model=deployment,
-                    messages=[
+            elif self.api_style == "chat_completions":
+                chat_kwargs: dict[str, Any] = {
+                    "model": deployment,
+                    "messages": [
                         {"role": "system", "content": instructions},
-                        {
-                            "role": "user",
-                            "content": json.dumps(payload, ensure_ascii=False),
-                        },
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                     ],
-                    temperature=self.settings.reasoning_temperature,
-                    max_tokens=max_output_tokens,
-                    response_format=_chat_response_format(schema, schema_name, strict_schema),
+                    "response_format": _chat_response_format(schema, schema_name, strict_schema),
+                    **_chat_token_kwargs(deployment, max_output_tokens),
+                }
+                temperature = _chat_temperature_kwargs(
+                    deployment,
+                    self.settings.reasoning_temperature,
                 )
+                if temperature is not None:
+                    chat_kwargs.update(temperature)
+                response = client.chat.completions.create(**chat_kwargs)
             else:
-                raise ProviderCapabilityError(
-                    "Azure OpenAI client supports neither Responses nor Chat Completions."
+                raise ConfigError(
+                    "AZURE_OPENAI_REASONING_API_STYLE must be chat_completions or responses."
                 )
         except (GenerationTokenLimitError, ProviderCapabilityError, StructuredGenerationError):
             raise
         except Exception as exc:
             raise StructuredGenerationError(
-                f"Azure OpenAI request failed for {schema_name}: {_provider_exception_detail(exc)}"
+                _provider_error_message(
+                    provider="azure_openai",
+                    deployment=deployment,
+                    api_style=self.api_style,
+                    operation=schema_name,
+                    exc=exc,
+                )
             ) from exc
         duration_ms = int((time.perf_counter() - started) * 1000)
         finish_reason = _response_finish_reason(response)
@@ -375,6 +387,7 @@ class AzureOpenAIReasoningClient:
                 "deployment": deployment,
                 "task_name": task_name,
                 "schema_name": schema_name,
+                "api_style": self.api_style,
                 "duration_ms": duration_ms,
                 "finish_reason": finish_reason,
                 "request_id": _response_request_id(response),
@@ -397,33 +410,7 @@ class AzureOpenAIReasoningClient:
     def _get_client(self) -> Any:
         if self._client is not None:
             return self._client
-        endpoint = self.settings.azure_openai_endpoint
-        base_url = self.settings.azure_openai_base_url
-        api_key = self.settings.azure_openai_api_key
-        if not api_key:
-            raise ConfigError("AZURE_OPENAI_API_KEY is required for Azure OpenAI workflows.")
-        module = import_module("openai")
-        if base_url:
-            self._client = module.OpenAI(
-                api_key=api_key,
-                base_url=normalize_azure_endpoint(base_url, allow_base_url=True),
-                timeout=self.settings.azure_openai_request_timeout_seconds,
-                max_retries=self.settings.azure_openai_max_retries,
-            )
-        else:
-            if not endpoint:
-                raise ConfigError("AZURE_OPENAI_ENDPOINT is required for Azure OpenAI workflows.")
-            if not self.settings.azure_openai_api_version:
-                raise ConfigError(
-                    "AZURE_OPENAI_API_VERSION is required when using AzureOpenAI client."
-                )
-            self._client = module.AzureOpenAI(
-                api_key=api_key,
-                azure_endpoint=normalize_azure_endpoint(endpoint),
-                api_version=self.settings.azure_openai_api_version,
-                timeout=self.settings.azure_openai_request_timeout_seconds,
-                max_retries=self.settings.azure_openai_max_retries,
-            )
+        self._client = build_azure_openai_client(self.settings)
         return self._client
 
 
@@ -432,21 +419,18 @@ def azure_preflight(
     *,
     deployment_capabilities: Mapping[str, AzureDeploymentCapability] | None = None,
 ) -> AzureOpenAICapabilityManifest:
-    """Validate static Azure configuration and return a redacted manifest.
+    """Validate static Azure configuration and return a redacted manifest."""
 
-    Live reachability is intentionally injected through ``deployment_capabilities`` so
-    tests can validate behavior without network calls.
-    """
-
-    endpoint = settings.azure_openai_endpoint or settings.azure_openai_base_url
+    endpoint = settings.azure_openai_endpoint
     if not endpoint:
-        raise ConfigError("Azure OpenAI endpoint or base_url is required.")
-    normalized_endpoint = normalize_azure_endpoint(
-        endpoint,
-        allow_base_url=bool(settings.azure_openai_base_url),
-    )
-    if not settings.azure_openai_api_key:
-        raise ConfigError("AZURE_OPENAI_API_KEY is required; it will not be printed.")
+        raise ConfigError("AZURE_OPENAI_ENDPOINT is required for Azure OpenAI workflows.")
+    normalized_endpoint = normalize_azure_endpoint(endpoint)
+    if settings.azure_openai_base_url:
+        raise ConfigError(
+            "azure_openai.base_url is deprecated for native Azure OpenAI providers; "
+            "set AZURE_OPENAI_ENDPOINT instead."
+        )
+
     deployments = {
         "generation": settings.azure_openai_generation_deployment,
         "answer": settings.azure_openai_answer_deployment,
@@ -458,28 +442,22 @@ def azure_preflight(
     capability_records: dict[str, AzureDeploymentCapability] = {}
     for name, deployment in deployments.items():
         _validate_deployment_name(deployment)
-        record = (
-            deployment_capabilities.get(deployment)
-            if deployment_capabilities is not None
-            else None
-        )
+        record = deployment_capabilities.get(deployment) if deployment_capabilities else None
         capability_records[name] = record or AzureDeploymentCapability(
             deployment=deployment,
             reachable=False,
-            api_style="unverified",
+            api_style=settings.azure_openai_reasoning_api_style,
             structured_output=False,
         )
     embedding_deployment = settings.azure_openai_embedding_deployment
     _validate_deployment_name(embedding_deployment, embedding=True)
     embedding_record = (
-        deployment_capabilities.get(embedding_deployment)
-        if deployment_capabilities is not None
-        else None
+        deployment_capabilities.get(embedding_deployment) if deployment_capabilities else None
     ) or AzureDeploymentCapability(deployment=embedding_deployment, reachable=False)
     _validate_requested_output_budgets(settings, capability_records)
     return AzureOpenAICapabilityManifest(
         endpoint=normalized_endpoint,
-        base_url=settings.azure_openai_base_url,
+        reasoning_api_style=settings.azure_openai_reasoning_api_style,
         api_version_configured=bool(settings.azure_openai_api_version),
         api_key_configured=bool(settings.azure_openai_api_key),
         deployments=capability_records,
@@ -490,21 +468,11 @@ def azure_preflight(
     )
 
 
-def normalize_azure_endpoint(endpoint: str, *, allow_base_url: bool = False) -> str:
-    """Normalize and validate a complete HTTPS Azure OpenAI endpoint."""
-
-    stripped = endpoint.strip()
-    parsed = urlparse(stripped)
-    if parsed.scheme != "https" or not parsed.netloc:
-        raise ConfigError("Azure OpenAI endpoint must be a complete HTTPS URL.")
-    if allow_base_url and "/openai/" not in parsed.path:
-        raise ConfigError("Azure OpenAI base_url must include the /openai/ API path.")
-    return stripped.rstrip("/") + ("/" if allow_base_url and not stripped.endswith("/") else "")
-
-
 def _validate_deployment_name(deployment: str, *, embedding: bool = False) -> None:
     if not deployment.strip():
-        raise ConfigError("Azure OpenAI deployment names must not be empty.")
+        if embedding:
+            raise ConfigError("Azure OpenAI embeddings require a deployment name.")
+        raise ConfigError("Azure OpenAI reasoning requires a deployment name.")
     if deployment == "gpt-5.3-codex":
         raise ConfigError("gpt-5.3-codex is not allowed for BRD reasoning tasks.")
     if embedding and deployment == "text-embedding-ada-002":
@@ -542,7 +510,7 @@ def _response_text_format(
     strict_schema: bool,
 ) -> dict[str, Any] | None:
     if not strict_schema:
-        return None
+        return {"format": {"type": "json_object"}}
     return {
         "format": {
             "type": "json_schema",
@@ -568,6 +536,23 @@ def _chat_response_format(
             "strict": True,
         },
     }
+
+
+def _chat_token_kwargs(deployment: str, max_output_tokens: int) -> dict[str, int]:
+    if _is_gpt5_deployment(deployment):
+        return {"max_completion_tokens": max_output_tokens}
+    return {"max_tokens": max_output_tokens}
+
+
+def _chat_temperature_kwargs(deployment: str, temperature: float) -> dict[str, float] | None:
+    if _is_gpt5_deployment(deployment):
+        return None
+    return {"temperature": temperature}
+
+
+def _is_gpt5_deployment(deployment: str) -> bool:
+    lowered = deployment.strip().lower()
+    return lowered.startswith("gpt-5")
 
 
 def _response_output_text(response: Any) -> str:
@@ -636,10 +621,33 @@ def _response_usage(response: Any) -> dict[str, Any] | None:
     }
 
 
-def _provider_exception_detail(exc: Exception) -> str:
-    parts = [str(exc)]
-    for attr in ("status_code", "code", "request_id"):
-        value = getattr(exc, attr, None)
-        if value is not None and str(value) not in parts[0]:
-            parts.append(str(value))
-    return "; ".join(part for part in parts if part)
+def _provider_error_message(
+    *,
+    provider: str,
+    deployment: str,
+    api_style: str,
+    operation: str,
+    exc: Exception,
+) -> str:
+    status_code = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    code = getattr(exc, "code", None)
+    request_id = getattr(exc, "request_id", None)
+    headers = getattr(response, "headers", None)
+    if request_id is None and isinstance(headers, Mapping):
+        request_id = headers.get("x-request-id") or headers.get("x-ms-request-id")
+    parts = [
+        f"{provider} request failed for {operation}",
+        f"deployment={deployment}",
+        f"api_style={api_style}",
+    ]
+    if status_code is not None:
+        parts.append(f"status_code={status_code}")
+    if code:
+        parts.append(f"azure_error_code={code}")
+    if request_id:
+        parts.append(f"request_id={request_id}")
+    parts.append(f"detail={exc}")
+    return "; ".join(parts)

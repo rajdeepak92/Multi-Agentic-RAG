@@ -11,9 +11,11 @@ import warnings
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol, cast
+from urllib.parse import urlparse
 
 from multi_agentic_rag.config import Settings
-from multi_agentic_rag.exceptions import ConfigError, ProviderCapabilityError
+from multi_agentic_rag.exceptions import ProviderCapabilityError
+from multi_agentic_rag.infrastructure.azure_openai_client import build_azure_openai_client
 from multi_agentic_rag.runtime.device import resolve_device
 
 
@@ -295,11 +297,15 @@ class AzureOpenAIEmbeddingProvider:
         indexed_vectors.sort(key=lambda item: item[0])
         self.request_diagnostics.append(
             {
+                "client_class": type(client).__name__,
                 "deployment": self.deployment,
+                "endpoint_host": _azure_endpoint_host(self.settings.azure_openai_endpoint),
+                "api_version": self.settings.azure_openai_api_version,
                 "batch_start": batch_start,
                 "batch_size": len(texts),
                 "duration_ms": duration_ms,
                 "usage": _usage_payload(getattr(response, "usage", None)),
+                "validated_dimension": self.validated_dimension,
             }
         )
         return [vector for _, vector in indexed_vectors]
@@ -321,28 +327,7 @@ class AzureOpenAIEmbeddingProvider:
     def _get_client(self) -> Any:
         if self._client is not None:
             return self._client
-        if not self.settings.azure_openai_api_key:
-            raise ConfigError("AZURE_OPENAI_API_KEY is required for Azure embeddings.")
-        module = import_module("openai")
-        if self.settings.azure_openai_base_url:
-            self._client = module.OpenAI(
-                api_key=self.settings.azure_openai_api_key,
-                base_url=self.settings.azure_openai_base_url,
-                timeout=self.settings.azure_openai_request_timeout_seconds,
-                max_retries=self.settings.azure_openai_max_retries,
-            )
-            return self._client
-        if not self.settings.azure_openai_endpoint:
-            raise ConfigError("AZURE_OPENAI_ENDPOINT is required for Azure embeddings.")
-        if not self.settings.azure_openai_api_version:
-            raise ConfigError("AZURE_OPENAI_API_VERSION is required for Azure embeddings.")
-        self._client = module.AzureOpenAI(
-            api_key=self.settings.azure_openai_api_key,
-            azure_endpoint=self.settings.azure_openai_endpoint,
-            api_version=self.settings.azure_openai_api_version,
-            timeout=self.settings.azure_openai_request_timeout_seconds,
-            max_retries=self.settings.azure_openai_max_retries,
-        )
+        self._client = build_azure_openai_client(self.settings)
         return self._client
 
 
@@ -392,6 +377,13 @@ def _usage_payload(usage: Any) -> dict[str, Any] | None:
         for name in ("prompt_tokens", "total_tokens", "input_tokens")
         if getattr(usage, name, None) is not None
     }
+
+
+def _azure_endpoint_host(endpoint: str | None) -> str | None:
+    if not endpoint:
+        return None
+    parsed = urlparse(endpoint.strip())
+    return parsed.hostname
 
 
 def _configure_hf_token(hf_token: str | None) -> None:

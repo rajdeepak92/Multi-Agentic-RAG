@@ -105,7 +105,10 @@ def test_azure_reasoning_routes_story_generation_to_generation_deployment() -> N
             usage={"input_tokens": 10, "output_tokens": 5},
         )
     )
-    client = AzureOpenAIReasoningClient(_azure_settings(), client=fake)
+    client = AzureOpenAIReasoningClient(
+        _azure_settings(azure_openai_reasoning_api_style="responses"),
+        client=fake,
+    )
 
     result = asyncio.run(
         client.generate_structured(
@@ -129,7 +132,10 @@ def test_azure_reasoning_truncation_raises_token_limit_error() -> None:
             choices=[SimpleNamespace(finish_reason="length")],
         )
     )
-    client = AzureOpenAIReasoningClient(_azure_settings(), client=fake)
+    client = AzureOpenAIReasoningClient(
+        _azure_settings(azure_openai_reasoning_api_style="responses"),
+        client=fake,
+    )
 
     with pytest.raises(GenerationTokenLimitError):
         asyncio.run(
@@ -146,7 +152,10 @@ def test_azure_reasoning_truncation_raises_token_limit_error() -> None:
 
 def test_azure_reasoning_invalid_structured_output_raises_schema_error() -> None:
     fake = FakeAzureClient(response=SimpleNamespace(output_text='{"stories":"bad"}'))
-    client = AzureOpenAIReasoningClient(_azure_settings(), client=fake)
+    client = AzureOpenAIReasoningClient(
+        _azure_settings(azure_openai_reasoning_api_style="responses"),
+        client=fake,
+    )
 
     with pytest.raises(StructuredGenerationError):
         asyncio.run(

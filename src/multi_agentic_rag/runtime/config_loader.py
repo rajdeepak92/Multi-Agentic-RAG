@@ -232,9 +232,7 @@ def _env_defaults(
         "EMBEDDING_DIMENSIONS": _string_or_none(
             embeddings.get("dimension", embeddings.get("expected_dimension"))
         ),
-        "EMBEDDING_EXPECTED_DIMENSION": _string_or_none(
-            embeddings.get("expected_dimension")
-        ),
+        "EMBEDDING_EXPECTED_DIMENSION": _string_or_none(embeddings.get("expected_dimension")),
         "EMBEDDING_DEVICE": _string_or_none(embeddings.get("device")),
         "EMBEDDING_NORMALIZE": _string_or_none(embeddings.get("normalize")),
         "EMBEDDING_DISTANCE_METRIC": _string_or_none(embeddings.get("distance_metric")),
@@ -257,19 +255,17 @@ def _env_defaults(
         "AZURE_OPENAI_ENDPOINT_ENV": _string_or_none(azure_openai.get("endpoint_env")),
         "AZURE_OPENAI_API_KEY_ENV": _string_or_none(azure_openai.get("api_key_env")),
         "AZURE_OPENAI_API_VERSION_ENV": _string_or_none(azure_openai.get("api_version_env")),
-        "AZURE_OPENAI_BASE_URL": _string_or_none(azure_openai.get("base_url")),
+        "AZURE_OPENAI_REASONING_API_STYLE": _string_or_none(
+            azure_openai.get("reasoning_api_style")
+        ),
         "AZURE_OPENAI_GENERATION_DEPLOYMENT": _string_or_none(
             azure_openai.get("generation_deployment")
         ),
-        "AZURE_OPENAI_ANSWER_DEPLOYMENT": _string_or_none(
-            azure_openai.get("answer_deployment")
-        ),
+        "AZURE_OPENAI_ANSWER_DEPLOYMENT": _string_or_none(azure_openai.get("answer_deployment")),
         "AZURE_OPENAI_ANALYSIS_DEPLOYMENT": _string_or_none(
             azure_openai.get("analysis_deployment")
         ),
-        "AZURE_OPENAI_UTILITY_DEPLOYMENT": _string_or_none(
-            azure_openai.get("utility_deployment")
-        ),
+        "AZURE_OPENAI_UTILITY_DEPLOYMENT": _string_or_none(azure_openai.get("utility_deployment")),
         "AZURE_OPENAI_VALIDATION_DEPLOYMENT": _string_or_none(
             azure_openai.get("validation_deployment")
         ),
@@ -305,16 +301,12 @@ def _env_defaults(
         "HF_REASON_VALIDATION_MAX_NEW_TOKENS": _string_or_none(
             reasoning.get("hf_validation_max_new_tokens")
         ),
-        "HF_REASON_TIMEOUT_SECONDS": _string_or_none(
-            reasoning.get("hf_timeout_seconds")
-        ),
+        "HF_REASON_TIMEOUT_SECONDS": _string_or_none(reasoning.get("hf_timeout_seconds")),
         "HF_REASON_ANSWER_MODE": _string_or_none(reasoning.get("hf_answer_mode")),
         "HF_REASON_TEMPERATURE": _string_or_none(reasoning.get("hf_temperature")),
         "HF_REASON_TOP_P": _string_or_none(reasoning.get("hf_top_p")),
         "HF_REASON_TOP_K": _string_or_none(reasoning.get("hf_top_k")),
-        "HF_REASON_ENABLE_THINKING": _string_or_none(
-            reasoning.get("hf_enable_thinking")
-        ),
+        "HF_REASON_ENABLE_THINKING": _string_or_none(reasoning.get("hf_enable_thinking")),
         "GEMINI_REASONING_MODEL": _string_or_none(reasoning.get("gemini_model")),
         "STRUCTURED_GENERATION_RETRY_COUNT": _string_or_none(reasoning.get("structured_retries")),
         "REASONING_ANALYSIS_MAX_OUTPUT_TOKENS": _string_or_none(
@@ -335,15 +327,9 @@ def _env_defaults(
         "REASONING_RERANKING_MAX_OUTPUT_TOKENS": _string_or_none(
             reasoning.get("reranking_max_output_tokens")
         ),
-        "REASONING_FAIL_ON_TRUNCATION": _string_or_none(
-            reasoning.get("fail_on_truncation")
-        ),
-        "REASONING_FAIL_ON_SCHEMA_ERROR": _string_or_none(
-            reasoning.get("fail_on_schema_error")
-        ),
-        "REASONING_FAIL_ON_EMPTY_OUTPUT": _string_or_none(
-            reasoning.get("fail_on_empty_output")
-        ),
+        "REASONING_FAIL_ON_TRUNCATION": _string_or_none(reasoning.get("fail_on_truncation")),
+        "REASONING_FAIL_ON_SCHEMA_ERROR": _string_or_none(reasoning.get("fail_on_schema_error")),
+        "REASONING_FAIL_ON_EMPTY_OUTPUT": _string_or_none(reasoning.get("fail_on_empty_output")),
         "RETRIEVAL_REQUIRED_SOURCES": _string_or_none(retrieval.get("required_sources")),
         "RETRIEVAL_LEXICAL_TOP_K": _string_or_none(retrieval.get("lexical_top_k")),
         "RETRIEVAL_VECTOR_TOP_K": _string_or_none(retrieval.get("vector_top_k")),
@@ -354,19 +340,11 @@ def _env_defaults(
         "RETRIEVAL_RECIPROCAL_RANK_CONSTANT": _string_or_none(
             retrieval.get("reciprocal_rank_constant")
         ),
-        "RETRIEVAL_MAX_RETRIEVAL_ROUNDS": _string_or_none(
-            retrieval.get("max_retrieval_rounds")
-        ),
-        "RETRIEVAL_ALLOW_DEGRADED": _string_or_none(
-            retrieval.get("allow_degraded_retrieval")
-        ),
+        "RETRIEVAL_MAX_RETRIEVAL_ROUNDS": _string_or_none(retrieval.get("max_retrieval_rounds")),
+        "RETRIEVAL_ALLOW_DEGRADED": _string_or_none(retrieval.get("allow_degraded_retrieval")),
         "RETRIEVAL_ANSWER_TOP_K": _string_or_none(retrieval.get("answer_top_k")),
-        "RETRIEVAL_ANSWER_MAX_EVIDENCE": _string_or_none(
-            retrieval.get("answer_max_evidence")
-        ),
-        "RETRIEVAL_ANSWER_MAX_SNIPPETS": _string_or_none(
-            retrieval.get("answer_max_snippets")
-        ),
+        "RETRIEVAL_ANSWER_MAX_EVIDENCE": _string_or_none(retrieval.get("answer_max_evidence")),
+        "RETRIEVAL_ANSWER_MAX_SNIPPETS": _string_or_none(retrieval.get("answer_max_snippets")),
         "RETRIEVAL_MINIMUM_EVIDENCE_COUNT": _string_or_none(
             retrieval.get("minimum_evidence_count")
         ),
@@ -377,12 +355,8 @@ def _env_defaults(
             retrieval.get("require_quality_assessment")
         ),
         "USER_STORY_SCHEMA_VERSION": _string_or_none(user_stories.get("schema_version")),
-        "USER_STORY_MINIMUM_GROUP_SIZE": _string_or_none(
-            user_stories.get("minimum_group_size")
-        ),
-        "USER_STORY_MAXIMUM_GROUP_SIZE": _string_or_none(
-            user_stories.get("maximum_group_size")
-        ),
+        "USER_STORY_MINIMUM_GROUP_SIZE": _string_or_none(user_stories.get("minimum_group_size")),
+        "USER_STORY_MAXIMUM_GROUP_SIZE": _string_or_none(user_stories.get("maximum_group_size")),
         "USER_STORY_REQUIREMENT_BATCH_SIZE": _string_or_none(
             user_stories.get("requirement_batch_size", user_stories.get("maximum_group_size"))
         ),
@@ -443,18 +417,12 @@ def _env_defaults(
         "USER_STORY_REQUIRE_HUMAN_APPROVAL_BEFORE_PUBLISHED_STATUS": _string_or_none(
             user_stories.get("require_human_approval_before_published_status")
         ),
-        "FACT_SEMANTIC_REVIEW_ENABLED": _string_or_none(
-            facts.get("semantic_review_enabled")
-        ),
+        "FACT_SEMANTIC_REVIEW_ENABLED": _string_or_none(facts.get("semantic_review_enabled")),
         "FACT_MINIMUM_CONFIDENCE": _string_or_none(facts.get("minimum_confidence")),
         "FACT_REQUIRE_EXACT_EVIDENCE": _string_or_none(facts.get("require_exact_evidence")),
         "FACT_REQUIRE_UNIT_VALIDATION": _string_or_none(facts.get("require_unit_validation")),
-        "FACT_REJECT_UNSUPPORTED_FACTS": _string_or_none(
-            facts.get("reject_unsupported_facts")
-        ),
-        "FACT_REJECT_CONFLICTING_FACTS": _string_or_none(
-            facts.get("reject_conflicting_facts")
-        ),
+        "FACT_REJECT_UNSUPPORTED_FACTS": _string_or_none(facts.get("reject_unsupported_facts")),
+        "FACT_REJECT_CONFLICTING_FACTS": _string_or_none(facts.get("reject_conflicting_facts")),
         "FACT_REJECT_DUPLICATE_FACTS": _string_or_none(facts.get("reject_duplicate_facts")),
         "FACT_REQUIRE_HUMAN_APPROVAL_FOR_SEMANTIC_PROMOTION": _string_or_none(
             facts.get("require_human_approval_for_semantic_promotion")
@@ -552,7 +520,6 @@ def _resolve_project_path(project_root: Path, value: Any, *, field_name: str) ->
     resolved = candidate.resolve(strict=False)
     if resolved != project_root and not resolved.is_relative_to(project_root):
         raise ConfigError(
-            f"{field_name} resolves outside PROJECT_ROOT: {resolved} "
-            f"(PROJECT_ROOT={project_root})."
+            f"{field_name} resolves outside PROJECT_ROOT: {resolved} (PROJECT_ROOT={project_root})."
         )
     return resolved

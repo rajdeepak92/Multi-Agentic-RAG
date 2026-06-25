@@ -19,6 +19,7 @@ from multi_agentic_rag.infrastructure.embeddings.provider import (
     _suppress_sentence_transformers_cache_warning,
 )
 from multi_agentic_rag.llm import GenerationConfig, ReasoningClient
+from multi_agentic_rag.llm.azure_openai import AzureOpenAIReasoningClient
 from multi_agentic_rag.runtime.device import resolve_device
 
 
@@ -225,9 +226,7 @@ class AzureListwiseReranker:
                             "reranker_score": ranked.relevance_score,
                             "reranker_rank": ranked.rank,
                             "reranker_reason": ranked.reason,
-                            "answerability": output.query_answerability.model_dump(
-                                mode="json"
-                            ),
+                            "answerability": output.query_answerability.model_dump(mode="json"),
                         },
                     }
                 )
@@ -249,9 +248,7 @@ def select_reranker(settings: Settings) -> RerankingService:
 
     settings.ensure_project_cache_paths()
     if settings.reranker_provider == "azure_openai":
-        from multi_agentic_rag.llm import build_reasoning_client
-
-        return AzureListwiseReranker(settings, build_reasoning_client(settings))
+        return AzureListwiseReranker(settings, AzureOpenAIReasoningClient(settings))
     if settings.reranker_provider == "sentence_transformers" and settings.reranker_model:
         return SentenceTransformerRerankingService(
             settings.reranker_model,
@@ -319,8 +316,6 @@ def _validate_reranker_output(
         raise RetrievalQualityError("Azure reranker returned duplicate candidate IDs.")
     invented = sorted(set(returned) - supplied)
     if invented:
-        raise RetrievalQualityError(
-            "Azure reranker invented candidate IDs: " + ", ".join(invented)
-        )
+        raise RetrievalQualityError("Azure reranker invented candidate IDs: " + ", ".join(invented))
     if not returned:
         raise RetrievalQualityError("Azure reranker returned no ranked candidates.")

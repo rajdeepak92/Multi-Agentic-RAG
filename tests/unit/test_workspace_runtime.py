@@ -10,6 +10,7 @@ from multi_agentic_rag.common_defs import (
     GENERATED_DIR_NAME,
     GLOBAL_CACHE_DIR_NAME,
 )
+from multi_agentic_rag.config import Settings
 from multi_agentic_rag.exceptions import ConfigError
 from multi_agentic_rag.runtime.config_loader import (
     apply_project_config,
@@ -65,8 +66,7 @@ def test_resolve_project_root_accepts_explicit_config_path(tmp_path) -> None:
     project_root = initialize_project_root(tmp_path / "repo with spaces")
 
     assert (
-        resolve_project_root(explicit_config_path=project_root / BASE_CONFIG_NAME)
-        == project_root
+        resolve_project_root(explicit_config_path=project_root / BASE_CONFIG_NAME) == project_root
     )
 
 
@@ -205,3 +205,73 @@ def test_path_resolver_manifest_disambiguates_directory_batch(tmp_path) -> None:
         ("a.md", "PROJECT_1", "v1"),
         ("b.md", "PROJECT_2", "v2"),
     ]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"reasoning_provider": "openai"},
+        {"reasoning_provider": "azure_openai"},
+        {"embedding_provider": "azure_openai"},
+        {"reranker_provider": "azure_openai"},
+        {"reasoning_provider": "openai", "embedding_provider": "azure_openai"},
+        {"reasoning_provider": "openai", "reranker_provider": "azure_openai"},
+        {
+            "reasoning_provider": "azure_openai",
+            "embedding_provider": "azure_openai",
+            "reranker_provider": "azure_openai",
+        },
+        {
+            "reasoning_provider": "openai",
+            "embedding_provider": "sentence_transformers",
+            "reranker_provider": "none",
+        },
+    ],
+)
+def test_settings_azure_provider_matrix(overrides: dict[str, str]) -> None:
+    base: dict[str, object] = {"postgres_dsn": "postgresql+asyncpg://x", "_env_file": None}
+    if (
+        overrides.get("reasoning_provider") == "azure_openai"
+        or overrides.get("embedding_provider") == "azure_openai"
+        or overrides.get("reranker_provider") == "azure_openai"
+    ):
+        base.update(
+            {
+                "azure_openai_endpoint": "https://example.openai.azure.com",
+                "azure_openai_api_key": "test-key",
+                "azure_openai_api_version": "2024-12-01-preview",
+                "azure_openai_generation_deployment": "gpt-5.2-chat",
+                "azure_openai_answer_deployment": "gpt-5.2-chat",
+                "azure_openai_analysis_deployment": "gpt-5.2-chat",
+                "azure_openai_utility_deployment": "gpt-4o-mini",
+                "azure_openai_validation_deployment": "gpt-4o-mini",
+                "azure_openai_reranker_deployment": "gpt-4o-mini",
+                "azure_openai_embedding_deployment": "text-embedding-3-large",
+            }
+        )
+    Settings(**base, **overrides)
+
+
+def test_settings_rejects_stale_azure_base_url_when_azure_provider_selected() -> None:
+    with pytest.raises(ConfigError, match="AZURE_OPENAI_ENDPOINT"):
+        Settings(
+            postgres_dsn="postgresql+asyncpg://x",
+            reasoning_provider="azure_openai",
+            azure_openai_endpoint="https://example.openai.azure.com",
+            azure_openai_api_key="test-key",
+            azure_openai_api_version="2024-12-01-preview",
+            azure_openai_base_url="https://example.openai.azure.com/openai/v1/",
+            _env_file=None,
+        )
+
+
+def test_apply_project_config_projects_native_azure_env_names(tmp_path) -> None:
+    project_root = initialize_project_root(tmp_path / "repo")
+    env: dict[str, str] = {}
+
+    apply_project_config(project_root, environ=env)
+
+    assert env["AZURE_OPENAI_ENDPOINT_ENV"] == "AZURE_OPENAI_ENDPOINT"
+    assert env["AZURE_OPENAI_API_KEY_ENV"] == "AZURE_OPENAI_API_KEY"
+    assert env["AZURE_OPENAI_API_VERSION_ENV"] == "AZURE_OPENAI_API_VERSION"
+    assert env["AZURE_OPENAI_REASONING_API_STYLE"] == "chat_completions"
