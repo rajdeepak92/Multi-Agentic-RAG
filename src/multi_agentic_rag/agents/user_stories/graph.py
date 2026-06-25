@@ -168,17 +168,37 @@ class UserStoryGraphRuntime:
             run_dir = state.get("run_dir")
             if not run_id or not run_dir:
                 run_id, run_dir = create_run_directory(self.settings.user_story_output_dir)
+            framework_log_path = run_dir / "framework.log"
+
             self.settings.active_run_id = run_id
             self.settings.active_run_dir = run_dir
             self.settings.run_results_dir = run_dir
-            self.settings.run_log_path = run_dir / "framework.log"
-            configure_command_logging(self.settings.log_level, self.settings.run_log_path)
+            self.settings.run_log_path = framework_log_path
+
+            configure_command_logging(
+                self.settings.log_level,
+                framework_log_path,
+            )
+
+            self.log.info(
+                "user_story_run_started run_id=%s system=%s kb=%s version=%s provider=%s model=%s",
+                run_id,
+                request.system,
+                request.kb,
+                request.version,
+                self.settings.reasoning_provider,
+                self.reasoning_client.model,
+            )
             return {
                 **state,
                 "request": request,
                 "run_id": run_id,
                 "run_dir": run_dir,
-                "retrieval_round": state.get("retrieval_round", 0),
+                "framework_log_path": (framework_log_path),
+                "retrieval_round": state.get(
+                    "retrieval_round",
+                    0,
+                ),
                 "source_responses": [],
                 "artifact_paths": [],
                 "errors": [],
@@ -268,6 +288,10 @@ class UserStoryGraphRuntime:
             ]
 
             if missing_evidence:
+                self.log.error(
+                    "stage=enumerate_requirement_ledger status=failed missing_evidence=%d",
+                    len(missing_evidence),
+                )
                 return {
                     **state,
                     "ledger_requirements": requirements,
@@ -279,6 +303,13 @@ class UserStoryGraphRuntime:
                         + ", ".join(missing_evidence[:20]),
                     ],
                 }
+            self.log.info(
+                "stage=enumerate_requirement_ledger "
+                "status=succeeded requirements=%d "
+                "evidence_rows=%d",
+                len(requirements),
+                len(evidence),
+            )
 
             return {
                 **state,
@@ -630,6 +661,11 @@ class UserStoryGraphRuntime:
     ) -> UserStoryGenerationState:
         """Generate stories using isolated authoritative evidence batches."""
 
+        current_batch_index = 0
+        current_batch_count = 0
+        current_requirement_ids: list[str] = []
+        current_source_chunk_ids: list[str] = []
+
         try:
             request = state["request"]
 
@@ -652,7 +688,13 @@ class UserStoryGraphRuntime:
                 if story_driving_requirements
                 else [()]
             )
+            current_batch_count = len(batches)
 
+            self.log.info(
+                "stage=generate_structured_output status=started batches=%d retry_count=%d",
+                current_batch_count,
+                state.get("retry_count", 0),
+            )
             stories: list[GeneratedUserStory] = []
             story_evidence_bundles: dict[str, EvidenceBundle] = {}
             story_batch_requirement_ids: dict[str, list[str]] = {}
@@ -701,6 +743,20 @@ class UserStoryGraphRuntime:
                     batch_evidence_bundle = state["evidence_bundle"]
                     prompt = state["prompt"]
 
+                current_batch_index = index
+                current_requirement_ids = list(batch_requirement_ids)
+                current_source_chunk_ids = list(batch_evidence_bundle.source_chunk_ids)
+
+                self.log.info(
+                    "stage=generate_structured_output "
+                    "status=batch_started "
+                    "batch=%d/%d requirements=%d "
+                    "source_chunks=%d",
+                    index,
+                    len(batches),
+                    len(batch_requirement_ids),
+                    len(batch_evidence_bundle.source_chunk_ids),
+                )
                 batch_output = await self.reasoning_client.generate_structured(
                     prompt=prompt,
                     schema=LLMGeneratedUserStoryBatch,
@@ -716,7 +772,32 @@ class UserStoryGraphRuntime:
                     raise ConfigError(
                         f"Reasoning provider returned more stories than allowed for batch {index}."
                     )
+                generation_attempts_path = _write_generation_attempt(
+                    state,
+                    phase="generation",
+                    status="succeeded",
+                    batch_index=index,
+                    batch_count=len(batches),
+                    requirement_ids=(batch_requirement_ids),
+                    source_chunk_ids=(batch_evidence_bundle.source_chunk_ids),
+                    stories=batch.stories,
+                    provider_metadata=(_reasoning_response_metadata(self.reasoning_client)),
+                )
 
+                if generation_attempts_path is not None:
+                    state = {
+                        **state,
+                        "generation_attempts_path": (generation_attempts_path),
+                    }
+
+                self.log.info(
+                    "stage=generate_structured_output "
+                    "status=batch_succeeded "
+                    "batch=%d/%d stories=%d",
+                    index,
+                    len(batches),
+                    len(batch.stories),
+                )
                 for story in batch.stories:
                     # _dedupe_stories keeps the first story for a duplicate
                     # ID. setdefault preserves the matching first bundle.
@@ -742,6 +823,29 @@ class UserStoryGraphRuntime:
             }
 
         except Exception as exc:
+            generation_attempts_path = _write_generation_attempt(
+                state,
+                phase="generation",
+                status="failed",
+                batch_index=(current_batch_index),
+                batch_count=(current_batch_count),
+                requirement_ids=(current_requirement_ids),
+                source_chunk_ids=(current_source_chunk_ids),
+                provider_metadata=(_reasoning_response_metadata(self.reasoning_client)),
+                error=(f"{type(exc).__name__}: {exc}"),
+            )
+
+            if generation_attempts_path is not None:
+                state = {
+                    **state,
+                    "generation_attempts_path": (generation_attempts_path),
+                }
+
+            self.log.exception(
+                "stage=generate_structured_output status=failed batch=%d/%d",
+                current_batch_index,
+                current_batch_count,
+            )
             typed_error = _generation_error_from_exception(exc)
             invalid_path = _write_invalid_model_output_if_present(
                 state,
@@ -787,6 +891,16 @@ class UserStoryGraphRuntime:
         """Validate generated stories before publication."""
 
         try:
+            self.log.info(
+                "stage=validate_output status=started stories=%d retry_count=%d",
+                len(
+                    state.get(
+                        "validated_stories",
+                        [],
+                    )
+                ),
+                state.get("retry_count", 0),
+            )
             validated_stories = state.get(
                 "validated_stories",
                 [],
@@ -940,7 +1054,14 @@ class UserStoryGraphRuntime:
             )
 
             if failures and retry_allowed:
-                return {
+                validation_attempts_path = _write_validation_attempt(
+                    state,
+                    outcome="repair",
+                    reports_by_story=(reports_by_story),
+                    story_failures=(story_validation_failures),
+                )
+
+                retry_state: UserStoryGenerationState = {
                     **state,
                     "retry_count": (state.get("retry_count", 0) + 1),
                     "repair_story_ids": sorted(story_validation_failures),
@@ -950,9 +1071,44 @@ class UserStoryGraphRuntime:
                     "next_action": "repair",
                 }
 
+                if validation_attempts_path is not None:
+                    retry_state = {
+                        **retry_state,
+                        "validation_attempts_path": (validation_attempts_path),
+                    }
+
+                self.log.warning(
+                    "stage=validate_output status=repair stories=%d failures=%d",
+                    len(story_validation_failures),
+                    len(failures),
+                )
+
+                return retry_state
+
             if failures:
-                return _state_error(
+                validation_attempts_path = _write_validation_attempt(
                     state,
+                    outcome="failed",
+                    reports_by_story=(reports_by_story),
+                    story_failures=(story_validation_failures),
+                )
+
+                failed_state = state
+
+                if validation_attempts_path is not None:
+                    failed_state = {
+                        **failed_state,
+                        "validation_attempts_path": (validation_attempts_path),
+                    }
+
+                self.log.error(
+                    "stage=validate_output status=failed stories=%d failures=%d",
+                    len(story_validation_failures),
+                    len(failures),
+                )
+
+                return _state_error(
+                    failed_state,
                     UserStoryQualityError("; ".join(failures[:20])),
                     stage="validate_output",
                 )
@@ -981,8 +1137,7 @@ class UserStoryGraphRuntime:
 
                 if missing and retry_allowed:
                     missing_requirement_ids = [str(row["canonical_id"]) for row in missing]
-
-                    return {
+                    coverage_state: UserStoryGenerationState = {
                         **state,
                         "coverage_records": (coverage_records),
                         "coverage_payload": matrix,
@@ -1000,15 +1155,76 @@ class UserStoryGraphRuntime:
                         "next_action": "repair",
                     }
 
+                    validation_attempts_path = _write_validation_attempt(
+                        coverage_state,
+                        outcome="repair",
+                        reports_by_story=(reports_by_story),
+                        story_failures={},
+                        coverage=matrix,
+                    )
+
+                    if validation_attempts_path is not None:
+                        coverage_state = {
+                            **coverage_state,
+                            "validation_attempts_path": (validation_attempts_path),
+                        }
+
+                    self.log.warning(
+                        "stage=validate_output status=coverage_repair missing_requirements=%d",
+                        len(missing_requirement_ids),
+                    )
+
+                    return coverage_state
+                    # return {
+                    #     **state,
+                    #     "coverage_records": (coverage_records),
+                    #     "coverage_payload": matrix,
+                    #     "retry_count": (
+                    #         state.get(
+                    #             "retry_count",
+                    #             0,
+                    #         )
+                    #         + 1
+                    #     ),
+                    #     "repair_story_ids": [],
+                    #     "repair_requirement_ids": (missing_requirement_ids),
+                    #     "pending_validation_story_ids": [],
+                    #     "errors": [],
+                    #     "next_action": "repair",
+                    # }
+
                 if missing and not self.settings.user_story_allow_partial_coverage:
                     missing_ids = ", ".join(str(row["canonical_id"]) for row in missing[:20])
+                    failed_state: UserStoryGenerationState = {
+                        **state,
+                        "coverage_records": (coverage_records),
+                        "coverage_payload": matrix,
+                    }
+
+                    validation_attempts_path = _write_validation_attempt(
+                        failed_state,
+                        outcome="failed",
+                        reports_by_story=(reports_by_story),
+                        story_failures={},
+                        coverage=matrix,
+                        error=(
+                            "Coverage-required requirements are missing stories: " + missing_ids
+                        ),
+                    )
+
+                    if validation_attempts_path is not None:
+                        failed_state = {
+                            **failed_state,
+                            "validation_attempts_path": (validation_attempts_path),
+                        }
+
+                    self.log.error(
+                        "stage=validate_output status=coverage_failed missing_requirements=%d",
+                        len(missing),
+                    )
 
                     return _state_error(
-                        {
-                            **state,
-                            "coverage_records": (coverage_records),
-                            "coverage_payload": matrix,
-                        },
+                        failed_state,
                         UserStoryQualityError(
                             "Coverage-required requirements are missing stories: " + missing_ids
                         ),
@@ -1021,7 +1237,7 @@ class UserStoryGraphRuntime:
                     "coverage_payload": matrix,
                 }
 
-            return {
+            success_state: UserStoryGenerationState = {
                 **state,
                 "validation_reports": reports,
                 "validation_failures": [],
@@ -1032,9 +1248,68 @@ class UserStoryGraphRuntime:
                 "next_action": "valid",
             }
 
+            validation_attempts_path = _write_validation_attempt(
+                success_state,
+                outcome="passed",
+                reports_by_story=(reports_by_story),
+                story_failures={},
+                coverage=cast(
+                    dict[str, object],
+                    success_state.get(
+                        "coverage_payload",
+                        {},
+                    ),
+                ),
+            )
+
+            if validation_attempts_path is not None:
+                success_state = {
+                    **success_state,
+                    "validation_attempts_path": (validation_attempts_path),
+                }
+
+            self.log.info(
+                "stage=validate_output status=passed stories=%d reports=%d",
+                len(validated_stories),
+                len(reports),
+            )
+
+            return success_state
+
         except Exception as exc:
-            return _state_error(
+            validation_attempts_path = _write_validation_attempt(
                 state,
+                outcome="failed",
+                reports_by_story=state.get(
+                    "validation_reports_by_story",
+                    {},
+                ),
+                story_failures=state.get(
+                    "story_validation_failures",
+                    {},
+                ),
+                coverage=cast(
+                    dict[str, object],
+                    state.get(
+                        "coverage_payload",
+                        {},
+                    ),
+                ),
+                error=(f"{type(exc).__name__}: {exc}"),
+            )
+
+            failed_state = state
+
+            if validation_attempts_path is not None:
+                failed_state = {
+                    **failed_state,
+                    "validation_attempts_path": (validation_attempts_path),
+                }
+
+            self.log.exception("stage=validate_output status=exception")
+
+            return _state_error(
+                failed_state,
                 exc,
                 stage="validate_output",
             )
@@ -1044,6 +1319,11 @@ class UserStoryGraphRuntime:
         state: UserStoryGenerationState,
     ) -> UserStoryGenerationState:
         """Regenerate only affected requirement batches."""
+
+        current_batch_index = 0
+        current_batch_count = 0
+        current_requirement_ids: list[str] = []
+        current_source_chunk_ids: list[str] = []
 
         try:
             # Compatibility path for workflows that do not use the
@@ -1070,7 +1350,13 @@ class UserStoryGraphRuntime:
                 state,
                 batch_size=(self.settings.user_story_requirement_batch_size),
             )
+            current_batch_count = len(affected_batches)
 
+            self.log.info(
+                "stage=repair_structured_output status=started affected_batches=%d retry_count=%d",
+                current_batch_count,
+                state.get("retry_count", 0),
+            )
             if not affected_batches:
                 return _state_error(
                     state,
@@ -1144,6 +1430,8 @@ class UserStoryGraphRuntime:
                     (requirement.canonical_id or requirement.requirement_id)
                     for requirement in requirement_batch
                 ]
+                current_batch_index = batch_index
+                current_requirement_ids = list(batch_requirement_ids)
 
                 batch_evidence = _build_batch_evidence_bundle(
                     requirement_batch,
@@ -1154,6 +1442,7 @@ class UserStoryGraphRuntime:
                     ),
                     version_scope=(state["request"].version),
                 )
+                current_source_chunk_ids = list(batch_evidence.source_chunk_ids)
 
                 batch_story_group_plan = _deterministic_story_group_plan(
                     list(requirement_batch),
@@ -1239,7 +1528,30 @@ class UserStoryGraphRuntime:
                         "stories than allowed for batch "
                         f"{batch_index}."
                     )
+                generation_attempts_path = _write_generation_attempt(
+                    state,
+                    phase="repair",
+                    status="succeeded",
+                    batch_index=batch_index,
+                    batch_count=len(affected_batches),
+                    requirement_ids=(batch_requirement_ids),
+                    source_chunk_ids=(batch_evidence.source_chunk_ids),
+                    stories=batch.stories,
+                    provider_metadata=(_reasoning_response_metadata(self.reasoning_client)),
+                )
 
+                if generation_attempts_path is not None:
+                    state = {
+                        **state,
+                        "generation_attempts_path": (generation_attempts_path),
+                    }
+
+                self.log.info(
+                    "stage=repair_structured_output status=batch_succeeded batch=%d/%d stories=%d",
+                    batch_index,
+                    len(affected_batches),
+                    len(batch.stories),
+                )
                 for story in batch.stories:
                     repaired_stories.append(story)
                     repaired_story_ids.append(story.id)
@@ -1286,8 +1598,34 @@ class UserStoryGraphRuntime:
             }
 
         except Exception as exc:
-            return _state_error(
+            generation_attempts_path = _write_generation_attempt(
                 state,
+                phase="repair",
+                status="failed",
+                batch_index=(current_batch_index),
+                batch_count=(current_batch_count),
+                requirement_ids=(current_requirement_ids),
+                source_chunk_ids=(current_source_chunk_ids),
+                provider_metadata=(_reasoning_response_metadata(self.reasoning_client)),
+                error=(f"{type(exc).__name__}: {exc}"),
+            )
+
+            failed_state = state
+
+            if generation_attempts_path is not None:
+                failed_state = {
+                    **failed_state,
+                    "generation_attempts_path": (generation_attempts_path),
+                }
+
+            self.log.exception(
+                "stage=repair_structured_output status=failed batch=%d/%d",
+                current_batch_index,
+                current_batch_count,
+            )
+
+            return _state_error(
+                failed_state,
                 exc,
                 stage="repair_structured_output",
             )
@@ -1412,6 +1750,16 @@ class UserStoryGraphRuntime:
             )
             trace_path = state["run_dir"] / "debug" / "retrieval_trace.json"
             write_json_artifact(trace_path, redact_secrets(_trace_payload(state)))
+            self.log.info(
+                "stage=write_artifacts status=succeeded stories=%d paths=%d",
+                len(
+                    state.get(
+                        "validated_stories",
+                        [],
+                    )
+                ),
+                len(paths),
+            )
             return {
                 **state,
                 "artifact_paths": paths,
@@ -1420,6 +1768,7 @@ class UserStoryGraphRuntime:
                 "validation_trace_path": validation_trace_path,
             }
         except Exception as exc:
+            self.log.exception("stage=write_artifacts status=failed")
             return _state_error(state, exc)
 
     async def finalize_user_stories(
@@ -1455,6 +1804,13 @@ class UserStoryGraphRuntime:
                 ],
                 stories=state.get("validated_stories", []),
             )
+        self.log.info(
+            "stage=finalize_user_stories status=%s run_id=%s artifacts=%d errors=%d",
+            result.status,
+            result.run_id,
+            len(result.artifact_paths),
+            len(errors),
+        )
         manifest_path = _write_run_manifest(state, result)
         return {**state, "result": result, "run_manifest_path": manifest_path}
 
@@ -1480,6 +1836,15 @@ class UserStoryGraphRuntime:
                     )
                 )
             duration_ms = int((time.perf_counter() - started) * 1000)
+
+            self.log.info(
+                "stage=retrieve_%s status=%s candidates=%d duration_ms=%d",
+                source.value,
+                "success" if results else "empty",
+                len(results),
+                duration_ms,
+            )
+
             return SourceRetrievalResponse(
                 source=source,
                 status="success" if results else "empty",
@@ -1489,6 +1854,15 @@ class UserStoryGraphRuntime:
             )
         except Exception as exc:
             duration_ms = int((time.perf_counter() - started) * 1000)
+
+            self.log.info(
+                "stage=retrieve_%s status=%s candidates=%d duration_ms=%d",
+                source.value,
+                "success" if results else "empty",
+                len(results),
+                duration_ms,
+            )
+
             return SourceRetrievalResponse(
                 source=source,
                 status="failed",
@@ -2832,6 +3206,175 @@ def _coverage_summary_message(state: UserStoryGenerationState) -> str:
     )
 
 
+def _append_debug_record(
+    state: UserStoryGenerationState,
+    *,
+    filename: str,
+    collection_key: str,
+    record: dict[str, Any],
+) -> Path | None:
+    """Append one redacted record to a run-scoped debug artifact."""
+
+    run_dir = state.get("run_dir")
+
+    if run_dir is None:
+        return None
+
+    path = run_dir / "debug" / filename
+    records: list[dict[str, Any]] = []
+
+    if path.exists():
+        try:
+            existing_payload = json.loads(path.read_text(encoding="utf-8"))
+
+            if isinstance(existing_payload, dict):
+                existing_records = existing_payload.get(
+                    collection_key,
+                    [],
+                )
+
+                if isinstance(existing_records, list):
+                    records = [item for item in existing_records if isinstance(item, dict)]
+        except (OSError, json.JSONDecodeError):
+            records = []
+
+    redacted_record = redact_secrets(record)
+
+    if not isinstance(redacted_record, dict):
+        redacted_record = {
+            "value": redacted_record,
+        }
+
+    records.append(
+        cast(
+            dict[str, Any],
+            redacted_record,
+        )
+    )
+
+    write_json_artifact(
+        path,
+        {
+            collection_key: records,
+        },
+    )
+
+    return path
+
+
+def _reasoning_response_metadata(
+    reasoning_client: Any,
+) -> dict[str, Any]:
+    """Return provider response metadata when the client exposes it."""
+
+    metadata = getattr(
+        reasoning_client,
+        "_last_response_metadata",
+        None,
+    )
+
+    if not isinstance(metadata, dict):
+        metadata = getattr(
+            reasoning_client,
+            "last_response_metadata",
+            None,
+        )
+
+    if not isinstance(metadata, dict):
+        return {}
+
+    redacted = redact_secrets(dict(metadata))
+
+    return cast(dict[str, Any], redacted) if isinstance(redacted, dict) else {}
+
+
+def _write_generation_attempt(
+    state: UserStoryGenerationState,
+    *,
+    phase: Literal["generation", "repair"],
+    status: Literal["succeeded", "failed"],
+    batch_index: int,
+    batch_count: int,
+    requirement_ids: Sequence[str],
+    source_chunk_ids: Sequence[str],
+    stories: Sequence[GeneratedUserStory] = (),
+    provider_metadata: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> Path | None:
+    """Persist one generation or repair attempt."""
+
+    return _append_debug_record(
+        state,
+        filename="generation_attempts.json",
+        collection_key="attempts",
+        record={
+            "run_id": state.get("run_id"),
+            "captured_at": datetime.now(UTC).isoformat(),
+            "phase": phase,
+            "status": status,
+            "retry_count": state.get(
+                "retry_count",
+                0,
+            ),
+            "batch_index": batch_index,
+            "batch_count": batch_count,
+            "requirement_ids": list(requirement_ids),
+            "source_chunk_ids": list(source_chunk_ids),
+            "story_count": len(stories),
+            "stories": [story.model_dump(mode="json") for story in stories],
+            "provider_metadata": (provider_metadata or {}),
+            "error": error,
+        },
+    )
+
+
+def _write_validation_attempt(
+    state: UserStoryGenerationState,
+    *,
+    outcome: Literal[
+        "passed",
+        "repair",
+        "failed",
+    ],
+    reports_by_story: dict[
+        str,
+        QualityValidationReport,
+    ],
+    story_failures: dict[str, list[str]],
+    coverage: dict[str, object] | None = None,
+    error: str | None = None,
+) -> Path | None:
+    """Persist one deterministic/provider validation pass."""
+
+    return _append_debug_record(
+        state,
+        filename="validation_attempts.json",
+        collection_key="attempts",
+        record={
+            "run_id": state.get("run_id"),
+            "captured_at": datetime.now(UTC).isoformat(),
+            "outcome": outcome,
+            "retry_count": state.get(
+                "retry_count",
+                0,
+            ),
+            "pending_validation_story_ids": (
+                state.get(
+                    "pending_validation_story_ids",
+                    [],
+                )
+            ),
+            "reports_by_story": {
+                story_id: report.model_dump(mode="json")
+                for story_id, report in (reports_by_story.items())
+            },
+            "story_failures": story_failures,
+            "coverage": coverage or {},
+            "error": error,
+        },
+    )
+
+
 def _write_invalid_model_output_if_present(
     state: UserStoryGenerationState,
     exc: Exception,
@@ -3027,8 +3570,18 @@ def _write_run_manifest(
         "validation_results": [
             report.model_dump(mode="json") for report in state.get("validation_reports", [])
         ],
-        "validation_failures": state.get("validation_failures", []),
-        "coverage_results": state.get("coverage_payload", {}),
+        "validation_failures": state.get(
+            "validation_failures",
+            [],
+        ),
+        "story_validation_failures": state.get(
+            "story_validation_failures",
+            {},
+        ),
+        "coverage_results": state.get(
+            "coverage_payload",
+            {},
+        ),
         "published_artifacts": [str(path) for path in state.get("artifact_paths", [])],
         "errors": state.get("errors", []),
         "warnings": [],
@@ -3037,6 +3590,15 @@ def _write_run_manifest(
             "model": _settings_value(state, "reasoning_model"),
         },
         "debug_artifacts": {
+            "framework_log": str(state.get("framework_log_path"))
+            if state.get("framework_log_path")
+            else None,
+            "generation_attempts": str(state.get("generation_attempts_path"))
+            if state.get("generation_attempts_path")
+            else None,
+            "validation_attempts": str(state.get("validation_attempts_path"))
+            if state.get("validation_attempts_path")
+            else None,
             "retrieval_trace": str(state.get("debug_trace_path"))
             if state.get("debug_trace_path")
             else None,

@@ -69,6 +69,9 @@ class UserStoryGenerationState(TypedDict, total=False):
     debug_trace_path: Path
     generation_trace_path: Path
     validation_trace_path: Path
+    generation_attempts_path: Path
+    validation_attempts_path: Path
+    framework_log_path: Path
     run_manifest_path: Path | None
     invalid_model_output_path: Path
     provider_errors_path: Path

@@ -1093,3 +1093,60 @@ def test_deterministic_traceability_accepts_valid_mapping() -> None:
     )
 
     assert failures == []
+
+
+def test_failed_validation_persists_attempt_diagnostics(
+    tmp_path: Path,
+) -> None:
+    reasoner = FakeStructuredReasoning(validation_statuses=["failed"])
+
+    runtime = _runtime(
+        tmp_path,
+        reasoner,
+        FakeRetriever([_retrieval_result("postgres")]),
+        FakeRetriever([_retrieval_result("chroma")]),
+        FakeRetriever([_retrieval_result("neo4j")]),
+        structured_generation_retry_count=0,
+    )
+
+    state = asyncio.run(
+        UserStoryGenerationAgent(runtime).graph.ainvoke(
+            {
+                "request": (
+                    UserStoryGenerationRequest(
+                        system="PROJECT_1",
+                        version="v1",
+                    )
+                )
+            }
+        )
+    )
+
+    assert state["result"].status == "failed"
+
+    generation_path = state["generation_attempts_path"]
+    validation_path = state["validation_attempts_path"]
+    framework_log_path = state["framework_log_path"]
+
+    assert generation_path.exists()
+    assert validation_path.exists()
+    assert framework_log_path.exists()
+
+    generation_payload = json.loads(generation_path.read_text(encoding="utf-8"))
+    validation_payload = json.loads(validation_path.read_text(encoding="utf-8"))
+    manifest = json.loads(state["run_manifest_path"].read_text(encoding="utf-8"))
+
+    assert generation_payload["attempts"]
+    assert generation_payload["attempts"][-1]["status"] == "succeeded"
+
+    assert validation_payload["attempts"]
+    assert validation_payload["attempts"][-1]["outcome"] == "failed"
+
+    assert manifest["publication_status"] == "failed"
+    assert manifest["debug_artifacts"]["generation_attempts"] == str(generation_path)
+    assert manifest["debug_artifacts"]["validation_attempts"] == str(validation_path)
+
+    log_text = framework_log_path.read_text(encoding="utf-8")
+
+    assert "user_story_run_started" in log_text
+    assert "stage=validate_output" in log_text
