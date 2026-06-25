@@ -127,6 +127,7 @@ class RequirementLedgerRepository(Protocol):
     ) -> None:
         """Persist requirement-to-story coverage rows."""
 
+
 class UserStoryGraphRuntime:
     """Node implementation for the user-story StateGraph."""
 
@@ -250,9 +251,7 @@ class UserStoryGraphRuntime:
             missing_evidence = [
                 requirement.canonical_id or requirement.requirement_id
                 for requirement in requirements
-                if not any(
-                    item.requirement_pk == requirement.requirement_pk for item in evidence
-                )
+                if not any(item.requirement_pk == requirement.requirement_pk for item in evidence)
             ]
             if missing_evidence:
                 return {
@@ -420,9 +419,7 @@ class UserStoryGraphRuntime:
                 continue
             hits = _merge_source_hits(existing.source_hits, candidate.source_hits)
             metadata = {**existing.metadata, **candidate.metadata}
-            requirement_ids = sorted(
-                {*existing.requirement_ids, *candidate.requirement_ids}
-            )
+            requirement_ids = sorted({*existing.requirement_ids, *candidate.requirement_ids})
             entity_ids = sorted({*existing.entity_ids, *candidate.entity_ids})
             merged[key] = existing.model_copy(
                 update={
@@ -464,11 +461,10 @@ class UserStoryGraphRuntime:
         fused = state.get("fused_results", [])
         domain_results = [_candidate_to_domain(candidate) for candidate in fused]
         query = _primary_query(state["retrieval_plan"], state["request"])
-        async_rerank = getattr(self.reranker, "arerank", None)
-        if callable(async_rerank):
-            reranked_domain = await async_rerank(query, domain_results)
-        else:
-            reranked_domain = self.reranker.rerank(query, domain_results)
+        reranked_domain = await self.reranker.arerank(
+            query,
+            domain_results,
+        )
         by_id = {result.chunk_id: result for result in reranked_domain}
         reranked: list[EvidenceCandidate] = []
         for candidate in fused:
@@ -572,9 +568,7 @@ class UserStoryGraphRuntime:
                 "allow_partial_coverage": self.settings.user_story_allow_partial_coverage,
                 "coverage_required_types": list(self.settings.user_story_coverage_required_types),
                 "story_group_plan": story_group_plan,
-                "requirement_ledger": _story_driving_requirement_payloads(
-                    ledger_requirements
-                ),
+                "requirement_ledger": _story_driving_requirement_payloads(ledger_requirements),
                 "evidence_count": len(bundle.ranked_results),
                 "source_chunk_ids": bundle.source_chunk_ids,
                 "assessment": assessment.model_dump(mode="json") if assessment else {},
@@ -626,8 +620,7 @@ class UserStoryGraphRuntime:
                 batch = batch_output.to_domain()
                 if len(batch.stories) > self.settings.user_story_max_stories_per_batch:
                     raise ConfigError(
-                        "Reasoning provider returned more stories than allowed "
-                        f"for batch {index}."
+                        f"Reasoning provider returned more stories than allowed for batch {index}."
                     )
                 stories.extend(batch.stories)
             if not stories:
@@ -734,8 +727,7 @@ class UserStoryGraphRuntime:
                             "coverage_payload": matrix,
                         },
                         UserStoryQualityError(
-                            "Coverage-required requirements are missing stories: "
-                            + missing_ids
+                            "Coverage-required requirements are missing stories: " + missing_ids
                         ),
                         stage="validate_output",
                     )
@@ -831,9 +823,7 @@ class UserStoryGraphRuntime:
                         )
                     )
                 if self.requirement_repository and coverage_records:
-                    await self.requirement_repository.upsert_requirement_coverage(
-                        coverage_records
-                    )
+                    await self.requirement_repository.upsert_requirement_coverage(coverage_records)
             quality_paths = _write_story_quality_artifacts(
                 artifact_dir,
                 state.get("validated_stories", []),
@@ -1129,8 +1119,7 @@ def _assessment_prompt(
     return (
         "Assess whether this evidence is sufficient to generate grounded enterprise "
         "user stories. If insufficient, provide refined retrieval queries. Do not invent "
-        "missing requirements.\n"
-        + json.dumps(payload, indent=2)
+        "missing requirements.\n" + json.dumps(payload, indent=2)
     )
 
 
@@ -1180,21 +1169,21 @@ def _deterministic_story_group_plan(
             key=lambda item: item.canonical_id or item.requirement_id,
         )
         for index, batch in enumerate(_batched(records, max(1, maximum_group_size)), start=1):
-            requirement_ids = [
-                record.canonical_id or record.requirement_id
-                for record in batch
-            ]
-            group_id = "GROUP-" + stable_id(
-                "story_group",
-                system,
-                kb,
-                version,
-                category,
-                requirement_type,
-                section,
-                str(index),
-                *requirement_ids,
-            )[-12:].upper()
+            requirement_ids = [record.canonical_id or record.requirement_id for record in batch]
+            group_id = (
+                "GROUP-"
+                + stable_id(
+                    "story_group",
+                    system,
+                    kb,
+                    version,
+                    category,
+                    requirement_type,
+                    section,
+                    str(index),
+                    *requirement_ids,
+                )[-12:].upper()
+            )
             plans.append(
                 {
                     "group_id": group_id,
@@ -1271,8 +1260,7 @@ def _batch_generation_prompt(
         "batch_index": batch_index,
         "batch_count": batch_count,
         "batch_requirement_ids": [
-            requirement.canonical_id or requirement.requirement_id
-            for requirement in requirements
+            requirement.canonical_id or requirement.requirement_id for requirement in requirements
         ],
         "batch_requirements": [
             _requirement_prompt_payload(requirement) for requirement in requirements
@@ -1573,11 +1561,7 @@ def _story_requirement_ids_by_story(
 def _coverage_summary_message(state: UserStoryGenerationState) -> str:
     requirements = state.get("ledger_requirements", [])
     matrix = state.get("coverage_payload", {})
-    rows = (
-        cast(list[dict[str, Any]], matrix.get("rows", []))
-        if isinstance(matrix, dict)
-        else []
-    )
+    rows = cast(list[dict[str, Any]], matrix.get("rows", [])) if isinstance(matrix, dict) else []
     story_driving = [
         requirement
         for requirement in requirements
@@ -1676,9 +1660,7 @@ def _write_provider_error(
                 list,
             ):
                 existing_errors = [
-                    item
-                    for item in existing_payload["errors"]
-                    if isinstance(item, dict)
+                    item for item in existing_payload["errors"] if isinstance(item, dict)
                 ]
         except json.JSONDecodeError:
             existing_errors = []

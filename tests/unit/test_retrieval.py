@@ -296,6 +296,83 @@ def test_hybrid_retriever_runs_backends_concurrently() -> None:
 
     assert [result.chunk_id for result in results] == ["b", "g", "v"]
 
+def test_hybrid_retriever_awaits_async_reranker() -> None:
+    class AsyncReranker:
+        def __init__(self) -> None:
+            self.called = False
+
+        def rerank(
+            self,
+            query_text: str,
+            results: list[RetrievalResult],
+        ) -> list[RetrievalResult]:
+            raise AssertionError(
+                "Synchronous rerank() must not be called from "
+                "HybridKnowledgeRetriever.retrieve()."
+            )
+
+        async def arerank(
+            self,
+            query_text: str,
+            results: list[RetrievalResult],
+        ) -> list[RetrievalResult]:
+            self.called = True
+            by_chunk_id = {result.chunk_id: result for result in results}
+
+            second = by_chunk_id["b"]
+            first = by_chunk_id["a"]
+
+            return [
+                second.model_copy(
+                    update={
+                        "score": 1.0,
+                        "sources": [*second.sources, "async_reranker"],
+                        "metadata": {
+                            **second.metadata,
+                            "reranker_score": 1.0,
+                        },
+                    }
+                ),
+                first.model_copy(
+                    update={
+                        "score": 0.5,
+                        "sources": [*first.sources, "async_reranker"],
+                        "metadata": {
+                            **first.metadata,
+                            "reranker_score": 0.5,
+                        },
+                    }
+                ),
+            ]
+
+    reranker = AsyncReranker()
+    hybrid = HybridKnowledgeRetriever(
+        bm25=FakeRetriever(
+            [
+                _result("a", 0.9, ["bm25"]),
+                _result("b", 0.8, ["bm25"]),
+            ]
+        ),
+        reranker=reranker,
+    )
+
+    results = asyncio.run(
+        hybrid.retrieve(
+            "query",
+            system_name="PROJECT_1",
+            top_k=2,
+        )
+    )
+
+    assert reranker.called is True
+    assert [result.chunk_id for result in results] == ["b", "a"]
+    assert results[0].rank == 1
+    assert results[0].metadata["reranker_score"] == 1.0
+    assert results[0].metadata["final_rank"] == 1
+    assert results[0].metadata["final_score"] == 1.0
+    assert "async_reranker" in results[0].sources
+
+
 
 def test_evidence_validator_drops_untraceable_results() -> None:
     valid = _result("a", 1.0, ["bm25"])

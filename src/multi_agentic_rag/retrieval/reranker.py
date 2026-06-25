@@ -24,10 +24,30 @@ from multi_agentic_rag.runtime.device import resolve_device
 
 
 class RerankingService(Protocol):
-    """Reranker contract."""
+    """Reranker contract for synchronous and asynchronous callers."""
 
-    def rerank(self, query_text: str, results: list[RetrievalResult]) -> list[RetrievalResult]:
-        """Rerank results.
+    def rerank(
+        self,
+        query_text: str,
+        results: list[RetrievalResult],
+    ) -> list[RetrievalResult]:
+        """Rerank results from a synchronous caller.
+
+        Args:
+            query_text: Original user query.
+            results: Candidate retrieval results after fusion.
+
+        Returns:
+            Results in final presentation order. Implementations may update
+            scores and append source signals.
+        """
+
+    async def arerank(
+        self,
+        query_text: str,
+        results: list[RetrievalResult],
+    ) -> list[RetrievalResult]:
+        """Rerank results from an asynchronous caller.
 
         Args:
             query_text: Original user query.
@@ -55,6 +75,15 @@ class NoOpRerankingService:
         """
 
         return results
+
+    async def arerank(
+        self,
+        query_text: str,
+        results: list[RetrievalResult],
+    ) -> list[RetrievalResult]:
+        """Return results unchanged from an asynchronous caller."""
+
+        return self.rerank(query_text, results)
 
 
 class SentenceTransformerRerankingService:
@@ -127,6 +156,19 @@ class SentenceTransformerRerankingService:
             for result, score in zip(results, scores, strict=True)
         ]
         return sorted(rescored, key=lambda item: (-item.score, item.chunk_id))
+
+    async def arerank(
+        self,
+        query_text: str,
+        results: list[RetrievalResult],
+    ) -> list[RetrievalResult]:
+        """Run blocking cross-encoder inference outside the event-loop thread."""
+
+        return await asyncio.to_thread(
+            self.rerank,
+            query_text,
+            results,
+        )
 
 
 class AzureRankedCandidate(BaseModel):

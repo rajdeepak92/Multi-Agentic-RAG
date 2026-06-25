@@ -119,7 +119,10 @@ class HybridKnowledgeRetriever:
             )
         ranked_lists = list(await asyncio.gather(*calls))
         fused = self._fuse(ranked_lists)
-        reranked = self.reranker.rerank(query_text, fused[:top_k])
+        reranked = await self.reranker.arerank(
+            query_text,
+            fused[:top_k],
+        )
         ranked: list[RankedRetrievalResult] = list(rank_retrieval_results(reranked))
         ranked = [
             result.model_copy(
