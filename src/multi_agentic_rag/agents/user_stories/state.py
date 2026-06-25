@@ -45,6 +45,8 @@ class UserStoryGenerationState(TypedDict, total=False):
     reranked_evidence: list[EvidenceCandidate]
     evidence_assessment: EvidenceAssessment
     evidence_bundle: EvidenceBundle
+    story_evidence_bundles: dict[str, EvidenceBundle]
+    story_batch_requirement_ids: dict[str, list[str]]
     retrieval_round: int
     prompt: str
     story_group_plan: list[dict[str, object]]

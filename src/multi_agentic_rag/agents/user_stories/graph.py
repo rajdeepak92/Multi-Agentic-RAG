@@ -567,7 +567,6 @@ class UserStoryGraphRuntime:
             graph_paths=[result.evidence_path for result in ranked],
             version_scope=state["request"].version,
         )
-        assessment = state.get("evidence_assessment")
         ledger_requirements = state.get("ledger_requirements", [])
         story_group_plan = _deterministic_story_group_plan(
             ledger_requirements,
@@ -580,15 +579,41 @@ class UserStoryGraphRuntime:
             {
                 "schema": "GeneratedUserStoryBatch",
                 "schema_version": self.settings.user_story_schema_version,
-                "requirement_batch_size": self.settings.user_story_requirement_batch_size,
-                "max_stories_per_batch": self.settings.user_story_max_stories_per_batch,
-                "allow_partial_coverage": self.settings.user_story_allow_partial_coverage,
+                "scope": state["request"].model_dump(mode="json"),
+                "generation_mode": "authoritative_requirement_batches",
+                "requirement_batch_size": (self.settings.user_story_requirement_batch_size),
+                "max_stories_per_batch": (self.settings.user_story_max_stories_per_batch),
+                "allow_partial_coverage": (self.settings.user_story_allow_partial_coverage),
                 "coverage_required_types": list(self.settings.user_story_coverage_required_types),
-                "story_group_plan": story_group_plan,
-                "requirement_ledger": _story_driving_requirement_payloads(ledger_requirements),
-                "evidence_count": len(bundle.ranked_results),
-                "source_chunk_ids": bundle.source_chunk_ids,
-                "assessment": assessment.model_dump(mode="json") if assessment else {},
+                "generation_contract": {
+                    "batch_scoped": True,
+                    "requirements_authority": (
+                        "The current batch requirement ledger is the complete "
+                        "requirement inventory for this generation call."
+                    ),
+                    "evidence_authority": (
+                        "Only source evidence and source chunk IDs supplied in "
+                        "the current batch may be cited."
+                    ),
+                    "requirements": [
+                        "Generate stories only for requirements in the current batch.",
+                        "Do not use requirements from another batch.",
+                        "Do not invent requirement IDs, chunk IDs, facts, or evidence paths.",
+                        (
+                            "Every generated story must contain non-empty "
+                            "traceability.requirement_ids."
+                        ),
+                        (
+                            "Every requirement ID cited by a story must have at least "
+                            "one corresponding authorized source chunk in "
+                            "traceability.chunk_ids."
+                        ),
+                        (
+                            "Copy evidence paths exactly from the supplied batch "
+                            "evidence into traceability.evidence_paths."
+                        ),
+                    ],
+                },
             },
             indent=2,
         )
@@ -603,14 +628,20 @@ class UserStoryGraphRuntime:
         self,
         state: UserStoryGenerationState,
     ) -> UserStoryGenerationState:
-        """Generate structured user stories from validated evidence."""
+        """Generate stories using isolated authoritative evidence batches."""
 
         try:
+            request = state["request"]
+
             story_driving_requirements = [
                 requirement
-                for requirement in state.get("ledger_requirements", [])
-                if requirement.story_driving or requirement.coverage_required
+                for requirement in state.get(
+                    "ledger_requirements",
+                    [],
+                )
+                if (requirement.story_driving or requirement.coverage_required)
             ]
+
             batches = (
                 list(
                     _batched(
@@ -621,31 +652,101 @@ class UserStoryGraphRuntime:
                 if story_driving_requirements
                 else [()]
             )
+
             stories: list[GeneratedUserStory] = []
-            for index, requirement_batch in enumerate(batches, start=1):
-                prompt = _batch_generation_prompt(
-                    state["prompt"],
-                    requirement_batch,
-                    batch_index=index,
-                    batch_count=len(batches),
-                )
+            story_evidence_bundles: dict[str, EvidenceBundle] = {}
+            story_batch_requirement_ids: dict[str, list[str]] = {}
+
+            for index, requirement_batch in enumerate(
+                batches,
+                start=1,
+            ):
+                if requirement_batch:
+                    batch_requirement_ids = [
+                        (requirement.canonical_id or requirement.requirement_id)
+                        for requirement in requirement_batch
+                    ]
+
+                    batch_evidence_bundle = _build_batch_evidence_bundle(
+                        requirement_batch,
+                        state["requirement_evidence_map"],
+                        query=(
+                            "Generate grounded user stories for "
+                            "requirements: " + ", ".join(batch_requirement_ids)
+                        ),
+                        version_scope=request.version,
+                    )
+
+                    batch_story_group_plan = _deterministic_story_group_plan(
+                        list(requirement_batch),
+                        system=request.system,
+                        kb=request.kb,
+                        version=request.version,
+                        maximum_group_size=(self.settings.user_story_maximum_group_size),
+                    )
+
+                    prompt = _batch_generation_prompt(
+                        state["prompt"],
+                        requirement_batch,
+                        state["requirement_evidence_map"],
+                        batch_story_group_plan,
+                        batch_index=index,
+                        batch_count=len(batches),
+                    )
+                else:
+                    # Compatibility path for workflows without a requirement
+                    # repository. Ledger-backed workflows must use the
+                    # authoritative batch path above.
+                    batch_requirement_ids = []
+                    batch_evidence_bundle = state["evidence_bundle"]
+                    prompt = state["prompt"]
+
                 batch_output = await self.reasoning_client.generate_structured(
                     prompt=prompt,
                     schema=LLMGeneratedUserStoryBatch,
-                    generation_config=_generation_config(self.settings, "user_story_generation"),
+                    generation_config=_generation_config(
+                        self.settings,
+                        "user_story_generation",
+                    ),
                 )
+
                 batch = batch_output.to_domain()
+
                 if len(batch.stories) > self.settings.user_story_max_stories_per_batch:
                     raise ConfigError(
                         f"Reasoning provider returned more stories than allowed for batch {index}."
                     )
+
+                for story in batch.stories:
+                    # _dedupe_stories keeps the first story for a duplicate
+                    # ID. setdefault preserves the matching first bundle.
+                    story_evidence_bundles.setdefault(
+                        story.id,
+                        batch_evidence_bundle,
+                    )
+                    story_batch_requirement_ids.setdefault(
+                        story.id,
+                        list(batch_requirement_ids),
+                    )
+
                 stories.extend(batch.stories)
+
             if not stories:
                 raise ConfigError("Reasoning provider returned no user stories.")
-            return {**state, "validated_stories": _dedupe_stories(stories)}
+
+            return {
+                **state,
+                "validated_stories": _dedupe_stories(stories),
+                "story_evidence_bundles": story_evidence_bundles,
+                "story_batch_requirement_ids": (story_batch_requirement_ids),
+            }
+
         except Exception as exc:
             typed_error = _generation_error_from_exception(exc)
-            invalid_path = _write_invalid_model_output_if_present(state, exc)
+            invalid_path = _write_invalid_model_output_if_present(
+                state,
+                exc,
+            )
             provider_errors_path = _write_provider_error(
                 state,
                 typed_error,
@@ -661,24 +762,65 @@ class UserStoryGraphRuntime:
                 ).max_output_tokens,
                 invalid_model_output_path=invalid_path,
             )
+
             failed_state: UserStoryGenerationState = {
                 **state,
                 "provider_errors_path": provider_errors_path,
             }
+
             if invalid_path is not None:
-                failed_state = {**failed_state, "invalid_model_output_path": invalid_path}
-            return _state_error(failed_state, typed_error, stage="generate_structured_output")
+                failed_state = {
+                    **failed_state,
+                    "invalid_model_output_path": invalid_path,
+                }
+
+            return _state_error(
+                failed_state,
+                typed_error,
+                stage="generate_structured_output",
+            )
 
     async def validate_output(self, state: UserStoryGenerationState) -> UserStoryGenerationState:
         """Validate every generated story before YAML publication."""
 
         try:
             reports: list[QualityValidationReport] = []
+            story_evidence_bundles = state.get(
+                "story_evidence_bundles",
+                {},
+            )
+
             for story in state.get("validated_stories", []):
+                story_evidence = story_evidence_bundles.get(story.id)
+
+                if story_evidence is None:
+                    if state.get("ledger_requirements"):
+                        reports.append(
+                            QualityValidationReport(
+                                status="failed",
+                                messages=[
+                                    (
+                                        f"Story {story.id} has no associated "
+                                        "authoritative requirement evidence "
+                                        "bundle."
+                                    )
+                                ],
+                                checks={
+                                    "evidence_traceable": False,
+                                    "citations_supported": False,
+                                    "schema_complete": True,
+                                    "unsupported_claims_absent": False,
+                                },
+                            )
+                        )
+                        continue
+
+                    # Compatibility path for non-ledger workflows.
+                    story_evidence = state["evidence_bundle"]
                 reports.append(
                     await self.reasoning_client.validate_user_story(
                         story,
-                        state["evidence_bundle"],
+                        story_evidence,
                     )
                 )
             failures = [
@@ -1260,6 +1402,163 @@ def _build_requirement_evidence_map(
     return requirement_evidence_map
 
 
+def _build_batch_evidence_bundle(
+    requirements: Sequence[RequirementRecord],
+    requirement_evidence_map: dict[str, dict[str, Any]],
+    *,
+    query: str,
+    version_scope: str,
+) -> EvidenceBundle:
+    """Build authoritative evidence for one requirement generation batch.
+
+    Evidence rows are grouped by source chunk. A chunk shared by multiple
+    requirements is represented once, with all associated requirement IDs
+    preserved in metadata.
+    """
+
+    chunk_payloads: dict[str, dict[str, Any]] = {}
+
+    for requirement in requirements:
+        canonical_id = requirement.canonical_id or requirement.requirement_id
+        evidence_entry = requirement_evidence_map.get(canonical_id)
+
+        if not evidence_entry:
+            raise ConfigError(
+                f"No authoritative evidence mapping exists for requirement {canonical_id}."
+            )
+
+        evidence_rows = evidence_entry.get("evidence", [])
+
+        if not isinstance(evidence_rows, list) or not evidence_rows:
+            raise ConfigError(
+                f"No authoritative evidence rows exist for requirement {canonical_id}."
+            )
+
+        for evidence_row in evidence_rows:
+            if not isinstance(evidence_row, dict):
+                continue
+
+            chunk_id = str(evidence_row.get("chunk_id") or "").strip()
+            if not chunk_id:
+                continue
+
+            page = evidence_row.get("page")
+            if not isinstance(page, int) or page < 1:
+                page = requirement.page or 1
+
+            source_name = str(
+                evidence_row.get("source_name") or requirement.source_name or ""
+            ).strip()
+
+            if not source_name:
+                raise ConfigError(
+                    f"Authoritative evidence has no source name for requirement {canonical_id}."
+                )
+
+            chunk_payload = chunk_payloads.setdefault(
+                chunk_id,
+                {
+                    "document_id": requirement.document_id,
+                    "document_version_id": str(
+                        evidence_row.get("document_version_id") or requirement.document_version_id
+                    ),
+                    "system_name": requirement.system_name,
+                    "kb_name": requirement.kb_name,
+                    "version": requirement.version,
+                    "source_name": source_name,
+                    "page": page,
+                    "texts": [],
+                    "requirement_ids": set(),
+                    "requirement_evidence_ids": set(),
+                },
+            )
+
+            evidence_text = str(evidence_row.get("evidence_text") or requirement.text).strip()
+
+            texts = cast(list[str], chunk_payload["texts"])
+            if evidence_text and evidence_text not in texts:
+                texts.append(evidence_text)
+
+            cast(
+                set[str],
+                chunk_payload["requirement_ids"],
+            ).add(canonical_id)
+
+            requirement_evidence_id = str(evidence_row.get("requirement_evidence_id") or "").strip()
+
+            if requirement_evidence_id:
+                cast(
+                    set[str],
+                    chunk_payload["requirement_evidence_ids"],
+                ).add(requirement_evidence_id)
+
+    if requirements and not chunk_payloads:
+        requirement_ids = ", ".join(
+            requirement.canonical_id or requirement.requirement_id for requirement in requirements
+        )
+        raise ConfigError(
+            "No authoritative source chunks could be built for requirement "
+            f"batch: {requirement_ids}"
+        )
+
+    retrieval_results: list[RetrievalResult] = []
+
+    ordered_chunks = sorted(
+        chunk_payloads.items(),
+        key=lambda item: (
+            int(item[1]["page"]),
+            item[0],
+        ),
+    )
+
+    for chunk_id, payload in ordered_chunks:
+        retrieval_results.append(
+            RetrievalResult(
+                chunk_id=chunk_id,
+                document_id=str(payload["document_id"]),
+                document_version_id=str(payload["document_version_id"]),
+                system_name=str(payload["system_name"]),
+                kb_name=str(payload["kb_name"]),
+                version=str(payload["version"]),
+                source_name=str(payload["source_name"]),
+                page=int(payload["page"]),
+                text="\n".join(cast(list[str], payload["texts"])),
+                score=1.0,
+                sources=["requirement_ledger"],
+                metadata={
+                    "authoritative_requirement_evidence": True,
+                    "requirement_ids": sorted(
+                        cast(
+                            set[str],
+                            payload["requirement_ids"],
+                        )
+                    ),
+                    "requirement_evidence_ids": sorted(
+                        cast(
+                            set[str],
+                            payload["requirement_evidence_ids"],
+                        )
+                    ),
+                },
+            )
+        )
+
+    ranked_results = EvidenceValidator().validate(retrieval_results)
+
+    if len(ranked_results) != len(retrieval_results):
+        raise ConfigError(
+            "One or more authoritative requirement evidence chunks failed lineage validation."
+        )
+
+    return EvidenceBundle(
+        query=query,
+        ranked_results=ranked_results,
+        source_chunk_ids=[result.chunk_id for result in ranked_results],
+        graph_paths=[result.evidence_path for result in ranked_results],
+        version_scope=version_scope,
+    )
+
+
 def _story_driving_requirement_payloads(
     requirements: list[RequirementRecord],
 ) -> list[dict[str, Any]]:
@@ -1349,16 +1648,36 @@ def _business_outcome_hint(records: Sequence[RequirementRecord]) -> str | None:
     return first.title or first.category or first.requirement_type.value
 
 
-def _requirement_prompt_payload(requirement: RequirementRecord) -> dict[str, Any]:
+def _requirement_prompt_payload(
+    requirement: RequirementRecord,
+    evidence_entry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one batch-scoped requirement and evidence payload."""
+
+    authoritative_evidence = evidence_entry or {}
+
+    source_chunk_ids = authoritative_evidence.get(
+        "source_chunk_ids",
+        [requirement.chunk_id],
+    )
+    source_pages = authoritative_evidence.get(
+        "source_pages",
+        [requirement.page] if requirement.page is not None else [],
+    )
+    source_evidence = authoritative_evidence.get("evidence", [])
+
     return {
-        "canonical_id": requirement.canonical_id or requirement.requirement_id,
+        "canonical_id": (requirement.canonical_id or requirement.requirement_id),
         "requirement_type": requirement.requirement_type.value,
         "category": requirement.category,
+        "title": requirement.title,
         "text": requirement.text,
         "coverage_required": requirement.coverage_required,
         "story_driving": requirement.story_driving,
-        "source_chunk_id": requirement.chunk_id,
-        "source_page": requirement.page,
+        "primary_source_chunk_id": requirement.chunk_id,
+        "source_chunk_ids": list(source_chunk_ids),
+        "source_pages": list(source_pages),
+        "source_evidence": list(source_evidence),
     }
 
 
@@ -1376,26 +1695,91 @@ def _batched(
 def _batch_generation_prompt(
     base_prompt: str,
     requirements: tuple[RequirementRecord, ...],
+    requirement_evidence_map: dict[str, dict[str, Any]],
+    story_group_plan: list[dict[str, object]],
     *,
     batch_index: int,
     batch_count: int,
 ) -> str:
+    """Build one isolated requirement-batch generation prompt."""
+
     if not requirements:
         return base_prompt
+
+    batch_requirement_ids = [
+        requirement.canonical_id or requirement.requirement_id for requirement in requirements
+    ]
+
+    missing_evidence = [
+        requirement_id
+        for requirement_id in batch_requirement_ids
+        if not requirement_evidence_map.get(
+            requirement_id,
+            {},
+        ).get("source_chunk_ids")
+    ]
+
+    if missing_evidence:
+        raise ConfigError(
+            "Cannot generate user stories without authoritative evidence for: "
+            + ", ".join(missing_evidence)
+        )
+
+    batch_requirements = [
+        _requirement_prompt_payload(
+            requirement,
+            requirement_evidence_map[requirement.canonical_id or requirement.requirement_id],
+        )
+        for requirement in requirements
+    ]
+
+    allowed_source_chunk_ids = sorted(
+        {
+            chunk_id
+            for requirement in batch_requirements
+            for chunk_id in requirement["source_chunk_ids"]
+        }
+    )
+
     payload = {
         "batch_index": batch_index,
         "batch_count": batch_count,
-        "batch_requirement_ids": [
-            requirement.canonical_id or requirement.requirement_id for requirement in requirements
-        ],
-        "batch_requirements": [
-            _requirement_prompt_payload(requirement) for requirement in requirements
-        ],
+        "batch_requirement_ids": batch_requirement_ids,
+        "allowed_source_chunk_ids": allowed_source_chunk_ids,
+        "batch_requirements": batch_requirements,
+        "batch_story_group_plan": story_group_plan,
+        "traceability_contract": {
+            "allowed_requirement_ids": batch_requirement_ids,
+            "allowed_source_chunk_ids": allowed_source_chunk_ids,
+            "rules": [
+                (
+                    "Each generated story must cite only requirement IDs "
+                    "listed in allowed_requirement_ids."
+                ),
+                (
+                    "Each requirement ID in traceability.requirement_ids "
+                    "must be linked to at least one of its supplied "
+                    "source_chunk_ids."
+                ),
+                (
+                    "traceability.chunk_ids must contain only IDs listed "
+                    "in allowed_source_chunk_ids."
+                ),
+                (
+                    "traceability.evidence_paths must be copied exactly "
+                    "from batch_requirements.source_evidence.evidence_path."
+                ),
+                ("Do not generate stories for requirements outside this batch."),
+            ],
+        },
         "instruction": (
-            "Generate only stories grounded in this batch. Every coverage-required "
-            "batch requirement must be covered or explicitly deferred with a reason."
+            "Generate only user stories grounded in this isolated batch. "
+            "Every coverage-required batch requirement must be covered or "
+            "explicitly deferred with a reason. Do not use requirements, "
+            "chunk IDs, or evidence from any other batch."
         ),
     }
+
     return base_prompt + "\n\nBatch generation scope:\n" + json.dumps(payload, indent=2)
 
 

@@ -19,6 +19,7 @@ from multi_agentic_rag.app import GraphRagApplication
 from multi_agentic_rag.config import Settings
 from multi_agentic_rag.domain import (
     DocumentStatus,
+    EvidenceBundle,
     GeneratedUserStory,
     IngestResult,
     QualityValidationReport,
@@ -334,6 +335,117 @@ def test_user_story_graph_generates_in_configured_requirement_batches(
     assert state["coverage_payload"]["counts"] == {"covered": 2}
 
 
+def test_user_story_graph_uses_batch_scoped_authoritative_evidence(
+    tmp_path: Path,
+) -> None:
+    requirement_one = _requirement_record("REQ-1")
+    requirement_two = _requirement_record("REQ-2").model_copy(
+        update={
+            "chunk_id": "chunk-2",
+            "page": 2,
+            "text": "REQ-2 pressure shutdown is required.",
+            "normalized_text": ("req-2 pressure shutdown is required."),
+        }
+    )
+
+    evidence = [
+        RequirementEvidenceRecord(
+            requirement_evidence_id="ev-REQ-1",
+            requirement_pk=requirement_one.requirement_pk or "",
+            chunk_id="chunk-1",
+            document_version_id=(requirement_one.document_version_id),
+            source_name="source.md",
+            page=1,
+            section_title="Temperature",
+            evidence_text=("REQ-1 temperature threshold maximum is 80 C."),
+        ),
+        RequirementEvidenceRecord(
+            requirement_evidence_id="ev-REQ-2",
+            requirement_pk=requirement_two.requirement_pk or "",
+            chunk_id="chunk-2",
+            document_version_id=(requirement_two.document_version_id),
+            source_name="source.md",
+            page=2,
+            section_title="Automation",
+            evidence_text=("REQ-2 pressure shutdown is required."),
+        ),
+    ]
+
+    reasoner = BatchAwareStructuredReasoning()
+    repository = FakeRequirementRepository(
+        [requirement_one, requirement_two],
+        evidence=evidence,
+    )
+
+    runtime = _runtime(
+        tmp_path,
+        reasoner,
+        FakeRetriever([_retrieval_result("postgres", chunk_id="chunk-1")]),
+        FakeRetriever([_retrieval_result("chroma", chunk_id="chunk-1")]),
+        FakeRetriever([_retrieval_result("neo4j", chunk_id="chunk-1")]),
+        requirement_repository=repository,
+        user_story_requirement_batch_size=1,
+    )
+
+    state = asyncio.run(
+        UserStoryGenerationAgent(runtime).graph.ainvoke(
+            {
+                "request": UserStoryGenerationRequest(
+                    system="PROJECT_1",
+                    version="v1",
+                )
+            }
+        )
+    )
+
+    assert state["result"].status == "succeeded"
+    assert len(reasoner.generation_prompts) == 2
+
+    first_prompt = reasoner.generation_prompts[0]
+    second_prompt = reasoner.generation_prompts[1]
+
+    first_payload = json.loads(
+        first_prompt.split(
+            "Batch generation scope:\n",
+            1,
+        )[1]
+    )
+    second_payload = json.loads(
+        second_prompt.split(
+            "Batch generation scope:\n",
+            1,
+        )[1]
+    )
+
+    assert first_payload["batch_requirement_ids"] == ["REQ-1"]
+    assert first_payload["allowed_source_chunk_ids"] == ["chunk-1"]
+    assert first_payload["batch_requirements"][0]["source_chunk_ids"] == ["chunk-1"]
+
+    assert second_payload["batch_requirement_ids"] == ["REQ-2"]
+    assert second_payload["allowed_source_chunk_ids"] == ["chunk-2"]
+    assert second_payload["batch_requirements"][0]["source_chunk_ids"] == ["chunk-2"]
+
+    assert '"canonical_id": "REQ-2"' not in first_prompt
+    assert '"canonical_id": "REQ-1"' not in second_prompt
+
+    first_validation_bundle = reasoner.validation_evidence_by_story["US-REQ-1"]
+    second_validation_bundle = reasoner.validation_evidence_by_story["US-REQ-2"]
+
+    assert first_validation_bundle.source_chunk_ids == ["chunk-1"]
+    assert second_validation_bundle.source_chunk_ids == ["chunk-2"]
+
+    assert first_validation_bundle.ranked_results[0].metadata["requirement_ids"] == ["REQ-1"]
+
+    assert second_validation_bundle.ranked_results[0].metadata["requirement_ids"] == ["REQ-2"]
+
+    assert state["story_batch_requirement_ids"]["US-REQ-1"] == ["REQ-1"]
+    assert state["story_batch_requirement_ids"]["US-REQ-2"] == ["REQ-2"]
+
+    assert state["story_evidence_bundles"]["US-REQ-1"].source_chunk_ids == ["chunk-1"]
+
+    assert state["story_evidence_bundles"]["US-REQ-2"].source_chunk_ids == ["chunk-2"]
+
+
 def test_user_story_graph_fails_without_fallback_when_structured_generation_fails(
     tmp_path: Path,
 ) -> None:
@@ -556,6 +668,11 @@ class BatchAwareStructuredReasoning(FakeStructuredReasoning):
     def __init__(self) -> None:
         super().__init__()
         self.batch_requirement_ids: list[list[str]] = []
+        self.generation_prompts: list[str] = []
+        self.validation_evidence_by_story: dict[
+            str,
+            EvidenceBundle,
+        ] = {}
 
     async def generate_structured(
         self,
@@ -571,6 +688,8 @@ class BatchAwareStructuredReasoning(FakeStructuredReasoning):
                 generation_config=generation_config,
             )
         self.task_names.append(generation_config.task_name)
+        self.generation_prompts.append(prompt)
+
         payload = json.loads(prompt.split("Batch generation scope:\n", 1)[1])
         requirement_ids = payload["batch_requirement_ids"]
         self.batch_requirement_ids.append(requirement_ids)
@@ -603,6 +722,18 @@ class BatchAwareStructuredReasoning(FakeStructuredReasoning):
                 ],
                 "reasoning_summary": "batch generation",
             }
+        )
+
+    async def validate_user_story(
+        self,
+        story: GeneratedUserStory,
+        evidence: EvidenceBundle,
+    ) -> QualityValidationReport:
+        self.validation_evidence_by_story[story.id] = evidence
+
+        return await super().validate_user_story(
+            story,
+            evidence,
         )
 
 
