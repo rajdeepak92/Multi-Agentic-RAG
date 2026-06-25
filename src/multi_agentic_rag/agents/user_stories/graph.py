@@ -232,7 +232,12 @@ class UserStoryGraphRuntime:
         """Enumerate exact active requirements before retrieval enrichment."""
 
         if self.requirement_repository is None:
-            return {**state, "ledger_requirements": [], "ledger_evidence": []}
+            return {
+                **state,
+                "ledger_requirements": [],
+                "ledger_evidence": [],
+                "requirement_evidence_map": {},
+            }
         try:
             request = state["request"]
             requirements = await self.requirement_repository.list_requirements_for_scope(
@@ -248,26 +253,38 @@ class UserStoryGraphRuntime:
                     if requirement.requirement_pk
                 ]
             )
+            requirement_evidence_map = _build_requirement_evidence_map(
+                requirements,
+                evidence,
+            )
+
             missing_evidence = [
                 requirement.canonical_id or requirement.requirement_id
                 for requirement in requirements
-                if not any(item.requirement_pk == requirement.requirement_pk for item in evidence)
+                if not requirement_evidence_map.get(
+                    requirement.canonical_id or requirement.requirement_id,
+                    {},
+                ).get("source_chunk_ids")
             ]
+
             if missing_evidence:
                 return {
                     **state,
                     "ledger_requirements": requirements,
                     "ledger_evidence": evidence,
+                    "requirement_evidence_map": requirement_evidence_map,
                     "errors": [
                         *state.get("errors", []),
                         "Requirement ledger has records without evidence: "
                         + ", ".join(missing_evidence[:20]),
                     ],
                 }
+
             return {
                 **state,
                 "ledger_requirements": requirements,
                 "ledger_evidence": evidence,
+                "requirement_evidence_map": requirement_evidence_map,
             }
         except Exception as exc:
             return _state_error(state, exc)
@@ -676,6 +693,13 @@ class UserStoryGraphRuntime:
                     for story in state.get("validated_stories", [])
                     for message in _generic_story_failures(story)
                 )
+
+            state = {
+                **state,
+                "validation_reports": reports,
+                "validation_failures": failures,
+            }
+
             retry_allowed = (
                 state.get("retry_count", 0) < self.settings.structured_generation_retry_count
             )
@@ -736,7 +760,12 @@ class UserStoryGraphRuntime:
                     "coverage_records": coverage_records,
                     "coverage_payload": matrix,
                 }
-            return {**state, "validation_reports": reports, "next_action": "valid"}
+            return {
+                **state,
+                "validation_reports": reports,
+                "validation_failures": [],
+                "next_action": "valid",
+            }
         except Exception as exc:
             return _state_error(state, exc)
 
@@ -1132,6 +1161,103 @@ def _generation_config(settings: Settings, task_name: str) -> GenerationConfig:
         retry_count=settings.structured_generation_retry_count,
         task_name=task_name,
     )
+
+
+def _build_requirement_evidence_map(
+    requirements: Sequence[RequirementRecord],
+    evidence: Sequence[RequirementEvidenceRecord],
+) -> dict[str, dict[str, Any]]:
+    """Build the authoritative requirement-to-source-evidence mapping.
+
+    The requirement ledger remains the authoritative inventory, while
+    RequirementEvidenceRecord rows provide the complete source lineage for
+    every requirement. Multiple evidence rows and chunks are preserved.
+    """
+
+    evidence_by_requirement_pk: dict[str, list[RequirementEvidenceRecord]] = {}
+
+    for evidence_record in evidence:
+        evidence_by_requirement_pk.setdefault(
+            evidence_record.requirement_pk,
+            [],
+        ).append(evidence_record)
+
+    requirement_evidence_map: dict[str, dict[str, Any]] = {}
+
+    sorted_requirements = sorted(
+        requirements,
+        key=lambda requirement: (
+            requirement.canonical_id or requirement.requirement_id,
+            requirement.requirement_pk or "",
+        ),
+    )
+
+    for requirement in sorted_requirements:
+        canonical_id = requirement.canonical_id or requirement.requirement_id
+        requirement_pk = requirement.requirement_pk or ""
+
+        evidence_records = sorted(
+            evidence_by_requirement_pk.get(requirement_pk, []),
+            key=lambda evidence_record: (
+                evidence_record.page,
+                evidence_record.chunk_id,
+                evidence_record.requirement_evidence_id,
+            ),
+        )
+
+        evidence_payloads: list[dict[str, Any]] = []
+
+        for evidence_record in evidence_records:
+            evidence_payloads.append(
+                {
+                    "requirement_evidence_id": (evidence_record.requirement_evidence_id),
+                    "chunk_id": evidence_record.chunk_id,
+                    "document_version_id": (evidence_record.document_version_id),
+                    "source_name": evidence_record.source_name,
+                    "page": evidence_record.page,
+                    "section_title": evidence_record.section_title,
+                    "start_offset": evidence_record.start_offset,
+                    "end_offset": evidence_record.end_offset,
+                    "evidence_text": evidence_record.evidence_text,
+                    "extraction_method": (evidence_record.extraction_method),
+                    "confidence": evidence_record.confidence,
+                    "evidence_path": [
+                        f"System:{requirement.system_name}",
+                        f"KnowledgeBase:{requirement.kb_name}",
+                        f"Document:{requirement.document_id}",
+                        (f"DocumentVersion:{evidence_record.document_version_id}"),
+                        f"Version:{requirement.version}",
+                        f"Requirement:{canonical_id}",
+                        f"Chunk:{evidence_record.chunk_id}",
+                        (f"Source:{evidence_record.source_name}#page={evidence_record.page}"),
+                    ],
+                }
+            )
+
+        requirement_evidence_map[canonical_id] = {
+            "requirement_pk": requirement.requirement_pk,
+            "canonical_id": canonical_id,
+            "requirement_id": requirement.requirement_id,
+            "requirement_type": requirement.requirement_type.value,
+            "category": requirement.category,
+            "title": requirement.title,
+            "text": requirement.text,
+            "coverage_required": requirement.coverage_required,
+            "story_driving": requirement.story_driving,
+            "document_id": requirement.document_id,
+            "document_version_id": requirement.document_version_id,
+            "version": requirement.version,
+            "source_name": requirement.source_name,
+            "source_page": requirement.page,
+            "primary_chunk_id": requirement.chunk_id,
+            "source_chunk_ids": sorted(
+                {evidence_record.chunk_id for evidence_record in evidence_records}
+            ),
+            "source_pages": sorted({evidence_record.page for evidence_record in evidence_records}),
+            "evidence": evidence_payloads,
+        }
+
+    return requirement_evidence_map
 
 
 def _story_driving_requirement_payloads(
@@ -1776,6 +1902,7 @@ def _write_run_manifest(
         "validation_results": [
             report.model_dump(mode="json") for report in state.get("validation_reports", [])
         ],
+        "validation_failures": state.get("validation_failures", []),
         "coverage_results": state.get("coverage_payload", {}),
         "published_artifacts": [str(path) for path in state.get("artifact_paths", [])],
         "errors": state.get("errors", []),

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from multi_agentic_rag.agents.user_stories.schemas import (
     EvidenceAssessment,
@@ -36,6 +36,7 @@ class UserStoryGenerationState(TypedDict, total=False):
     source_responses: list[SourceRetrievalResponse]
     ledger_requirements: list[RequirementRecord]
     ledger_evidence: list[RequirementEvidenceRecord]
+    requirement_evidence_map: dict[str, dict[str, Any]]
     coverage_records: list[RequirementCoverageRecord]
     coverage_payload: dict[str, object]
     normalized_candidates: list[EvidenceCandidate]
@@ -50,6 +51,7 @@ class UserStoryGenerationState(TypedDict, total=False):
     raw_model_output: str
     validated_stories: list[GeneratedUserStory]
     validation_reports: list[QualityValidationReport]
+    validation_failures: list[str]
     artifact_paths: list[Path]
     debug_trace_path: Path
     generation_trace_path: Path

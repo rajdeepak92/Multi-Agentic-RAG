@@ -89,9 +89,7 @@ def test_user_story_graph_distinguishes_empty_failed_and_degraded_sources(
     failed_state = asyncio.run(
         UserStoryGenerationAgent(
             _runtime(tmp_path / "strict", FakeStructuredReasoning(), postgres, chroma, neo4j)
-        ).graph.ainvoke(
-            {"request": UserStoryGenerationRequest(system="PROJECT_1", version="v1")}
-        )
+        ).graph.ainvoke({"request": UserStoryGenerationRequest(system="PROJECT_1", version="v1")})
     )
 
     assert failed_state["result"].status == "failed"
@@ -112,9 +110,7 @@ def test_user_story_graph_distinguishes_empty_failed_and_degraded_sources(
                 FakeRetriever(error=RuntimeError("neo4j unavailable")),
                 retrieval_allow_degraded=True,
             )
-        ).graph.ainvoke(
-            {"request": UserStoryGenerationRequest(system="PROJECT_1", version="v1")}
-        )
+        ).graph.ainvoke({"request": UserStoryGenerationRequest(system="PROJECT_1", version="v1")})
     )
 
     assert degraded_state["result"].status == "succeeded"
@@ -165,6 +161,12 @@ def test_retry_exhaustion_does_not_publish_invalid_yaml(tmp_path: Path) -> None:
     assert reasoner.task_names.count("user_story_generation") == 2
     assert state["artifact_paths"] == []
     assert not list((state["run_dir"] / "artifacts" / "user_stories").glob("*.yaml"))
+    run_manifest = json.loads(state["run_manifest_path"].read_text(encoding="utf-8"))
+
+    assert state["validation_reports"]
+    assert state["validation_failures"] == ["unsupported claim"]
+    assert run_manifest["validation_results"]
+    assert run_manifest["validation_failures"] == ["unsupported claim"]
 
 
 def test_user_story_graph_starts_from_requirement_ledger_and_writes_coverage(
@@ -188,9 +190,7 @@ def test_user_story_graph_starts_from_requirement_ledger_and_writes_coverage(
 
     assert state["result"].status == "succeeded"
     assert repository.enumerated_scopes == [("PROJECT_1", "default", "v1")]
-    assert [requirement.canonical_id for requirement in state["ledger_requirements"]] == [
-        "REQ-1"
-    ]
+    assert [requirement.canonical_id for requirement in state["ledger_requirements"]] == ["REQ-1"]
     assert state["coverage_payload"]["counts"] == {"covered": 1}
     assert repository.coverage_records[0].canonical_id == "REQ-1"
     artifact_names = {Path(path).name for path in state["artifact_paths"]}
@@ -198,6 +198,82 @@ def test_user_story_graph_starts_from_requirement_ledger_and_writes_coverage(
     assert "requirements_inventory.md" in artifact_names
     assert "requirement_story_coverage.json" in artifact_names
     assert "requirement_story_coverage.csv" in artifact_names
+
+
+def test_user_story_graph_preserves_all_requirement_evidence(
+    tmp_path: Path,
+) -> None:
+    requirement = _requirement_record("REQ-1")
+
+    repository = FakeRequirementRepository(
+        [requirement],
+        evidence=[
+            RequirementEvidenceRecord(
+                requirement_evidence_id="ev-REQ-1-primary",
+                requirement_pk=requirement.requirement_pk or "",
+                chunk_id="chunk-1",
+                document_version_id=requirement.document_version_id,
+                source_name="source.md",
+                page=1,
+                section_title="Requirements",
+                start_offset=10,
+                end_offset=80,
+                evidence_text=("REQ-1 temperature threshold maximum is 80 C."),
+            ),
+            RequirementEvidenceRecord(
+                requirement_evidence_id="ev-REQ-1-secondary",
+                requirement_pk=requirement.requirement_pk or "",
+                chunk_id="chunk-2",
+                document_version_id=requirement.document_version_id,
+                source_name="source.md",
+                page=2,
+                section_title="Threshold Table",
+                start_offset=20,
+                end_offset=90,
+                evidence_text=("Temperature critical level is greater than 80 C."),
+            ),
+        ],
+    )
+
+    runtime = _runtime(
+        tmp_path,
+        FakeStructuredReasoning(),
+        FakeRetriever([_retrieval_result("postgres")]),
+        FakeRetriever([_retrieval_result("chroma")]),
+        FakeRetriever([_retrieval_result("neo4j")]),
+        requirement_repository=repository,
+    )
+
+    state = asyncio.run(
+        UserStoryGenerationAgent(runtime).graph.ainvoke(
+            {
+                "request": UserStoryGenerationRequest(
+                    system="PROJECT_1",
+                    version="v1",
+                )
+            }
+        )
+    )
+
+    evidence_entry = state["requirement_evidence_map"]["REQ-1"]
+
+    assert evidence_entry["canonical_id"] == "REQ-1"
+    assert evidence_entry["primary_chunk_id"] == "chunk-1"
+    assert evidence_entry["source_chunk_ids"] == [
+        "chunk-1",
+        "chunk-2",
+    ]
+    assert evidence_entry["source_pages"] == [1, 2]
+    assert len(evidence_entry["evidence"]) == 2
+
+    secondary_evidence = evidence_entry["evidence"][1]
+
+    assert secondary_evidence["chunk_id"] == "chunk-2"
+    assert secondary_evidence["evidence_text"] == (
+        "Temperature critical level is greater than 80 C."
+    )
+    assert "Requirement:REQ-1" in secondary_evidence["evidence_path"]
+    assert "Chunk:chunk-2" in secondary_evidence["evidence_path"]
 
 
 def test_user_story_graph_blocks_publication_when_required_coverage_is_missing(
@@ -674,9 +750,7 @@ def _retrieval_result(
             "fact_id": "fact-1",
             "entity_ids": ["entity-1"],
             "status": "active",
-            "graph_matches": [["Requirement:REQ-1", "Chunk:chunk-1"]]
-            if source == "neo4j"
-            else [],
+            "graph_matches": [["Requirement:REQ-1", "Chunk:chunk-1"]] if source == "neo4j" else [],
         },
     )
 
@@ -698,8 +772,14 @@ def _ingest_result() -> IngestResult:
 
 
 class FakeRequirementRepository:
-    def __init__(self, requirements: list[RequirementRecord]) -> None:
+    def __init__(
+        self,
+        requirements: list[RequirementRecord],
+        *,
+        evidence: list[RequirementEvidenceRecord] | None = None,
+    ) -> None:
         self.requirements = requirements
+        self.evidence = evidence
         self.enumerated_scopes: list[tuple[str, str, str]] = []
         self.coverage_records: list[RequirementCoverageRecord] = []
 
@@ -718,6 +798,9 @@ class FakeRequirementRepository:
         self,
         **kwargs: Any,
     ) -> list[RequirementEvidenceRecord]:
+        if self.evidence is not None:
+            return self.evidence
+
         return [
             RequirementEvidenceRecord(
                 requirement_evidence_id=f"ev-{requirement.canonical_id}",
